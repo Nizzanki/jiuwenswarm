@@ -3445,13 +3445,15 @@ class JiuWenSwarmDeepAdapter:
             self._paid_search_tool = WebPaidSearchTool(
                 language=self._resolve_runtime_language(), agent_id=agent_id
             )
-            Runner.resource_mgr.add_tool(self._paid_search_tool)
+            if not Runner.resource_mgr.get_tool(self._paid_search_tool.card.id):
+                Runner.resource_mgr.add_tool(self._paid_search_tool)
             tool_cards.append(self._paid_search_tool.card)
             self._paid_search_registered = True
 
         for tool_cls in [WebFreeSearchTool, WebFetchWebpageTool]:
             tool_instance = tool_cls(agent_id=agent_id)
-            Runner.resource_mgr.add_tool(tool_instance)
+            if not Runner.resource_mgr.get_tool(tool_instance.card.id):
+                Runner.resource_mgr.add_tool(tool_instance)
             tool_cards.append(tool_instance.card)
 
         self._vision_tools = []
@@ -3463,7 +3465,8 @@ class JiuWenSwarmDeepAdapter:
                     vision_model_config=self._vision_model_config,
                     agent_id=agent_id,
                 ):
-                    Runner.resource_mgr.add_tool(tool)
+                    if not Runner.resource_mgr.get_tool(tool.card.id):
+                        Runner.resource_mgr.add_tool(tool)
                     tool_cards.append(tool.card)
                     self._vision_tools.append(tool)
                 self._vision_tools_registered = bool(self._vision_tools)
@@ -3479,7 +3482,8 @@ class JiuWenSwarmDeepAdapter:
         try:
             self._audio_tools = self._iter_runtime_audio_tools(agent_id)
             for tool in self._audio_tools:
-                Runner.resource_mgr.add_tool(tool)
+                if not Runner.resource_mgr.get_tool(tool.card.id):
+                    Runner.resource_mgr.add_tool(tool)
                 tool_cards.append(tool.card)
             self._audio_tools_registered = bool(self._audio_tools)
         except Exception as exc:
@@ -3492,7 +3496,8 @@ class JiuWenSwarmDeepAdapter:
         self._video_tool_registered = False
         if self._video_model_config:
             try:
-                Runner.resource_mgr.add_tool(video_understanding)
+                if not Runner.resource_mgr.get_tool(video_understanding.card.id):
+                    Runner.resource_mgr.add_tool(video_understanding)
                 tool_cards.append(video_understanding.card)
                 self._video_tool_registered = True
             except Exception as exc:
