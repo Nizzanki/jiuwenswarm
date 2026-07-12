@@ -75,6 +75,86 @@ def _history_user_content(params: Any, query: Any) -> Any:
     return query
 
 
+def _history_media_string(item: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _history_media_size(item: dict[str, Any]) -> int | float | None:
+    for key in ("size_bytes", "sizeBytes"):
+        value = item.get(key)
+        if isinstance(value, (int, float)) and value >= 0:
+            return value
+    return None
+
+
+def _history_media_record(value: Any, *, default_type: str = "image") -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+
+    path = _history_media_string(value, "path")
+    url = _history_media_string(value, "url")
+    if not path and not url:
+        return None
+
+    media_type = _history_media_string(value, "type") or default_type
+    filename = _history_media_string(value, "filename", "name") or (
+        Path(path).name if path else "image"
+    )
+    mime_type = _history_media_string(value, "mime_type", "mimeType")
+    size = _history_media_size(value)
+
+    record: dict[str, Any] = {
+        "type": media_type,
+        "filename": filename,
+    }
+    if mime_type:
+        record["mime_type"] = mime_type
+    if path:
+        record["path"] = path
+    if url:
+        record["url"] = url
+    if size is not None:
+        record["size_bytes"] = size
+    return record
+
+
+def _history_user_extra(params: Any) -> dict[str, Any] | None:
+    if not isinstance(params, dict):
+        return None
+
+    extra: dict[str, Any] = {}
+    raw_media_items = params.get("media_items")
+    if isinstance(raw_media_items, list):
+        media_items: list[dict[str, Any]] = []
+        for raw_item in raw_media_items:
+            item = _history_media_record(raw_item)
+            if item is not None:
+                media_items.append(item)
+        if media_items:
+            extra["media_items"] = media_items
+
+    raw_files = params.get("files")
+    if isinstance(raw_files, dict):
+        files: dict[str, Any] = {}
+        uploaded_images = raw_files.get("uploaded_images")
+        if isinstance(uploaded_images, list):
+            image_items: list[dict[str, Any]] = []
+            for raw_item in uploaded_images:
+                item = _history_media_record(raw_item, default_type="image")
+                if item is not None:
+                    image_items.append(item)
+            if image_items:
+                files["uploaded_images"] = image_items
+        if files:
+            extra["files"] = files
+
+    return extra or None
+
+
 def _compact_stats_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     stats: dict[str, Any] = {}
     for key in ("status", "phase", "processor", "model", "before", "after", "saved", "duration_ms"):
@@ -766,6 +846,18 @@ class JiuWenSwarm:
         except Exception as exc:
             logger.warning("[JiuWenSwarm] team shared skill link refresh failed: %s", exc)
 
+    async def _refresh_skill_rails_after_change(self) -> None:
+        """轻量刷新 skill rail，避免 uninstall 后全量重建 agent 实例.
+
+        SkillUseRail 通过 reload_skills() 重新扫描 skills_dir 并清除已删除的 skill 缓存，
+        无需重建整个 agent（省去 _get_tool_cards + _build_agent_rails + create_deep_agent 开销）。
+        """
+        adapter = self._adapter
+        if adapter is None:
+            return
+        if hasattr(adapter, "refresh_skill_rails"):
+            await adapter.refresh_skill_rails()
+
     async def reload_agent_config(
             self,
             config_base: dict[str, Any] | None = None,
@@ -1214,7 +1306,6 @@ class JiuWenSwarm:
             payload = await handler(request.params)
             _reload_after_skills = handler_name in [
                 "handle_skills_install",
-                "handle_skills_uninstall",
                 "handle_skills_import_local",
                 "handle_skills_toggle",
                 "handle_skills_skillnet_install",
@@ -1225,6 +1316,12 @@ class JiuWenSwarm:
                 _reload_after_skills = False
             if _reload_after_skills:
                 await self.create_instance()
+                self._refresh_team_shared_skill_links(request.session_id)
+            elif handler_name == "handle_skills_uninstall" and payload.get("success"):
+                # 卸载只需轻量刷新 skill rail，不需要全量重建 agent 实例。
+                # SkillUseRail 会通过文件系统签名检测到目录删除并自动刷新，
+                # 这里主动调用 reload_skills() 确保立即生效，避免延迟到下一次模型调用。
+                await self._refresh_skill_rails_after_change()
                 self._refresh_team_shared_skill_links(request.session_id)
         except Exception as exc:
             logger.error("[JiuWenSwarm] skills 请求处理失败: %s", exc)
@@ -1543,6 +1640,7 @@ class JiuWenSwarm:
                 role="user",
                 content=_history_user_content(request.params, query),
                 timestamp=time.time(),
+                extra=_history_user_extra(request.params),
                 channel_metadata=request.metadata,
                 mode=request.params.get("mode", "unknown"),
             )
@@ -1713,6 +1811,7 @@ class JiuWenSwarm:
                 role="user",
                 content=_history_user_content(request.params, query),
                 timestamp=time.time(),
+                extra=_history_user_extra(request.params),
                 channel_metadata=request.metadata,
                 mode=request.params.get("mode", "unknown"),
             )
@@ -1827,14 +1926,29 @@ class JiuWenSwarm:
                 event_type="chat.final",
                 content=pending_text,
                 timestamp=time.time(),
-                extra=_attach_reasoning_content(),
+                # 透传 proactive 标记到 history——刷新页面时前端靠 payload.source===
+                # 'proactive_recommendation' 渲染推荐卡片，不带则退化白色气泡。
+                extra=_attach_reasoning_content({
+                    k: v for k, v in request.params.items()
+                    if k in ("source", "proactive_type", "proactive_target")
+                }),
                 mode=request.params.get("mode", "unknown"),
             )
             durable_final_content = pending_text
 
         async def run_stream_task():
+            logger.info("[JiuWenSwarm] run_stream_task started: request_id=%s session_id=%s", rid, session_id)
+            _put_count = 0
             try:
                 async for chunk in adapter.process_message_stream_impl(request, inputs):
+                    _put_count += 1
+                    if _put_count <= 3:
+                        _pl = getattr(chunk, "payload", None) or {}
+                        _et = _pl.get("event_type", "") if isinstance(_pl, dict) else ""
+                        logger.info(
+                            "[JiuWenSwarm] run_stream_task chunk #%s: request_id=%s event_type=%s",
+                            _put_count, rid, _et,
+                        )
                     await stream_queue.put(("chunk", chunk))
             except asyncio.CancelledError:
                 logger.info("[JiuWenSwarm] 流式任务被取消: request_id=%s session_id=%s", rid, session_id)
@@ -1843,6 +1957,10 @@ class JiuWenSwarm:
                 logger.exception("[JiuWenSwarm] 流式任务异常: %s", exc)
                 await stream_queue.put(("error", exc))
             finally:
+                logger.info(
+                    "[JiuWenSwarm] run_stream_task finished: request_id=%s total_chunks=%s",
+                    rid, _put_count,
+                )
                 stream_done.set()
 
         # Team 模式: 后续请求直接执行，绕过 Session Manager 队列
@@ -1866,6 +1984,11 @@ class JiuWenSwarm:
         suppress_a2ui_stream = False
         a2ui_pending_render_sent = False
         a2ui_stream_probe = ""
+        _yielded_from_queue = 0
+        logger.info(
+            "[JiuWenSwarm] consumer loop starting: request_id=%s is_team=%s is_first=%s",
+            rid, is_team_mode, is_team_first_request,
+        )
         try:
             while not stream_done.is_set() or not stream_queue.empty():
                 try:
@@ -1874,6 +1997,14 @@ class JiuWenSwarm:
                     continue
 
                 event_type, data = item
+                _yielded_from_queue += 1
+                if _yielded_from_queue <= 3:
+                    _pl = getattr(data, "payload", None) if event_type == "chunk" else None
+                    _et = _pl.get("event_type", "") if isinstance(_pl, dict) else ""
+                    logger.info(
+                        "[JiuWenSwarm] consumer loop yield #%s: request_id=%s event_type=%s item_type=%s",
+                        _yielded_from_queue, rid, _et, event_type,
+                    )
 
                 if event_type == "error":
                     if isinstance(data, asyncio.CancelledError):
@@ -1989,6 +2120,10 @@ class JiuWenSwarm:
                                                 extra_fields[k] = v
                                 if et in {"chat.final", "chat.tool_call"}:
                                     extra_fields = _attach_reasoning_content(extra_fields)
+                                # 透传 proactive 标记——刷新页面时前端靠 source 识别卡片
+                                for pk in ("source", "proactive_type", "proactive_target"):
+                                    if pk not in extra_fields and pk in request.params:
+                                        extra_fields[pk] = request.params[pk]
                                 append_history_record(
                                     session_id=session_id,
                                     request_id=rid,
@@ -2083,6 +2218,10 @@ class JiuWenSwarm:
                                             extra_fields[k] = v
                             if et in {"chat.final", "chat.tool_call"}:
                                 extra_fields = _attach_reasoning_content(extra_fields)
+                            # 透传 proactive 标记——刷新页面时前端靠 source 识别卡片
+                            for pk in ("source", "proactive_type", "proactive_target"):
+                                if pk not in extra_fields and pk in request.params:
+                                    extra_fields[pk] = request.params[pk]
                             append_history_record(
                                 session_id=session_id,
                                 request_id=rid,
@@ -2134,7 +2273,10 @@ class JiuWenSwarm:
                 event_type="chat.final",
                 content=finalized_assistant_message,
                 timestamp=time.time(),
-                extra=_attach_reasoning_content(),
+                extra=_attach_reasoning_content({
+                    k: v for k, v in request.params.items()
+                    if k in ("source", "proactive_type", "proactive_target")
+                }),
                 mode=request.params.get("mode", "unknown"),
             )
             final_answer_content = finalized_assistant_message
@@ -2309,6 +2451,16 @@ class JiuWenSwarm:
         return await adapter.generate_btw_answer(session_id=session_id, question=question)
 
     # ---------- 资源清理 ----------
+
+    async def cleanup_session_runtime(self, session_id: str) -> bool:
+        """Release in-memory runtime owned by one session while keeping persisted history."""
+        adapter = self._adapter
+        if adapter is None:
+            return False
+        cleanup_fn = getattr(adapter, "cleanup_session_adapter", None)
+        if not callable(cleanup_fn):
+            return False
+        return bool(await cleanup_fn(session_id))
 
     async def cancel_inflight_work(self, log_prefix: str = "[gateway disconnect] ") -> None:
         """Gateway 与 AgentServer 的 WebSocket 断开时调用：取消 session 流式任务并中止 adapter 内层循环。"""

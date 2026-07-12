@@ -460,13 +460,13 @@ export function buildDiffViewerSources(payload: Record<string, unknown>): DiffSo
 
   sources.push({
     label: "Current",
-    title: "Diff (git diff HEAD)",
+    title: "Uncommitted changes (git diff HEAD)",
     subtitle: formatDiffStats(currentStats),
     stats: currentStats,
     files: currentFiles,
     emptyMessage: currentStats.filesChanged > 0 && currentFiles.length === 0
       ? "Too many files to display details"
-      : "Working tree is clean",
+      : "No changes yet",
   });
 
   for (const turn of turns) {
@@ -1304,6 +1304,7 @@ export class AppScreen implements Component, Focusable {
   private fileViewerState: FileViewerState | null = null;
   /** DiffViewer state for interactive diff browsing */
   private diffViewerState: DiffViewerState | null = null;
+  private mouseTrackingEnabled = false;
   /** Previous session title for terminal window title sync. */
   private previousSessionTitle: string = "";
 
@@ -1476,6 +1477,8 @@ export class AppScreen implements Component, Focusable {
   }
 
   private setMouseTrackingEnabled(enabled: boolean): void {
+    if (this.mouseTrackingEnabled === enabled) return;
+    this.mouseTrackingEnabled = enabled;
     if (enabled) {
       this.tui.terminal.write(ENABLE_MOUSE_TRACKING);
     } else {
@@ -1789,7 +1792,10 @@ export class AppScreen implements Component, Focusable {
   private _toRelativePath(absPath: string): string {
     const cwd = getCurrentCwd() || process.cwd();
     const normalized = path.resolve(absPath);
-    if (normalized.startsWith(cwd + path.sep) || normalized === cwd) {
+    // On Windows, paths are case-insensitive — lower() for safe comparison
+    const a = process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    const b = process.platform === "win32" ? cwd.toLowerCase() : cwd;
+    if (a.startsWith(b + path.sep) || a === b) {
       const rel = path.relative(cwd, normalized);
       return rel || path.basename(absPath);
     }
@@ -1997,9 +2003,7 @@ export class AppScreen implements Component, Focusable {
     }
 
     const sourceHint = this.diffViewerState.sources.length > 1 ? "←/→ source · " : "";
-    const hintText = source.files.length > 0
-      ? `  ${sourceHint}↑/↓ to select · Enter to view · Esc to close`
-      : `  ${sourceHint}Esc to close`;
+    const hintText = `  ${sourceHint}↑/↓ to select · Enter to view · Esc to close`;
     lines.push(padToWidth(palette.text.dim(hintText), safeWidth));
 
     return lines;
@@ -2695,6 +2699,28 @@ export class AppScreen implements Component, Focusable {
       pendingInput,
       pendingInputBaseline,
     ).length;
+    const approximateFixedHeight =
+      questionLines.length + editorLines.length + composerPreviewLines.length + 2;
+    const transcriptMayScroll =
+      transcriptLineCount > Math.max(0, this.tui.terminal.rows - approximateFixedHeight);
+    const interactiveOverlayActive =
+      this.startupPromptList !== null ||
+      this.resumeSessionList !== null ||
+      this.statusViewState !== null ||
+      this.mcpDetail !== null ||
+      this.mcpList !== null ||
+      this.mcpTools !== null ||
+      this.modelList !== null ||
+      this.toolSelector !== null ||
+      this.themeList !== null ||
+      this.swarmWorkflowsViewState !== null ||
+      this.configEditorState !== null ||
+      this.questionList !== null;
+    this.setMouseTrackingEnabled(
+      transcriptMayScroll ||
+        snapshot.pendingQuestion !== null ||
+        interactiveOverlayActive,
+    );
     if (
       this.transcriptScrollOffset > 0 &&
       this.lastTranscriptLineWidth === width &&
@@ -2911,13 +2937,10 @@ export class AppScreen implements Component, Focusable {
       // Check for mode switch when there's ongoing work
       if (/^\/(?:mode|switch)\s/.test(text) && snapshot.cancellableWork) {
         const currentMode = snapshot.mode;
-        const isTeamMode = currentMode === "code.team" || currentMode === "team";
         // Parse the target mode from the command
         const modeMatch = text.match(/^\/(?:mode|switch)\s+(\S+)/);
         const targetMode = modeMatch?.[1] ?? "";
-        const targetIsTeamMode = targetMode === "code.team" || targetMode === "team";
-        // Only warn when leaving team mode
-        if (isTeamMode && !targetIsTeamMode) {
+        if (currentMode !== targetMode) {
           const answers = await this.state.askQuestions(
             [
               {
