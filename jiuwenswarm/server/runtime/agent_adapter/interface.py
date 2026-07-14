@@ -22,6 +22,7 @@ from typing import Any, AsyncIterator, Tuple
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
+from jiuwenswarm.common.errors import record_boundary_exception
 from jiuwenswarm.server.runtime.agent_adapter.agent_adapters import (
     AgentAdapter,
     create_adapter,
@@ -1841,6 +1842,7 @@ class JiuWenSwarm:
                 await stream_queue.put(("error", asyncio.CancelledError()))
             except Exception as exc:
                 logger.exception("[JiuWenSwarm] 流式任务异常: %s", exc)
+                record_boundary_exception("agent_adapter.stream", exc)
                 await stream_queue.put(("error", exc))
             finally:
                 stream_done.set()

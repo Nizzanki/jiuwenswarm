@@ -31,6 +31,7 @@ from websockets.exceptions import ConnectionClosed, ConnectionClosedError
 from openjiuwen.core.common.logging import LogManager
 
 # --- Early --dotenv parsing (before jiuwenswarm imports) ---
+from jiuwenswarm.common.errors import record_boundary_exception
 from jiuwenswarm.dotenv_early import parse_dotenv_early
 
 parse_dotenv_early("jiuwenswarm-gateway")
@@ -171,8 +172,9 @@ class _InboundGatewayServer:
                 handled = self._inbound_handler(msg)
                 if asyncio.iscoroutine(handled):
                     await handled
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 logger.exception("[App] Gateway inbound handling failed: id=%s", getattr(msg, "id", None))
+                record_boundary_exception("gateway.serve_loop", exc)
 
 
 async def _connect_with_retry(
