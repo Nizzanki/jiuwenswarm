@@ -1,6 +1,8 @@
 import { flattenArrayPayload, makeItem } from "../helpers.js";
 import { CommandKind, type SlashCommand } from "../types.js";
 
+const ONLINE_SKILL_SOURCES = new Set(["clawhub"]);
+
 type SkillNetItem = {
   skill_name: string;
   skill_description: string;
@@ -172,14 +174,14 @@ async function listSkills(ctx: import("../types.js").CommandContext): Promise<vo
 export function createSkillsCommand(): SlashCommand {
   return {
     name: "skills",
-    description: "Manage skills (list, install, uninstall, marketplace, skillnet, use)",
-    usage: "/skills [list|install|uninstall|marketplace|skillnet|use]",
-    example: "/skills install my-skill  |  /skills install code-review@clawhub  |  /skills skillnet search code",
+    description: "Manage skills (list, install, uninstall, marketplace, use)",
+    usage: "/skills [list|install|uninstall|marketplace|use]",
+    example: "/skills install my-skill  |  /skills install code-review@clawhub",
     kind: CommandKind.BUILT_IN,
     action: async (ctx) => {
       await listSkills(ctx);
     },
-    subCommands: [
+    subCommands: ([
       {
         name: "list",
         description: "List skills",
@@ -193,15 +195,15 @@ export function createSkillsCommand(): SlashCommand {
       },
       {
         name: "install",
-        description: "Install a skill (builtin name, slug@clawhub, name@skillnet, plugin@marketplace, or local path/URL)",
-        usage: "/skills install <skill> | <slug@clawhub> | <name@skillnet> | <skill@marketplace> | <path_or_url>",
-        example: "/skills install my-skill  |  /skills install code-review@clawhub  |  /skills install code-review@skillnet",
+        description: "Install a skill (builtin name, slug@clawhub, plugin@marketplace, or local path/URL)",
+        usage: "/skills install <skill> | <slug@clawhub> | <skill@marketplace> | <path_or_url>",
+        example: "/skills install my-skill  |  /skills install code-review@clawhub",
         kind: CommandKind.BUILT_IN,
         takesArgs: true,
         action: async (ctx, args) => {
           const spec = args.trim();
           if (!spec) {
-            ctx.addItem(makeItem(ctx.sessionId, "error", "Usage: /skills install <skill> | <slug@clawhub> | <name@skillnet> | <skill@marketplace> | <path_or_url>"));
+            ctx.addItem(makeItem(ctx.sessionId, "error", "Usage: /skills install <skill> | <slug@clawhub> | <skill@marketplace> | <path_or_url>"));
             return;
           }
 
@@ -256,14 +258,21 @@ export function createSkillsCommand(): SlashCommand {
             return;
           }
 
-          // ClawHub install flow: "slug@clawhub" or bare slug that looks like a ClawHub identifier
+          // ClawHub install flow: "ownerHandle/slug@clawhub" or "slug@clawhub"
           // ClawHub identifiers are alphanumeric slugs like "code-review", "daily-report" etc.
           if (spec.includes("@clawhub") || (spec.includes("@") && spec.endsWith("@clawhub"))) {
-            const slug = spec.replace(/@clawhub$/i, "");
+            const clawhubPart = spec.replace(/@clawhub$/i, "");
+            let slug = clawhubPart;
+            let ownerHandle: string | undefined;
+            if (clawhubPart.includes("/")) {
+              const slashIdx = clawhubPart.indexOf("/");
+              ownerHandle = clawhubPart.substring(0, slashIdx);
+              slug = clawhubPart.substring(slashIdx + 1);
+            }
             ctx.addItem(makeItem(ctx.sessionId, "info", `Installing from ClawHub: ${slug}`));
             const downloadPayload = await ctx.request<{ success?: boolean; detail?: string; detail_key?: string; skill?: { name?: string; source?: string } }>(
               "skills.clawhub.download",
-              { slug, force: false },
+              { slug, owner_handle: ownerHandle || "", force: false },
               120_000,
             );
             if (downloadPayload.success) {
@@ -296,7 +305,7 @@ export function createSkillsCommand(): SlashCommand {
                   ctx.addItem(makeItem(ctx.sessionId, "info", `Force re-installing from ClawHub: ${slug}`));
                   const forcePayload = await ctx.request<{ success?: boolean; detail?: string; detail_key?: string; skill?: { name?: string; source?: string } }>(
                     "skills.clawhub.download",
-                    { slug, force: true },
+                    { slug, owner_handle: ownerHandle || "", force: true },
                     120_000,
                   );
                   if (forcePayload.success) {
@@ -324,7 +333,7 @@ export function createSkillsCommand(): SlashCommand {
                     value: s.slug,
                     description: `${s.summary || "(no description)"} | slug: ${s.slug} | v${s.version || "?"}`,
                   }));
-                  ctx.addItem(makeItem(ctx.sessionId, "info", `Found ${searchPayload.skills.length} matching skills on ClawHub. Use the slug shown below:`, "*", { view: "list", title: "ClawHub Search Results (use slug@clawhub to install)", items }));
+                  ctx.addItem(makeItem(ctx.sessionId, "info", `Found ${searchPayload.skills.length} matching skills on ClawHub. Use the slug shown below:`, "*", { view: "list", title: "ClawHub Search Results", items }));
                 } else {
                   // Search also requires token — if token error, give guidance
                   if (searchPayload.detail_key === "skills.clawhub.errors.tokenNotConfigured") {
@@ -347,7 +356,7 @@ export function createSkillsCommand(): SlashCommand {
           // SkillNet skills are identified by URL, not slug. The @skillnet format triggers
           // a search first. Only auto-installs if an exact match by skill_name is found;
           // otherwise shows search results and lets the user pick the right one.
-          if (spec.endsWith("@skillnet")) {
+          if (spec.endsWith("@skillnet") && ONLINE_SKILL_SOURCES.has("skillnet")) {
             const skillName = spec.replace(/@skillnet$/i, "");
             ctx.addItem(makeItem(ctx.sessionId, "info", `Searching SkillNet for: ${skillName}`));
             const searchPayload = await ctx.request<{ success?: boolean; detail?: string; detail_key?: string; count?: number; skills?: SkillNetItem[] }>(
@@ -759,6 +768,9 @@ export function createSkillsCommand(): SlashCommand {
                   description: `${s.skill_description || "(no description)"} | by ${s.author || "?"} | ⭐${s.stars || 0} | ${s.category || "-"}`,
                 }));
                 ctx.addItem(makeItem(ctx.sessionId, "info", `SkillNet results (${payload.skills.length})`, "*", { view: "list", title: "SkillNet Search Results (use /skills skillnet install <url> to install)", items }));
+              } else if (payload.success) {
+                // Search succeeded but matched nothing — not a failure
+                ctx.addItem(makeItem(ctx.sessionId, "info", `No skills found on SkillNet for: ${q}`));
               } else {
                 ctx.addItem(makeItem(ctx.sessionId, "error", payload.detail || `SkillNet search failed: ${q}`));
               }
@@ -841,15 +853,15 @@ export function createSkillsCommand(): SlashCommand {
         },
         action: async (ctx, args) => {
           const parts = args.trim().split(/\s*,\s*(.*)/);
-          const skill_name = parts[0];
-          const query = parts[1];
+          const skill_name = parts[0]?.trim();
+          const query = parts[1]?.trim();
           if (!skill_name || !query) {
             ctx.addItem(makeItem(ctx.sessionId, "error", "Usage: /skills use <skill_name>, <query>"));
             return;
           }
-          const text = `/skills use ${skill_name}, ${query}`
-
-          const requestId = ctx.sendMessage(text)
+          // 兼容路径：不再拼 `/skills use` 文本，
+          // 直接把干净的 query 作为 content 发送，skill 名走独立的 skills 参数。
+          const requestId = ctx.sendMessage(query, undefined, undefined, undefined, [skill_name]);
           if (!requestId) {
             ctx.addItem(
               makeItem(ctx.sessionId, "error", "offline: waiting for reconnect before sending /skills use request"),
@@ -858,6 +870,8 @@ export function createSkillsCommand(): SlashCommand {
           }
         },
       },
-    ],
+    ] satisfies SlashCommand[]).filter(
+      (command) => command.name !== "skillnet" || ONLINE_SKILL_SOURCES.has("skillnet"),
+    ),
   };
 }

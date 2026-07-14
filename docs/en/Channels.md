@@ -77,5 +77,25 @@ For detailed configuration instructions, see: [China Channels](ChinaChannels.md)
 |---------|-------------|
 | [Telegram](InternationalChannels.md#telegram) | International messaging tool, supports private and group chat |
 | [Discord](InternationalChannels.md#discord) | Gaming community platform, supports private and group chat |
+| [Slack](InternationalChannels.md#slack) | Enterprise collaboration platform, supports DMs and channel threads |
+| [WhatsApp](InternationalChannels.md#whatsapp) | Personal messaging tool, supports private chat |
 
 For detailed configuration instructions, see: [International Channels](InternationalChannels.md)
+
+---
+
+## Developer Channels
+
+In addition to the end-user chat platforms above, JiuwenSwarm also provides integration methods for developers:
+
+| Integration | Description |
+|-------------|-------------|
+| [ACP Plugin Usage](ACP_Client_Config.md) | Integrate with JiuwenSwarm via the ACP protocol, suitable for custom integrations |
+
+The **Browser Extension** (`browser-extension/BrowserExtension.md`) is a WebSocket client of the
+gateway (like the built-in Web UI), not an IM ingress channel — it connects to `ws://<host>:19000/ws`
+and shares sessions/history with the webview. See its docs for details.
+
+The **IDE Plugins** (`ide/jetbrains/JetBrains.md` and `ide/vscode/VSCode.md`) are WebSocket
+clients of the gateway (like the built-in Web UI) — they connect to `ws://<host>:19000/ws` with
+`channel_id: "ide"` and share sessions/history with the webview. See their docs for details.

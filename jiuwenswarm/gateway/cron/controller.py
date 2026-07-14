@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+from functools import wraps
+
+
 from datetime import datetime, timedelta
 from typing import Any, ClassVar, List
 from zoneinfo import ZoneInfo
@@ -8,15 +12,30 @@ from openjiuwen.core.foundation.tool import LocalFunction, Tool, ToolCard
 
 from jiuwenswarm.gateway.cron.cron_expr import normalize_cron_expr
 from jiuwenswarm.gateway.cron.models import (
+    CRON_JOB_DESCRIPTION_MAX_LENGTH,
+    CRON_JOB_NAME_MAX_LENGTH,
     CronTargetChannel,
     cron_job_metadata,
     cron_job_modes_for_tools,
     is_valid_target_channel_id,
+    normalize_cron_job_mcp,
     normalize_cron_job_mode,
     normalize_target_channel_id,
+    validate_cron_model,
 )
 from jiuwenswarm.gateway.cron.scheduler import CronSchedulerService, _cron_next_push_dt
 from jiuwenswarm.gateway.cron.store import CronJobStore
+
+
+def _serialize_mutation(method):
+    """Keep project fencing/cleanup and cron creation in one admission order."""
+
+    @wraps(method)
+    async def serialized(self, *args, **kwargs):
+        async with self.mutation_lock:
+            return await method(self, *args, **kwargs)
+
+    return serialized
 
 
 class CronController:
@@ -27,7 +46,20 @@ class CronController:
     def __init__(self, *, store: CronJobStore, scheduler: CronSchedulerService) -> None:
         self._store = store
         self._scheduler = scheduler
+        if not hasattr(scheduler, "_lifecycle_mutation_lock"):
+            scheduler._lifecycle_mutation_lock = asyncio.Lock()
+        self.mutation_lock = scheduler._lifecycle_mutation_lock
         self._target_channel: CronTargetChannel | None = None
+
+    @property
+    def store(self) -> CronJobStore:
+        """The underlying cron job store."""
+        return self._store
+
+    @property
+    def scheduler(self) -> CronSchedulerService:
+        """The underlying cron scheduler service."""
+        return self._scheduler
 
     def set_target_channel(self, channel: CronTargetChannel) -> None:
         self._target_channel = channel
@@ -74,7 +106,16 @@ class CronController:
         base = datetime.now(tz=tz)
         _ = _cron_next_push_dt(cron_expr, base)
 
-    _DESCRIPTION_TIME_KEYWORDS = ("每天", "每周", "每月", "上午", "下午", "早上", "晚上", "凌晨")
+    _DESCRIPTION_TIME_KEYWORDS = (
+        "每天",
+        "每周",
+        "每月",
+        "上午",
+        "下午",
+        "早上",
+        "晚上",
+        "凌晨",
+    )
 
     def _normalize_targets(self, raw: Any) -> str:
         """将 targets 规范为 CronTargetChannel 枚举值。"""
@@ -121,7 +162,38 @@ class CronController:
 
     async def list_jobs(self) -> list[dict[str, Any]]:
         jobs = await self._store.list_jobs()
-        return [j.to_dict() for j in jobs]
+        return [
+            j.to_dict()
+            for j in jobs
+            if await self._scheduler.project_execution_allowed(j.project_id, j.user_id)
+        ]
+
+    @_serialize_mutation
+    async def stop_project_jobs(
+        self, project_id: str, *, user_id=None, delete=False, checkpoint=None, plan=None
+    ) -> dict:
+        jobs = []
+        for job in await self._store.list_jobs():
+            if job.project_id == project_id and str(job.user_id or "") == str(user_id or ""):
+                jobs.append(job)
+        if plan:
+            await plan([job.id for job in jobs])
+        stopped = 0
+        for job in jobs:
+            if job.enabled:
+                await self._store.update_job(job.id, {"enabled": False})
+                stopped += 1
+        await self._scheduler.reload()
+        if delete:
+            await self._scheduler.stop_project_runs(project_id, user_id)
+        for job in jobs:
+            if delete:
+                # Preserve store protection rules; no blanket force deletion.
+                await self.delete_job(job.id)
+            if checkpoint:
+                await checkpoint(job.id)
+        await self._scheduler.reload()
+        return {"stopped_cron_jobs": stopped}
 
     async def get_job(self, job_id: str) -> dict[str, Any] | None:
         job = await self._store.get_job(job_id)
@@ -131,10 +203,20 @@ class CronController:
     def job_metadata() -> dict[str, Any]:
         return cron_job_metadata()
 
+    @_serialize_mutation
     async def create_job(self, params: dict[str, Any]) -> dict[str, Any]:
+        # This marker is set only by the AgentServer-to-Gateway path after the
+        # project has been resolved against the user's AgentServer directory.
+        # Do not persist it with the job payload.
+        params = dict(params or {})
+        allow_unresolved_project_id = bool(
+            params.pop("_agentos_project_binding_verified", False)
+        )
         name = str(params.get("name") or "").strip()
         cron_expr = normalize_cron_expr(str(params.get("cron_expr") or "").strip())
-        timezone = str(params.get("timezone") or "Asia/Shanghai").strip() or "Asia/Shanghai"
+        timezone = (
+            str(params.get("timezone") or "Asia/Shanghai").strip() or "Asia/Shanghai"
+        )
         enabled = bool(params.get("enabled", True))
         description = str(params.get("description") or "")
         wake_offset_seconds = params.get("wake_offset_seconds", None)
@@ -144,6 +226,12 @@ class CronController:
             mode = normalize_cron_job_mode(mode)
         else:
             mode = None
+        model_name = validate_cron_model(params.get("model_name"))
+        # mcp：会话级 MCP 选择，随 job 落库；调度执行时注入 chat.send 的
+        # ``mcp`` 字段走 AgentServer 的 reconcile_session_mcp。只做类型
+        # 规范化（strip/去空/去重），不校验存在性（断连后 job 应降级运行）。
+        mcp = normalize_cron_job_mcp(params.get("mcp"))
+
         targets = self._normalize_targets(raw_targets)
 
         self._validate_schedule(cron_expr=cron_expr, timezone=timezone)
@@ -153,13 +241,71 @@ class CronController:
         chat_type = params.get("chat_type")
         delete_after_run = params.get("delete_after_run")
         timeout_seconds = params.get("timeout_seconds")
+        # work_mode 解析(严格校验:非法值由 resolve_request_work_mode 返回 BAD_REQUEST);
+        # 默认值按 controller 目标通道推断(tui→code,web/未设置→work)
+        from jiuwenswarm.server.runtime.session.work_mode import (
+            resolve_request_work_mode,
+        )
+
+        default_channel = (
+            self._target_channel.value if self._target_channel is not None else "web"
+        )
+        work_mode, mode_err = resolve_request_work_mode(params, default_channel)
+        if mode_err is not None:
+            raise ValueError(f"invalid work_mode: {params.get('work_mode')!r}")
+        # project_id / project_dir → project_id 解析(设计文档 §6.1 + work_mode 隔离):
+        # 优先接受显式 project_id(修改计划 §5 链路 A,与 CronTools 保持一致):
+        # 1. 默认项目 ID(default/default_code)→ 直接使用,按 project_id 映射 work_mode
+        # 2. 真实 project_id → 校验存在且未隐藏,从 Project 记录注入精确 work_mode
+        # 3. 无显式 project_id → 按 (work_mode, project_dir) 解析可见项目,
+        #    匹配不到(含命中隐藏项目 / 无命中)归默认项目
+        # 非绝对路径抛 ValueError → BAD_REQUEST
+        # AgentOS 多用户时，此绑定已由目标 AgentServer 完成。Gateway 必须把该
+        # 结果作为不透明值持久化，绝不能再探测部署侧 project_store：即使两边
+        # 恰好存在同 ID 项目，也会造成 work_mode 被错误覆盖。
+        raw_project_id = str(params.get("project_id") or "").strip()
+        project_dir_raw = params.get("project_dir")
+        project_dir_val = (
+            str(project_dir_raw).strip()
+            if isinstance(project_dir_raw, str) and project_dir_raw.strip()
+            else ""
+        )
+        if allow_unresolved_project_id:
+            # The marker is only injected after AgentServer-side validation.
+            # Do not import or read the Gateway-local project store on this path.
+            resolved_project_id = raw_project_id
+            caller_work_mode = str(params.get("work_mode") or "").strip()
+            if caller_work_mode in ("code", "work"):
+                work_mode = caller_work_mode
+        else:
+            from jiuwenswarm.server.runtime.session.project_store import (
+                resolve_cron_project_binding,
+            )
+
+            binding = resolve_cron_project_binding(
+                raw_project_id, project_dir_val, work_mode
+            )
+            if binding.error is not None:
+                raise ValueError(binding.error)
+            resolved_project_id = binding.project_id
+            work_mode = binding.work_mode
+        app_id = str(params.get("app_id") or "").strip()
+        # user_id：web 端创建定时任务时由 handler 注入 params（见 _cron_job_create），
+        # 执行时透传给 faas 的 X-Session-Context。agent 内部创建的 cron 无 user_id 即存空串。
+        user_id = str(params.get("user_id") or "").strip()
+        if not await self._scheduler.project_execution_allowed(
+            resolved_project_id, user_id
+        ):
+            raise ValueError("PROJECT_ARCHIVED: project execution is blocked")
         job = await self._store.create_job(
             job_id=str(params.get("id") or "").strip() or None,
             name=name,
             cron_expr=cron_expr,
             timezone=timezone,
             enabled=enabled,
-            wake_offset_seconds=int(wake_offset_seconds) if wake_offset_seconds is not None else None,
+            wake_offset_seconds=int(wake_offset_seconds)
+            if wake_offset_seconds is not None
+            else None,
             description=description,
             targets=targets,
             session_id=routing_sid,
@@ -167,14 +313,29 @@ class CronController:
             mode=mode,
             delete_after_run=delete_after_run,
             timeout_seconds=timeout_seconds,
+            project_id=resolved_project_id,
+            model_name=model_name,
+            mcp=mcp,
+            app_id=app_id,
+            work_mode=work_mode,
+            user_id=user_id,
         )
         await self._scheduler.reload()
         return job.to_dict()
 
+    @_serialize_mutation
     async def update_job(self, job_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         patch = dict(patch or {})
+        allow_unresolved_project_id = bool(
+            patch.pop("_agentos_project_binding_verified", False)
+        )
         if "mode" in patch:
             patch["mode"] = normalize_cron_job_mode(patch.get("mode"))
+        if "model_name" in patch:
+            patch["model_name"] = validate_cron_model(patch.get("model_name"))
+        if "mcp" in patch:
+            # 显式传 null/[] 归 None（清除选择，执行时回到全局默认集）。
+            patch["mcp"] = normalize_cron_job_mcp(patch.get("mcp"))
         if "targets" in patch:
             patch["targets"] = self._normalize_targets(patch["targets"])
         existing = await self._store.get_job(job_id)
@@ -188,7 +349,37 @@ class CronController:
             self._validate_schedule(cron_expr=cron_expr, timezone=timezone)
         if "description" in patch:
             name = str(patch.get("name") or existing.name or "").strip()
-            patch["description"] = self._normalize_description(str(patch.get("description") or ""), name)
+            patch["description"] = self._normalize_description(
+                str(patch.get("description") or ""), name
+            )
+
+        # work_mode / project_id / project_dir 重解析(共享 helper):
+        # 与 cron_tools.py update_job 共用同一 ``resolve_cron_job_patch``,
+        # 确保 Web RPC 与 AgentTool 两条链路逻辑一致。
+        # 仅 AgentServer 已校验过的多用户请求可跳过 Gateway 本地反查；单用户仍须
+        # 因无效 project_id 明确失败，避免把失效 ID 写入定时任务。
+        from jiuwenswarm.common.work_mode import DEFAULT_WEB_WORK_MODE
+
+        caller_work_mode = str(patch.get("work_mode") or "").strip()
+        if allow_unresolved_project_id:
+            # AgentServer has already resolved this project in the user's
+            # injected directory.  Never look up the deployment-side project
+            # table here: a colliding ID must not influence the stored job.
+            patch["work_mode"] = (
+                caller_work_mode
+                if caller_work_mode in ("code", "work")
+                else (existing.work_mode or DEFAULT_WEB_WORK_MODE)
+            )
+        else:
+            from jiuwenswarm.server.runtime.session.project_store import (
+                resolve_cron_job_patch,
+            )
+
+            resolve_cron_job_patch(
+                patch,
+                existing_work_mode=existing.work_mode or "",
+                channel_id="web",
+            )
 
         final_targets = str(patch.get("targets") or existing.targets).strip()
         if "session_id" in patch:
@@ -200,17 +391,32 @@ class CronController:
                 final_targets, existing.session_id
             )
 
+        if patch.get("enabled") or any(
+            key in patch for key in ("project_id", "project_dir")
+        ):
+            if not await self._scheduler.project_execution_allowed(
+                patch.get("project_id", existing.project_id), existing.user_id
+            ):
+                raise ValueError("PROJECT_ARCHIVED: project execution is blocked")
         job = await self._store.update_job(job_id, patch)
         await self._scheduler.reload()
         return job.to_dict()
 
-    async def delete_job(self, job_id: str) -> bool:
-        deleted = await self._store.delete_job(job_id)
+    async def delete_job(self, job_id: str, *, force: bool = False) -> bool:
+        deleted = await self._store.delete_job(job_id, force=force)
         if deleted:
             await self._scheduler.reload()
         return deleted
 
+    @_serialize_mutation
     async def toggle_job(self, job_id: str, enabled: bool) -> dict[str, Any]:
+        existing = await self._store.get_job(job_id)
+        if existing is None:
+            raise KeyError("job not found")
+        if enabled and not await self._scheduler.project_execution_allowed(
+            existing.project_id, existing.user_id
+        ):
+            raise ValueError("PROJECT_ARCHIVED: project execution is blocked")
         job = await self._store.update_job(job_id, {"enabled": bool(enabled)})
         await self._scheduler.reload()
         return job.to_dict()
@@ -235,13 +441,18 @@ class CronController:
                 raise
             if out and push_dt.isoformat() == out[-1]["push_at"]:
                 break
-            wake_dt = push_dt - timedelta(seconds=max(0, int(job.wake_offset_seconds or 0)))
+            wake_dt = push_dt - timedelta(
+                seconds=max(0, int(job.wake_offset_seconds or 0))
+            )
             out.append({"wake_at": wake_dt.isoformat(), "push_at": push_dt.isoformat()})
         return out
 
     async def run_now(self, job_id: str) -> str:
         run_id = await self._scheduler.trigger_run_now(job_id)
         return run_id
+
+    async def run_now_info(self, job_id: str) -> dict[str, str]:
+        return await self._scheduler.trigger_run_now_info(job_id)
 
     async def _create_job_tool(
         self,
@@ -254,6 +465,11 @@ class CronController:
         wake_offset_seconds: int | None = None,
         mode: str | None = None,
         timeout_seconds: int | None = None,
+        model_name: str | None = None,
+        mcp: list[str] | None = None,
+        project_dir: str | None = None,
+        project_id: str | None = None,
+        work_mode: str | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "name": name,
@@ -269,6 +485,16 @@ class CronController:
             params["mode"] = mode
         if timeout_seconds is not None:
             params["timeout_seconds"] = timeout_seconds
+        if model_name is not None and str(model_name).strip():
+            params["model_name"] = validate_cron_model(model_name)
+        if mcp is not None:
+            params["mcp"] = mcp
+        if project_dir is not None:
+            params["project_dir"] = str(project_dir).strip()
+        if project_id is not None and str(project_id).strip():
+            params["project_id"] = str(project_id).strip()
+        if work_mode is not None and str(work_mode).strip():
+            params["work_mode"] = str(work_mode).strip()
         return await self.create_job(params)
 
     async def _update_job_tool(
@@ -348,13 +574,13 @@ class CronController:
                     "cron_expr:\n"
                     "- Recurring (5 fields): minute hour day month day-of-week.\n"
                     "  Example: daily 9:00 = '0 9 * * *', every Monday 9:00 = '0 9 * * 1'.\n"
-                    "- Relative time (e.g. \"in X minutes\"): take now in the given timezone, "
+                    '- Relative time (e.g. "in X minutes"): take now in the given timezone, '
                     "compute run_at = now + X minutes, then encode run_at as 7-field cron "
-                    "with a fixed year (minute hour day month day-of-week second year). "
-                    "Example: run_at (Mar 19, 2026 10:07:00 local) -> '0 7 10 19 3 * 2026'.\n"
+                    "with a fixed year (second minute hour day month day-of-week year). "
+                    "Example: run_at (Mar 19, 2026 10:07:00 local) -> '0 7 10 19 3 ? 2026'.\n"
                     "- One-shot (runs only once): must use 7 fields with a fixed year: "
-                    "minute hour day month day-of-week second year. "
-                    "Example: 2026-03-28 17:00 (local) -> '0 17 28 3 * 0 2026'.\n"
+                    "second minute hour day month day-of-week year. "
+                    "Example: 2026-03-28 17:00 (local) -> '0 0 17 28 3 ? 2026'.\n"
                     "Warning: if you use a 5-field expression with fixed day/month "
                     "but year semantics implicitly '*', it will repeat every year; "
                     "for a real one-shot, use the 7-field form with a fixed year.\n"
@@ -364,17 +590,20 @@ class CronController:
                 input_params={
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "Job name"},
+                        "name": {
+                            "type": "string",
+                            "description": f"Job name (max {CRON_JOB_NAME_MAX_LENGTH} characters).",
+                        },
                         "cron_expr": {
                             "type": "string",
                             "description": (
                                 "Cron expression. "
                                 "Recurring jobs use 5 fields: minute hour dom month day-of-week. "
-                                "One-shot jobs must use 7 fields: minute hour dom month "
-                                "day-of-week second year (fixed year). "
+                                "One-shot jobs must use 7 fields: second minute hour dom month "
+                                "day-of-week year (fixed year). "
                                 "For relative time, treat it as one-shot: compute run_at = now + X minutes, "
                                 "then encode it as a 7-field expression with a fixed year. "
-                                "Example: 2026-03-28 17:00 (local) -> '0 17 28 3 * 0 2026'."
+                                "Example: 2026-03-28 17:00 (local) -> '0 0 17 28 3 ? 2026'."
                             ),
                         },
                         "timezone": {
@@ -400,27 +629,68 @@ class CronController:
                             "type": "string",
                             "description": (
                                 "Task payload text sent to the assistant at run time. "
-                                "Do not include time or frequency."
+                                "Do not include time or frequency. "
+                                f"Max {CRON_JOB_DESCRIPTION_MAX_LENGTH} characters."
                             ),
                         },
                         "wake_offset_seconds": {
                             "type": "integer",
-                            "description": "Seconds to wake before push. Default 300",
-                            "default": 300,
+                            "description": "Seconds to wake before push. Default 0",
+                            "default": 0,
                         },
                         "mode": {
                             "type": "string",
                             "enum": cron_job_modes_for_tools(),
                             "description": (
                                 "Agent runtime mode when the job runs. "
-                                "Default agent.fast. Use team for multi-agent team execution."
+                                "Default agent. Use team for multi-agent team execution."
                             ),
                         },
                         "timeout_seconds": {
                             "type": "integer",
                             "description": (
                                 "Execution timeout in seconds (60-259200). "
-                                "Default 600 for normal modes and 1200 for team modes."
+                                "Default 3600 (1 hour) for both normal and team modes."
+                            ),
+                        },
+                        "model_name": {
+                            "type": "string",
+                            "description": (
+                                "Model name or alias to use when the job runs. "
+                                "If omitted, uses the AgentServer default model."
+                            ),
+                        },
+                        "mcp": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Session-scoped MCP server names to enable when "
+                                "the job runs. Omit to inherit the creating "
+                                "session's MCP selection; pass [] for none."
+                            ),
+                        },
+                        "project_dir": {
+                            "type": "string",
+                            "description": (
+                                "Absolute path to the project directory this job belongs to. "
+                                "If omitted, uses the current session's project."
+                            ),
+                        },
+                        "project_id": {
+                            "type": "string",
+                            "description": (
+                                "Explicit project id (takes priority over project_dir). "
+                                "Omit to resolve from project_dir + work_mode."
+                            ),
+                        },
+                        "work_mode": {
+                            "type": "string",
+                            "enum": ["code", "work"],
+                            "description": (
+                                "Working mode of the target project (code/work). "
+                                "Defaults to current channel default (tui->code, web->work). "
+                                "Only used when project_id is not provided; ignored if project_id "
+                                "is provided (work_mode inherited from the project)."
                             ),
                         },
                     },
@@ -432,7 +702,10 @@ class CronController:
                 name="cron_update_job",
                 description=(
                     "Update an existing cron job. Pass job_id and a patch dict with fields to update "
-                    "(name, enabled, cron_expr, timezone, description, wake_offset_seconds, targets, mode)."
+                    "(name, enabled, cron_expr, timezone, description, wake_offset_seconds, "
+                    "targets, mode, model_name, mcp, project_dir, project_id). "
+                    f"name max {CRON_JOB_NAME_MAX_LENGTH} characters, "
+                    f"description max {CRON_JOB_DESCRIPTION_MAX_LENGTH} characters."
                 ),
                 input_params={
                     "type": "object",
@@ -442,7 +715,11 @@ class CronController:
                             "type": "object",
                             "description": (
                                 "Fields to update (name, enabled, cron_expr, timezone, "
-                                "description, wake_offset_seconds, targets, mode)"
+                                "description, wake_offset_seconds, targets, mode, model_name, "
+                                "mcp, project_dir, project_id). work_mode is not accepted as an "
+                                "independent patch field; to change work_mode, patch project_id "
+                                "or project_dir + work_mode (work_mode only disambiguates the "
+                                "target project when resolving project_dir)."
                             ),
                             "properties": {
                                 "targets": {
@@ -455,7 +732,41 @@ class CronController:
                                 "mode": {
                                     "type": "string",
                                     "enum": cron_job_modes_for_tools(),
-                                    "description": "Agent runtime mode (agent, team, agent.plan, ...)",
+                                    "description": "Agent runtime mode (agent, team, ...)",
+                                },
+                                "model_name": {
+                                    "type": "string",
+                                    "description": "Model to use when the job runs. \
+                                        Set to empty string to reset to default.",
+                                },
+                                "mcp": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": (
+                                        "Session-scoped MCP server names to enable when the "
+                                        "job runs. Set to [] to clear (use default set only)."
+                                    ),
+                                },
+                                "project_dir": {
+                                    "type": "string",
+                                    "description": "Absolute path to the project directory. \
+                                        Set to empty string for default project.",
+                                },
+                                "project_id": {
+                                    "type": "string",
+                                    "description": (
+                                        "Directly patch the project_id (takes priority over "
+                                        "project_dir). work_mode is re-injected from the "
+                                        "project record."
+                                    ),
+                                },
+                                "work_mode": {
+                                    "type": "string",
+                                    "enum": ["code", "work"],
+                                    "description": (
+                                        "Disambiguates target project when patching "
+                                        "project_dir. Not a standalone patchable field."
+                                    ),
                                 },
                             },
                         },

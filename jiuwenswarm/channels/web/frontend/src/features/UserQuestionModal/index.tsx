@@ -10,12 +10,13 @@ import { useChatStore } from '../../stores';
 import { Question, UserAnswer } from '../../types';
 
 interface UserQuestionModalProps {
-  onSubmit: (requestId: string, answers: UserAnswer[], source?: string) => void;
+  onSubmit: (requestId: string, answers: UserAnswer[], source?: string) => Promise<boolean>;
 }
 
 export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
   const { t } = useTranslation();
-  const { pendingQuestion, setPendingQuestion } = useChatStore();
+  const pendingQuestion = useChatStore((s) => s.runtimes[s.activeSessionId ?? '']?.pendingQuestions[0] ?? null);
+  const activeSessionId = useChatStore((s) => s.activeSessionId);
   const [answers, setAnswers] = useState<Map<number, UserAnswer>>(new Map());
 
   // 处理选项选择
@@ -24,6 +25,7 @@ export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
       setAnswers((prev) => {
         const newAnswers = new Map(prev);
         const current = newAnswers.get(questionIndex) || {
+          question: pendingQuestion?.questions[questionIndex]?.question,
           selected_options: [],
         };
 
@@ -48,7 +50,7 @@ export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
         return newAnswers;
       });
     },
-    []
+    [pendingQuestion]
   );
 
   // 处理自定义输入
@@ -57,6 +59,7 @@ export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
       setAnswers((prev) => {
         const newAnswers = new Map(prev);
         const current = newAnswers.get(questionIndex) || {
+          question: pendingQuestion?.questions[questionIndex]?.question,
           selected_options: [],
         };
         newAnswers.set(questionIndex, {
@@ -66,7 +69,7 @@ export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
         return newAnswers;
       });
     },
-    []
+    [pendingQuestion]
   );
 
   // 提交回答
@@ -77,61 +80,70 @@ export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
       (q, index) => {
         const answer = answers.get(index);
         if (answer) {
-          return answer;
+          return { ...answer, question: answer.question ?? q.question };
         }
         // 默认选择第一个选项
         return {
+          question: q.question,
           selected_options: q.options.length > 0 ? [q.options[0].label] : [],
         };
       }
     );
 
-    onSubmit(pendingQuestion.request_id, finalAnswers, pendingQuestion.source);
-    setAnswers(new Map());
+    void onSubmit(pendingQuestion.request_id, finalAnswers, pendingQuestion.source).then(
+      (accepted) => {
+        if (accepted) setAnswers(new Map());
+      },
+    );
   }, [pendingQuestion, answers, onSubmit]);
 
   // 取消/关闭
   const handleCancel = useCallback(() => {
-    setPendingQuestion(null);
+    if (activeSessionId && pendingQuestion) {
+      useChatStore.getState().consumePendingQuestion(activeSessionId, pendingQuestion);
+    }
     setAnswers(new Map());
-  }, [setPendingQuestion]);
+  }, [activeSessionId, pendingQuestion]);
 
   if (!pendingQuestion) {
     return null;
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" data-testid="user-question-modal">
       {/* 背景遮罩 */}
       <div
         className="absolute inset-0 bg-black/60"
         onClick={handleCancel}
+        data-testid="user-question-modal-backdrop"
       />
 
       {/* 弹窗内容 */}
       <div
         className="relative w-full max-w-lg max-h-[80vh] overflow-hidden rounded-xl animate-rise"
         style={{
-          backgroundColor: 'var(--card)',
-          boxShadow: 'var(--shadow-xl)',
+          backgroundColor: 'var(--color-surface-card)',
+          boxShadow: 'var(--effect-shadow-xl)',
         }}
+        data-testid="user-question-modal-dialog"
       >
         {/* 标题栏 */}
         <div
           className="px-6 py-4 flex items-center gap-4"
+          data-testid="user-question-modal-header"
           style={{
-            backgroundColor: 'var(--panel-strong)',
-            borderBottom: '1px solid var(--border)',
+            backgroundColor: 'var(--color-surface-panel-strong)',
+            borderBottom: '1px solid var(--color-border-default)',
           }}
         >
           <div
             className="w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0"
             style={{
-              background: 'linear-gradient(135deg, var(--accent), var(--accent-2))',
+              background: 'linear-gradient(135deg, var(--color-action-primary), var(--color-brand-secondary))',
             }}
           >
             <svg
-              className="w-5 h-5 text-white"
+              className="w-5 h-5 text-text-inverse"
               fill="none"
               stroke="currentColor"
               viewBox="0 0 24 24"
@@ -147,13 +159,15 @@ export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
           <div>
             <h2
               className="text-lg font-semibold"
-              style={{ color: 'var(--text-strong)' }}
+              style={{ color: 'var(--color-text-strong)' }}
+              data-testid="user-question-modal-title"
             >
               {t('userQuestion.title')}
             </h2>
             <p
               className="text-sm"
-              style={{ color: 'var(--muted)' }}
+              style={{ color: 'var(--color-text-secondary)' }}
+              data-testid="user-question-modal-subtitle"
             >
               {t('userQuestion.subtitle')}
             </p>
@@ -165,8 +179,9 @@ export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
           className="px-6 py-5 overflow-y-auto"
           style={{
             maxHeight: '50vh',
-            backgroundColor: 'var(--card)',
+            backgroundColor: 'var(--color-surface-card)',
           }}
+          data-testid="user-question-modal-questions"
         >
           {pendingQuestion.questions.map((question, qIndex) => (
             <QuestionItem
@@ -183,34 +198,37 @@ export function UserQuestionModal({ onSubmit }: UserQuestionModalProps) {
         {/* 操作按钮 */}
         <div
           className="px-6 py-4 flex justify-end gap-3"
+          data-testid="user-question-modal-actions"
           style={{
-            backgroundColor: 'var(--panel-strong)',
-            borderTop: '1px solid var(--border)',
+            backgroundColor: 'var(--color-surface-panel-strong)',
+            borderTop: '1px solid var(--color-border-default)',
           }}
         >
           <button
             onClick={handleCancel}
-            className="px-4 py-2 text-sm font-medium rounded-lg transition-colors"
+            className="px-4 py-2 text-sm font-medium rounded-lg "
+            data-testid="user-question-modal-cancel"
             style={{
-              color: 'var(--muted)',
+              color: 'var(--color-text-secondary)',
               backgroundColor: 'transparent',
             }}
             onMouseOver={(e) => {
-              e.currentTarget.style.backgroundColor = 'var(--bg-hover)';
-              e.currentTarget.style.color = 'var(--text)';
+              e.currentTarget.style.backgroundColor = 'var(--color-surface-hover)';
+              e.currentTarget.style.color = 'var(--color-text-primary)';
             }}
             onMouseOut={(e) => {
               e.currentTarget.style.backgroundColor = 'transparent';
-              e.currentTarget.style.color = 'var(--muted)';
+              e.currentTarget.style.color = 'var(--color-text-secondary)';
             }}
           >
             {t('common.cancel')}
           </button>
           <button
             onClick={handleSubmit}
-            className="px-5 py-2 text-sm font-medium text-white rounded-lg transition-opacity hover:opacity-90"
+            className="px-5 py-2 text-sm font-medium text-text-inverse rounded-lg  hover:opacity-90"
+            data-testid="user-question-modal-submit"
             style={{
-              background: 'linear-gradient(135deg, var(--accent), var(--accent-2))',
+              background: 'linear-gradient(135deg, var(--color-action-primary), var(--color-brand-secondary))',
             }}
           >
             {t('userQuestion.submit')}
@@ -246,28 +264,31 @@ function QuestionItem({
   const selectedOptions = answer?.selected_options || [];
 
   return (
-    <div className="mb-6 last:mb-0">
+    <div className="mb-6 last:mb-0" data-testid="user-question-modal-question" data-variant={questionIndex}>
       {/* 问题标题 */}
-      <div className="mb-3">
+      <div className="mb-3" data-testid="user-question-modal-question-header">
         <span
           className="inline-block px-2 py-0.5 text-xs font-medium rounded mb-2"
           style={{
-            color: 'var(--accent)',
-            backgroundColor: 'var(--accent-subtle)',
+            color: 'var(--color-action-primary)',
+            backgroundColor: 'var(--color-action-primary-subtle)',
           }}
+          data-testid="user-question-modal-question-badge"
         >
           {question.header}
         </span>
         <p
           className="font-medium"
-          style={{ color: 'var(--text-strong)' }}
+          style={{ color: 'var(--color-text-strong)' }}
+          data-testid="user-question-modal-question-text"
         >
           {question.question}
         </p>
         {question.multi_select && (
           <p
             className="text-xs mt-1"
-            style={{ color: 'var(--muted)' }}
+            style={{ color: 'var(--color-text-secondary)' }}
+            data-testid="user-question-modal-multi-select-hint"
           >
             {t('userQuestion.multiSelect')}
           </p>
@@ -275,7 +296,7 @@ function QuestionItem({
       </div>
 
       {/* 选项列表 */}
-      <div className="space-y-2">
+      <div className="space-y-2" data-testid="user-question-modal-options">
         {question.options.map((option, oIndex) => {
           const isSelected = selectedOptions.includes(option.label);
           return (
@@ -288,30 +309,32 @@ function QuestionItem({
                   question.multi_select || false
                 )
               }
-              className="w-full text-left px-4 py-3 rounded-lg transition-all"
+              className="w-full text-left px-4 py-3 rounded-lg "
+              data-testid="user-question-modal-option"
+              data-variant={option.label}
               style={{
                 backgroundColor: isSelected
-                  ? 'var(--accent-subtle)'
-                  : 'var(--bg-elevated)',
+                  ? 'var(--color-action-primary-subtle)'
+                  : 'var(--color-surface-elevated)',
                 border: `1px solid ${
-                  isSelected ? 'var(--accent)' : 'var(--border)'
+                  isSelected ? 'var(--color-action-primary)' : 'var(--color-border-default)'
                 }`,
-                color: isSelected ? 'var(--text-strong)' : 'var(--text)',
+                color: isSelected ? 'var(--color-text-strong)' : 'var(--color-text-primary)',
               }}
             >
               <div className="flex items-center gap-3">
                 <div
-                  className="w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0 transition-colors"
+                  className="w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0 "
                   style={{
                     border: `2px solid ${
-                      isSelected ? 'var(--accent)' : 'var(--border-strong)'
+                      isSelected ? 'var(--color-action-primary)' : 'var(--color-border-strong)'
                     }`,
-                    backgroundColor: isSelected ? 'var(--accent)' : 'transparent',
+                    backgroundColor: isSelected ? 'var(--color-action-primary)' : 'transparent',
                   }}
                 >
                   {isSelected && (
                     <svg
-                      className="w-3 h-3 text-white"
+                      className="w-3 h-3 text-text-inverse"
                       fill="currentColor"
                       viewBox="0 0 20 20"
                     >
@@ -328,7 +351,7 @@ function QuestionItem({
                   {option.description && (
                     <div
                       className="text-sm mt-0.5"
-                      style={{ color: 'var(--muted)' }}
+                      style={{ color: 'var(--color-text-secondary)' }}
                     >
                       {option.description}
                     </div>
@@ -342,30 +365,31 @@ function QuestionItem({
         {/* 自定义输入选项 */}
         <button
           onClick={() => setShowCustomInput(!showCustomInput)}
-          className="w-full text-left px-4 py-3 rounded-lg transition-all"
+          className="w-full text-left px-4 py-3 rounded-lg "
+          data-testid="user-question-modal-custom-option"
           style={{
             backgroundColor: showCustomInput
-              ? 'var(--accent-subtle)'
-              : 'var(--bg-elevated)',
+              ? 'var(--color-action-primary-subtle)'
+              : 'var(--color-surface-elevated)',
             border: `1px solid ${
-              showCustomInput ? 'var(--accent)' : 'var(--border)'
+              showCustomInput ? 'var(--color-action-primary)' : 'var(--color-border-default)'
             }`,
-            color: showCustomInput ? 'var(--text-strong)' : 'var(--text)',
+            color: showCustomInput ? 'var(--color-text-strong)' : 'var(--color-text-primary)',
           }}
         >
           <div className="flex items-center gap-3">
             <div
-              className="w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0 transition-colors"
+              className="w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0 "
               style={{
                 border: `2px solid ${
-                  showCustomInput ? 'var(--accent)' : 'var(--border-strong)'
+                  showCustomInput ? 'var(--color-action-primary)' : 'var(--color-border-strong)'
                 }`,
-                backgroundColor: showCustomInput ? 'var(--accent)' : 'transparent',
+                backgroundColor: showCustomInput ? 'var(--color-action-primary)' : 'transparent',
               }}
             >
               {showCustomInput && (
                 <svg
-                  className="w-3 h-3 text-white"
+                  className="w-3 h-3 text-text-inverse"
                   fill="currentColor"
                   viewBox="0 0 20 20"
                 >
@@ -383,22 +407,23 @@ function QuestionItem({
 
         {/* 自定义输入框 */}
         {showCustomInput && (
-          <div className="mt-2 ml-8">
+          <div className="mt-2 ml-8" data-testid="user-question-modal-custom-input">
             <textarea
               value={answer?.custom_input || ''}
               onChange={(e) => onCustomInput(questionIndex, e.target.value)}
               placeholder={t('userQuestion.customPlaceholder')}
               className="w-full px-3 py-2 text-sm rounded-lg resize-none focus:outline-none"
+              data-testid="user-question-modal-custom-input-field"
               style={{
-                backgroundColor: 'var(--bg-elevated)',
-                border: '1px solid var(--border)',
-                color: 'var(--text)',
+                backgroundColor: 'var(--color-surface-elevated)',
+                border: '1px solid var(--color-border-default)',
+                color: 'var(--color-text-primary)',
               }}
               onFocus={(e) => {
-                e.currentTarget.style.borderColor = 'var(--accent)';
+                e.currentTarget.style.borderColor = 'var(--color-action-primary)';
               }}
               onBlur={(e) => {
-                e.currentTarget.style.borderColor = 'var(--border)';
+                e.currentTarget.style.borderColor = 'var(--color-border-default)';
               }}
               rows={3}
             />

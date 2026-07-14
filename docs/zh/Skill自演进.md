@@ -1,370 +1,376 @@
 # Skill 自演进
 
-Agent 系统普遍存在一个问题：能力定义一旦写好，就基本不会再变了。工具调用出错，记录一条日志；用户反馈说理解有误，下次还是同样的逻辑。能力的上限，从部署那天就已经固定了。
+## 1. 功能概览
 
-JiuwenSwarm 基于 **openJiuwen 自演进框架**，以 `SkillCallOperator` 算子统一管理所有 Skills 的读写与演进分发。在此基础上，系统内置了一套演进信号检测机制，持续监听执行过程和对话内容，将真实使用中遇到的问题转化为 Skills 的改进输入。
+### 1.1 Skill 自演进简介
 
-## 核心组件
+Skill 自演进是 JiuwenSwarm 基于 openJiuwen 自演进框架实现的一项核心功能，它打破了传统 Agent 系统能力固定的局限。传统 Agent 系统的能力定义一旦写好，就基本不会再变——工具调用出错仅记录日志，用户反馈理解有误但下次仍使用同样逻辑。能力的上限从部署那天就已固定。
 
-### SkillCallOperator
+JiuwenSwarm 的 Skill 自演进机制将真实使用中反复出现的问题和更好做法转化为 Skill 的改进输入。它让 Skill 不再是一次性的静态文档，而是能够随着真实使用持续迭代的活文档。经验保存后，Agent 再次使用该 Skill 时会自动加载，无需立即改写 `SKILL.md`。
 
-SkillCallOperator 是 JiuwenSwarm 基于 openJiuwen 框架实现的 Operator 算子，负责 Skills 的统一管理。
+当前主流程不会因某个错误关键词或一次用户纠正就必然生成经验。对于 Single Agent 和 Agent Team 的 Team Leader，主 Agent 会根据当前任务证据判断改进是否可复用，再决定是否建议发起演进。
 
-作为 JiuwenSwarm 与 Skills 交互的核心入口，它承担以下职责：
-- 读取 Skill 定义（SKILL.md）
-- 执行 Skill 指令
-- 自动加载 Skill 积累的演进经验
+### 1.2 核心价值
 
-当系统检测到需要改进的地方，这些改进会先存入 `evolutions.json`，SkillCallOperator 会把它们合并后一起返回给 Agent。这意味着每次调用 Skill 时，都能获取到最新的演进经验。
+Skill 自演进机制的核心价值在于：
 
-### SkillOptimizer
+- **降低日常干预成本**：智能体识别可复用经验，再按审批配置保存。
+- **持续能力提升**：随着使用时间增加，Skill 可以通过累积的纠错、预检、降级策略和验证方法提高准确性和可靠性。
+- **自适应场景变化**：根据真实使用场景沉淀可复用的调整和优化。
+- **降低维护成本**：减少手动更新和维护 Skill 的工作量，并可通过查看、整理、重建和回滚管理已累积的经验。
 
-SkillOptimizer 是 JiuwenSwarm 基于 openJiuwen 框架实现的 Optimizer 优化器，负责驱动整个 Skill 演进流程。
+## 2. 配置与角色差异
 
-它的核心工作包括：
-1. **接收信号**：从 SignalDetector 接收异常信号，理解当前 Skill 遇到了什么问题
-2. **分析判断**：结合对话上下文，判断这个问题是否值得记录
-3. **生成改进**：调用 LLM 生成具体的改进建议
-4. **执行记录**：将生成的改进方案写入演进记录
+### 2.1 启用 Skill 自演进
 
-当你使用 `/evolve` 命令时，背后就是 SkillOptimizer 在工作。
+Skill 自演进由 `react.evolution.skill_evolution` 统一开关控制，默认为 `false`。Web 配置页将该开关显示为 **本地技能自动演进与沉淀**，TUI 在 Features 分组中显示为 **技能演进与创建**。
 
-### SkillEvolutionManager
-
-SkillEvolutionManager 是演进生命周期的核心管理者，负责协调各个阶段的演进工作：
-
-- **信号扫描**：调用 SignalDetector 提取需要演进的事件
-- **记录生成**：调用 LLM 将信号转化为可执行的改进方案
-- **存储管理**：维护 `evolutions.json` 文件的读写
-- **内容固化**：将待定演进记录合并到原始 SKILL.md
-
-它衔接了 SignalDetector、SkillOptimizer 和 SkillCallOperator，形成完整的演进闭环。
-
-### SignalDetector
-
-SignalDetector 是演进信号的检测器，持续监听对话和执行结果中的异常。
-
-它基于规则工作，不需要调用 LLM，因此响应速度快：
-- 监听每一次工具执行的结果，捕捉错误关键词
-- 捕捉用户的纠正反馈（如"不对"、"应该"等）
-- 判断信号应该归到哪个 Skill 并关联上下文
-
----
-
-## 识别哪些信号？
-
-信号来源主要分两类：
-
-### 执行异常
-
-包括工具调用超时、接口返回报错、代码执行中的异常中断等。只要任务执行中出现明确的失败字样，系统会自动识别并将其归因到当前正在执行的 Skill 上。
-
-检测关键词包括但不限于：
-- 通用错误：`error`、`exception`、`failed`、`failure`、`timeout`
-- 网络相关：`connection error`、`econnrefused`、`enoent`
-- 其他：`permission denied`、`command not found`
-
-### 用户纠错
-
-当你说“不对”、“应该换个方式”、“你理解错了”这类话语时，系统不会将其当作普通对话略过，而是会识别为一次有效的负反馈。这类信号往往比报错日志更有价值——它直接点出了 Skill 在理解或处理逻辑上的偏差。
-
-检测模式包括：
-- 中文：`不对`、`不是这`、`错 了`、`应该 是`、`你搞错了`、`纠正一下`
-- 英文：`that's wrong`、`you're wrong`、`should be`、`actually`
-
----
-
-## 信号捕获之后做什么？
-
-系统会全程追踪当前活跃的 Skill 模块，确保每个信号都能准确对应到具体的 Skill 文档。具体的改写逻辑如下：
-
-### 异常案例 → 排障建议
-
-执行失败的现场记录会被整理成具体的操作建议，补充进 Skills 的 `Troubleshooting`（已知问题与处理方式）部分。下次遇到相同场景，Skill 可以主动提示已知的风险点和应对方式。
-
-```text
-原始信号：
-Tool 'weather-check' returned: Error: API timeout after 30s
-
-演进为：
-## Troubleshooting
-- 遇到天气 API 超时错误时，优先检查网络连接，可考虑添加重试机制或降级策略。
-```
-
-### 纠错交互 → 示例补充
-
-用户纠错的对话片段会作为新的 `Example`（正确用法示例）写入 Skills 文档，让后续的调用更容易理解用户的真实意图。
-
-```text
-原始信号：
-User: 不对，我说的是查询上海不是北京
-
-演进为：
-## Examples
-- 用户说"查询上海天气"时应调用上海的经纬度参数，而非默认北京
-```
-
----
-
-## 演进流程
-
-```text
-用户对话 / 工具执行
-        │
-        ▼
-┌───────────────────┐
-│  SignalDetector   │  监听并识别信号
-│   检测执行异常     │
-│   检测用户纠错     │
-└────────┬──────────┘
-         │
-         ▼
-┌─────────────────────────────┐
-│    SkillEvolutionManager    │
-│         .scan()            │  提取演进信号
-└────────────┬───────────────┘
-             │
-             ▼
-┌─────────────────────────────┐
-│    SkillEvolutionManager    │
-│       .generate()          │  LLM 生成演进记录
-└────────────┬───────────────┘
-             │
-             ▼
-┌─────────────────────────────┐
-│      evolutions.json        │  写入待固化记录
-│    (Skill 目录下)          │
-└────────────┬───────────────┘
-             │
-             ▼ (可选)
-┌─────────────────────────────┐
-│         .solidify()         │  合并到 SKILL.md
-└─────────────────────────────┘
-```
-
----
-
-## 演进文件
-
-演进记录存储在每个 Skill 目录下的 `evolutions.json` 文件中：
-
-```json
-{
-  "skill_id": "<skill_name>",
-  "version": "1.0.0",
-  "updated_at": "2024-01-15T10:30:00Z",
-  "entries": [
-    {
-      "id": "ev_1234abcd",
-      "source": "execution_failure",
-      "timestamp": "2024-01-15T10:30:00Z",
-      "context": "API timeout after 30s",
-      "change": {
-        "section": "Troubleshooting",
-        "action": "append",
-        "content": "## 常见问题\n- 遇到 API 超时错误时..."
-      },
-      "applied": false
-    }
-  ]
-}
-```
-
-其中 `applied: false` 表示待固化状态，`applied: true` 表示已固化到 SKILL.md。
- 
----
-
-## 演进效果
-
-这套机制让 Skills 不再是一次性的静态文档，而是随着真实使用持续迭代的活文档。不需要任何人工干预，智能体在日常运转过程中就完成了对自身的改进。
-
-演进后的 Skill 在下次被调用时，会自动检查 Skill 目录下是否存在 `evolutions.json` 文件，存在时会自动加载演进经验的内容，从而：
-- 主动提示已知的风险点和应对方式
-- 更准确地理解用户的真实意图
-- 持续优化自身的表现
-
----
-
-## 如何使用
-
-使用 Skill 自演进时，可以先按下面顺序判断自己要做什么：
-
-- 想让系统在后台自动发现并沉淀经验：开启自动扫描。
-- 想立即针对某个已有 Skill 生成经验：使用 `/evolve` 系列命令。
-- 想让系统在缺少合适 Skill 时自动提出新 Skill 创建建议：开启 Skill 自动创建。
-
-### 自演进配置开关
-
-在配置页的 **自演进配置** 中，可以按需要开启：
-
-- **自动检测可演进信号**：让系统在对话和工具执行后自动扫描失败、纠错等演进信号；对应配置 `evolution.auto_scan`，默认关闭。
-- **自动建议创建新技能**：让系统在缺少合适 Skill 时提出新 Skill 创建建议；对应配置 `evolution.skill_create`，默认关闭。
-
-如果通过配置文件管理，对应写法是：
+最小配置如下：
 
 ```yaml
-evolution:
-  auto_scan: false
-  skill_create: false
+react:
+  evolution:
+    skill_evolution: true
+    auto_save: false
 ```
 
-- 环境变量 `EVOLUTION_AUTO_SCAN` 会覆盖 `auto_scan`，`SKILL_CREATE` 会覆盖 `skill_create`。
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `react.evolution.skill_evolution` | `false` | 统一启用 Skill 演进、自动 Skill 创建建议及相关命令和工具 |
+| `react.evolution.auto_save` | `false` | YAML-only 高级选项；控制 Single Agent 和 Team Leader 的经验提交是否需要用户审批 |
+| `react.evolution.review_feedback_min_confidence` | `0.7` | Reviewer Feedback 归因进入团队演进流程的最低置信度 |
 
-![打开自演进自动检测](../assets/images/skill演进_自动检测开关.png)
+关闭 `skill_evolution` 会禁用相关 Rails、自检提示、演进工具和 `/evolve` 命令，但不影响用户显式使用通用 `skill-creator` 或 `swarmskill-creator`。
 
-### 自动演进
+升级时，系统会按新模板同步配置结构，但不会将旧版 `enabled`、`auto_scan`、`skill_create` 或相关环境变量的取值转换为 `skill_evolution`。如果升级前已启用过相关能力，请在升级后重新确认并显式开启 **Skill 自演进**。
 
-开启 **自动检测可演进信号** 后，系统会在工具执行和对话结束后自动检测演进信号。常见信号包括工具失败、执行报错、用户纠错和明确负反馈。
+![打开本地技能自动演进与沉淀](../assets/images/skill演进_开关.png)
 
-如果检测到有效信号，系统会为相关 Skill 生成演进经验。下次调用该 Skill 时，这些经验会被自动加载，帮助 Agent 避免重复错误。
+### 2.2 角色差异
 
-![自动触发](../assets/images/skill演进_自动触发.png)
+| 角色 | 触发和审批方式 |
+| --- | --- |
+| Single Agent | 主 Agent 按非 follow-up 任务轮次计数，当前默认每 5 轮自检一次；是否审批由 `auto_save` 决定 |
+| Team Leader | 每次团队任务确认完成后自检当次团队执行；审批同样由 `auto_save` 控制，并面向用户展示建议和审批交互 |
+| Teammate | 使用后台被动信号链路并固定自动保存，不展示与上述主流程相同的自检建议和审批交互 |
 
-### 手动触发已有 Skill 演进
+## 3. 演进触发与管理
 
-如果你刚遇到某个 Skill 的失败、偏差或需要补充的经验，可以直接输入：
+### 3.1 Agent 自动建议
 
-```bash
-/evolve <skill_name> [user_query]
+开启功能后，Single Agent 和 Team Leader 在不同时机发起自检：
+
+- **Single Agent**：按非 follow-up 任务轮次计数，当前默认累计 5 轮后检查一次。后台 heartbeat、cron 和 follow-up 任务不计入该阈值。
+- **Team Leader**：不使用上述 5 轮阈值；每次团队任务被确认为完成后，对该次团队执行发起一次自检。
+
+触发自检后，主 Agent 会判断当前任务是否包含值得保留的可复用更新，例如：
+
+- 可以应用到后续同类任务的用户纠正。
+- Skill 缺少必要的预检、参数说明、降级策略或验证步骤。
+- 某项执行失败暴露出可重复修复的 Skill 指令缺口。
+
+临时环境故障、一次性事实、个人偏好或证据不足的推测不应生成演进建议。如果主 Agent 判断存在可复用更新，它会在正常回复末尾简要说明改进点，并询问是否发起 Skill 演进；否则不会向用户暴露这次内部自检。
+
+![Agent 判断存在可复用改进并建议发起演进](../assets/images/skill演进_Agent自动建议.png)
+
+> **前置条件**：开启 **Skill 自演进**，并确保目标 Skill 已安装且可见。使用 Single Agent 时，完成 5 个符合条件的非 follow-up 任务轮次；使用 Team Leader 时，完成一次团队任务并使任务状态被确认为全部完成。
+
+### 3.2 Reviewer Feedback 驱动的团队演进
+
+在 scheduled 团队中，如果 Task 验收失败且已开启 Skill 自演进，系统会对 Reviewer Feedback 进行归因：
+
+- 归因为 Skill 缺陷时，系统保留 observation，并在全部 Task 完成后按 Skill 汇总，交给 Team Skill 演进流程。
+- 归因为执行者失误或无法归因时，只记录失败，不修改 Skill。
+- 没有可归因 Skill、但相同可复用模式跨 Task 重复出现时，系统会发起新 Team Skill 审批。
+
+只有达到 `react.evolution.review_feedback_min_confidence` 阈值的归因结果才会进入上述流程。Reviewer Feedback 不会创建或更新成员私有 Skill 副本，也不使用 Single Agent 的 5 轮计数逻辑。
+
+已有 Team Skill 的更新沿用 Team Leader 的演进审批流程，默认 `auto_save: false` 时需要用户审批；新 Team Skill 创建使用独立的创建审批流程。
+
+### 3.3 使用 `/evolve` 主动发起
+
+如果希望立即审查某个 Skill，可以输入：
+
+```text
+/evolve <skill_name> [user_intent]
 ```
 
-例如：
+`user_intent` 是可选的演进意图，可以用来指明希望改进的问题。例如：
 
-```bash
-/evolve xlsx 创建发票文件前需要向我确定具体要求
+```text
+/evolve xlsx 增加处理合并单元格前的预检和失败恢复说明
 ```
 
-![手动触发](../assets/images/skill演进_手动触发.png)
+系统会审查当前任务中可用的对话和执行证据，然后返回“无需演进”或结构化改进提案。`/evolve` 是发起审查，不代表一定会生成或保存经验。
 
-在**规划模式**下，系统会优先扫描当前会话中的工具失败和用户纠错信号。如果没有检测到明确演进信号，可以在命令后补充 `user_query`，直接说明希望 Skill 改进什么。
+自动建议仍遵循运行模式的对象边界：Single Agent 面向普通 Skill，Team Leader 面向 Team/Swarm Skill。显式使用 `/evolve` 时，系统会按目标的实际类型发起审查，因此 Team 模式可以手动演进普通 Skill，普通模式也可以手动演进 Team/Swarm Skill；目标仍需已安装且对当前 Agent 可见。
 
-在**集群模式**下，`/evolve <skill_name>` 必须带上演进意图，例如：
+![使用 evolve 命令主动发起并生成待审批提案](../assets/images/skill演进_命令触发.png)
 
-```bash
-/evolve pptx 让团队报告导出失败时给出可恢复步骤
-```
+> **前置条件**：开启 **Skill 自演进**，确保目标 Skill 已安装且对当前 Single Agent 或 Team Leader 可见，然后输入带 Skill 名称的 `/evolve` 命令。如需展示审批交互，还需设置 `auto_save: false`。
 
-### 查看和整理演进经验
+### 3.4 审批和保存
 
-想查看某个 Skill 的详细经验库和评分，可以输入：
+对于 Single Agent 和 Team Leader，`react.evolution.auto_save` 使用相同的审批规则：
 
-```bash
-/evolve_list <skill_name> [--sort score]
-```
+- `auto_save: false`：提案通过校验后进入用户审批，确认后才写入经验库。
+- `auto_save: true`：提案通过校验后跳过用户审批并自动保存。
 
-例如：
+Teammate 使用固定自动保存策略，不按上述 `auto_save` 值展示审批交互。经验保存后，后续调用该 Skill 时会自动加载。
 
-```bash
-/evolve_list xlsx --sort score
-```
+`auto_save: false` 时，Single Agent 或 Team Leader 会向用户呈现经验审批入口。
 
-在**规划模式**下，无参数 `/evolve` 仍会返回当前可见 Skill 的待处理演进记录摘要；Team 模式不支持裸 `/evolve`，必须提供 Skill 名称和演进意图。因此日常查看经验库时，建议使用 `/evolve_list <skill_name>`。
+![Skill 演进经验审批入口](../assets/images/skill演进_审批.png)
 
-如果某个 Skill 的经验库开始重复、过长或价值不清，可以让系统生成整理方案：
+展开审批内容后，可以查看结构化提案的 `target`、`section`、`reason` 和 `content`，再决定是否批准。
 
-```bash
+![查看并审批结构化 Skill 演进提案](../assets/images/skill演进_审批详情.png)
+
+### 3.5 查看和整理经验
+
+优先使用 Web 管理已保存的经验。在技能列表中找到目标 Skill，然后点击 **查看技能经验**。
+
+![从技能列表打开技能经验](../assets/images/skill演进_技能经验入口.png)
+
+打开经验编辑器后，可以查看每条记录、修改经验内容、删除记录并保存。
+
+![在 Web 中查看和编辑已保存的 Skill 经验](../assets/images/skill演进_技能经验.png)
+
+也可以使用命令：
+
+```text
+/evolve_list <skill_name>
 /evolve_simplify <skill_name> [user_intent]
 ```
 
-例如：
+`/evolve_list` 显示指定 Skill 的经验摘要；`/evolve_simplify` 审查已有经验，并对合并、精炼或删除建议执行相应流程。
 
-```bash
-/evolve_simplify xlsx 合并重复的导出失败经验
-```
+![使用命令查看和整理 Skill 经验](../assets/images/skill演进_查看与整理经验.png)
 
-整理方案不会静默落盘。系统会弹出审批，确认后才执行，拒绝后会丢弃本次整理。
+### 3.6 重建和回滚
 
-![查看和整理演进经验](../assets/images/skill演进_查看和整理经验.png)
+已保存的经验不需要重建就能在后续调用中生效。如果希望将经验永久合并到 `SKILL.md`，使用：
 
-### 重建 Skill 文档
-
-当某个 Skill 积累了较多演进经验，希望把经验重新组织进 `SKILL.md` 时，可以输入：
-
-```bash
+```text
 /evolve_rebuild <skill_name> [user_intent]
 ```
 
-例如：
+重建会先归档当前 Skill 和经验日志，再将经验合入 `SKILL.md`；已合入的经验不再作为独立演进条目保留。
 
-```bash
-/evolve_rebuild xlsx 增加环境缺少工具时的应对策略
+![将已保存经验重建进 Skill](../assets/images/skill演进_重建.png)
+
+查看可用归档或恢复指定版本时使用：
+
+```text
+/evolve_rollback <skill_name>
+/evolve_rollback <skill_name> <version>
+/evolve_rollback <skill_name> latest
 ```
 
-这个命令会生成后续执行任务，并继续作为普通 Agent / Team 任务运行。它不是直接覆盖 `SKILL.md` 的快捷按钮，实际改动仍会通过任务执行和审批流程完成。
+不提供版本时会列出可用归档；提供具体版本或 `latest` 时会执行恢复。恢复前的当前状态也会自动归档，以便再次回滚。
 
-![重建SKILL](../assets/images/skill演进_重建.png)
+![查看并恢复 Skill 重建归档](../assets/images/skill演进_回滚.png)
 
-### Skill 自动创建
+### 3.7 `evolutions.json` 高级排障
 
-已有 Skill 自演进解决的是“已有 Skill 怎么变好”。如果当前任务暴露出缺少合适 Skill 的问题，可以开启 Skill 自动创建：
+系统将经验保存在 Skill 目录下的 `evolutions.json`。该文件在首次保存经验时动态创建，没有任何已保存经验时可能不存在。
 
-```yaml
-evolution:
-  skill_create: true
-```
-
-开启后，系统会注册 `SkillCreateRail`。在集群模式中，会注册 `TeamSkillCreateRail`。当系统判断当前任务需要沉淀成新 Skill 时，会提出创建建议，并通过后续任务完成 Skill 创建。
-
-注意：
-
-- `skill_create` 默认关闭，适合在希望主动沉淀新能力时开启。
-- 环境变量 `SKILL_CREATE=true` 会覆盖配置文件。
-
-### 适用模式
-
-| 模式 | 支持情况 |
-|---|---|
-| 规划模式 `agent.plan` | 支持已有 Skill 演进、经验查看、整理、重建和 Skill 自动创建。 |
-| 集群模式 `team` | 支持团队 Skill 演进、经验查看、整理、重建；`/evolve <skill_name>` 必须带演进意图。 |
-| Code 模式 / `agent.fast` | 不支持 `/evolve` 系列 Skill 自演进命令。 |
-
-### 审批和状态
-
-- `/evolve` 和 `/evolve_simplify` 生成变更后不会静默写入，会推送确认问题。
-- 接受后，后端接受本次演进记录并写入或固化；拒绝后丢弃本次生成内容。
-- Team 技能演进接受后会同步团队技能目录。
-- 演进或审批未完成时，后续输入会先排队，等待演进完成后再发送。
-
-### 如何管理演进经验
-
-演进经验存储在 Skill 目录下的 `evolutions.json` 文件中。日常建议优先使用：
-
-- Web 前端 **查看技能经验**：编辑经验内容 `change.content`，或删除整条经验后保存。
-- `/evolve_list <skill_name>`：查看经验库和评分。
-- `/evolve_simplify <skill_name> [user_intent]`：整理、合并、清理经验库。
-- `/evolve_rebuild <skill_name> [user_intent]`：把经验重新组织进 `SKILL.md`。
-
-不要修改 `change.content` 之外的字段，例如 `id`、`source`、`timestamp`、`context`、`section`、`action`、`target`、`relevant`、`applied`。这些字段由系统生成和维护。
-
-**目录位置：**
-
-```
-~/.jiuwenswarm/workspace/agent/skills/<skill_name>/
-├── SKILL.md           # Skill 源文档
-├── evolutions.json    # 演进经验记录
+```text
+~/.jiuwenswarm/agent/workspace/skills/<skill_name>/
+├── SKILL.md
+├── evolutions.json    # 首次保存经验后创建
 └── ...
 ```
 
-**演进记录示例：**
+Agent Team 使用同一个全局 Skill 库，因此经验仍保存在上述路径。成员可见的 Skill 由团队的可见性声明决定，详见 [Agent Team](AgentTeam.md) 的“Team Skills”小节。
+
+下面是当前存储结构的**只读示例**：
 
 ```json
 {
+  "skill_id": "file-operations",
+  "version": "1.0.0",
+  "updated_at": "2026-08-17T10:30:00+00:00",
   "entries": [
     {
-      "id": "ev_1cdbc3a5",
-      "source": "execution_failure",
-      "timestamp": "2026-03-09T09:33:08Z",
-      "context": "错误上下文",
+      "id": "ev_1234abcd",
+      "source": "user_intent",
+      "timestamp": "2026-08-17T10:30:00+00:00",
+      "context": "Relative file path failed before checking the working directory",
       "change": {
         "section": "Troubleshooting",
         "action": "append",
-        "content": "演进内容",
-        "relevant": true
+        "content": "读取相对路径前，先确认工作目录和候选路径。",
+        "target": "body"
       },
-      "applied": false
+      "applied": false,
+      "score": 0.6,
+      "usage_stats": {
+        "times_presented": 0,
+        "times_used": 0,
+        "times_positive": 0,
+        "times_negative": 0
+      },
+      "summary": "增加相对路径预检"
     }
   ]
 }
 ```
 
-前端保存后，下次对话会自动加载更新后的经验内容。
+- `entries` 包含已保存的经验记录。
+- `change` 描述一条经验的改进位置、操作和具体内容。
+- `target` 表示改进所属的 Skill 层，可以是 `description`、`body` 或 `script`。
+
+该示例用于帮助理解和排障，不是手工创建记录的接口契约；系统可能随版本扩展可选字段。Web 经验编辑器和演进命令是首选管理入口。只在排障或恢复时直接编辑 `evolutions.json`，并在编辑前备份文件、编辑后校验 JSON 语法。不要手动新增记录或改写 `id`、`source`、`timestamp` 等系统管理字段。
+
+## 4. 案例：为文件读取 Skill 补充预检
+
+### 4.1 场景背景
+
+假设我们有一个简单的 `file-operations` Skill，用于处理文件操作。该 Skill 包含一个 `read_file` 功能，用于读取文件内容。
+
+**初始 `SKILL.md` 定义：**
+
+```markdown
+# file-operations Skill
+
+## Functions
+
+### read_file
+- 功能：读取指定文件的内容
+- 参数：
+  - `file_path`: 文件路径
+- 返回：文件内容
+
+## Examples
+- 读取文件：read_file({"file_path": "/path/to/file.txt"})
+```
+
+这份初始说明没有要求 Agent 在读取相对路径前确认工作目录和候选路径。
+
+### 4.2 在多轮对话中累积证据
+
+#### 第一轮：发现问题
+
+```text
+User: 帮我读取当前目录下的 test.txt 文件。
+Assistant: 好的，我将为您读取当前目录下的 test.txt 文件。
+Tool: file-operations.read_file({
+  "file_path": "test.txt"
+})
+Tool Response: Error: File not found: test.txt
+Assistant: 对不起，我找不到 test.txt 文件。请问文件的完整路径是什么？
+```
+
+这次执行失败可以作为演进审查的证据，但不会因 `Error` 字样就必然生成经验。
+
+#### 第二轮：用户提供可行路径
+
+```text
+User: 应该是 ./test.txt。
+Assistant: 好的，我将为您读取 ./test.txt 文件。
+Tool: file-operations.read_file({
+  "file_path": "./test.txt"
+})
+Tool Response: 这是 test.txt 文件的内容。
+Assistant: 已成功读取 ./test.txt 文件。
+```
+
+#### 第三轮：用户补充可复用要求
+
+```text
+User: 不对，当我只提供文件名时，你应该先确认当前目录，不需要我手动添加 ./。
+Assistant: 非常感谢您的反馈。我会先确认当前目录和候选路径，再读取文件。
+```
+
+这条纠正进一步说明了失败的原因和希望复用的做法。在 Single Agent 的计数自检或 Team Leader 的团队任务完成自检中，主 Agent 会判断“在读取相对路径前确认工作目录和候选路径”是否适用于后续同类任务，而不是根据“不对”等关键词直接生成记录。
+
+### 4.3 审查并保存提案
+
+如果主 Agent 判断该做法可复用，它会询问用户是否为 `file-operations` 发起演进。用户也可以不等待自检，直接输入：
+
+```text
+/evolve file-operations 增加读取相对路径前的工作目录和候选路径预检
+```
+
+发起后，`evolution_reviewer` 会审查当前证据，并在确认值得演进时生成结构化提案。提案经审批或自动保存后，会写入 `file-operations` 的经验库。
+
+### 4.4 演进后的效果
+
+下次调用 `file-operations` 时，Agent 会自动加载这条经验并按其中的预检方法执行：
+
+```text
+User: 帮我读取当前目录下的 test.txt 文件。
+Assistant: 我会先确认当前目录，然后读取 ./test.txt。
+Tool: file-operations.read_file({
+  "file_path": "./test.txt"
+})
+Tool Response: 这是 test.txt 文件的内容。
+Assistant: 已成功读取 test.txt 文件。
+```
+
+现在，当用户只提供文件名时，Agent 可以按已保存的经验先确认当前目录和候选路径，不再要求用户手动补充 `./` 前缀。
+
+## 5. 工作原理
+
+### 5.1 关键组件
+
+- **`SkillEvolutionRail` / `TeamSkillEvolutionRail`**：注册演进工具和审查 Subagent，并组织自检、提交和演进生命周期。
+- **`evolution_reviewer` Subagent**：只使用受限的只读演进工具审查当前证据，判断是否需要演进并生成结构化提案。
+- **`EvolutionInterruptRail`**：在需要人工确认时承接审批交互。
+- **`EvolutionStore`**：负责查询、保存和重建经验数据。
+
+### 5.2 Single Agent 和 Team Leader 主流程
+
+```text
+Single Agent 计数自检，或 Team Leader 任务完成自检，或 /evolve
+        │
+        ▼
+主 Agent 判断是否存在可复用更新
+        │
+        ▼
+用户确认发起（自动自检场景）
+        │
+        ▼
+evolution_reviewer 审查证据并生成提案
+        │
+        ▼
+提案校验
+        │
+        ├─ auto_save: false → EvolutionInterruptRail 审批
+        └─ auto_save: true  → 自动保存
+                              │
+                              ▼
+                       EvolutionStore
+                              │
+                              ▼
+                       evolutions.json
+```
+
+### 5.3 Teammate 兼容链路
+
+Teammate 不使用上述面向用户的自动自检交互，而是保留简化的被动链路：
+
+```text
+被动信号检测 → SkillExperienceOptimizer 生成候选经验 → 固定自动保存
+```
+
+`SkillExperienceOptimizer` 仍服务于这条被动链路，但不负责 Single Agent、Team Leader 或 `/evolve` 的主要判断和提案流程。
+
+## 6. 命令速查
+
+| 命令 | 作用 |
+| --- | --- |
+| `/evolve` | 查看所有可见 Skill 的 pending 经验摘要 |
+| `/evolve <skill_name> [user_intent]` | 为指定 Skill 发起审查 |
+| `/evolve_list <skill_name>` | 查看指定 Skill 的经验摘要 |
+| `/evolve_simplify <skill_name> [user_intent]` | 整理指定 Skill 的经验 |
+| `/evolve_rebuild <skill_name> [user_intent]` | 将经验重建进 Skill |
+| `/evolve_rollback <skill_name> [version]` | 查看可恢复版本，或将 Skill 恢复到指定版本 |
+
+---
+
+## 返回导航
+
+- [返回文档首页](../README.md)
+- [返回项目首页](../../README_CN.md)
