@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+try:
+    # Inside the jiuwenswarm app: join the unified JiuwenError taxonomy.
+    from jiuwenswarm.common.errors import JiuwenError as _JiuwenError
 
-class LLMClientError(RuntimeError):
+    _BASES: tuple = (_JiuwenError, RuntimeError)
+except ImportError:
+    # Standalone openjiuwen-skillsdispatch build (PyYAML-only deps).
+    _BASES = (RuntimeError,)
+
+
+class LLMClientError(*_BASES):
     """Base error for progressive LLM client failures."""
 
 
