@@ -4095,7 +4095,8 @@ class JiuWenSwarmDeepAdapter:
         self._image_gen_tool_registered = False
         if self._image_gen_model_config:
             try:
-                Runner.resource_mgr.add_tool(generate_image)
+                if not Runner.resource_mgr.get_tool(generate_image.card.id):
+                    Runner.resource_mgr.add_tool(generate_image)
                 tool_cards.append(generate_image.card)
                 self._image_gen_tool_registered = True
             except Exception as exc:
