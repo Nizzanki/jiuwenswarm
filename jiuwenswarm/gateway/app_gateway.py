@@ -36,6 +36,7 @@ from jiuwenswarm.common.ws_diagnostics import format_ws_diagnostics, describe_ws
 # user_id 白名单: 仅允许字母数字及 _-, 拒绝路径遍历字符
 _SAFE_USER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 # --- Early --dotenv parsing (before jiuwenswarm imports) ---
+from jiuwenswarm.common.errors import record_boundary_exception
 from jiuwenswarm.dotenv_early import parse_dotenv_early, load_dotenv_runtime
 from jiuwenswarm.gateway.channel_manager.base import BaseWebChannel
 
@@ -349,8 +350,9 @@ class _InboundGatewayServer:
                 handled = self._inbound_handler(msg)
                 if asyncio.iscoroutine(handled):
                     await handled
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 logger.exception("[App] Gateway inbound handling failed: id=%s", getattr(msg, "id", None))
+                record_boundary_exception("gateway.serve_loop", exc)
 
 
 async def _connect_with_retry(

@@ -7,11 +7,10 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from jiuwenswarm.common.errors import record_boundary_exception
 from jiuwenswarm.gateway.channel_manager.base import BaseChannel
 from jiuwenswarm.common.e2a.acp.acp_tool_updates import is_reasoning_event
 from jiuwenswarm.common.schema.message import EventType, Message, ReqMethod
-from jiuwenswarm.gateway.routing.keys import DeliveryTarget
-from jiuwenswarm.gateway.routing.session_sharing import RoutingTarget
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +234,7 @@ class _A2AAgentExecutor(_AgentExecutorBase):
                     break
         except Exception as exc:  # noqa: BLE001
             logger.exception("[A2AChannel] execution failed: request_id=%s err=%s", request_id, exc)
+            record_boundary_exception("a2a.execute", exc)
             await event_queue.enqueue_event(
                 TaskStatusUpdateEvent(
                     task_id=task_id,
@@ -387,7 +387,7 @@ class A2AChannel(BaseChannel):
         self._pending.clear()
         logger.info("[A2AChannel] stopped")
 
-    async def send(self, msg: Message, *, routing_target: RoutingTarget | None = None) -> None:
+    async def send(self, msg: Message) -> None:
         pending = self._pending.get(str(msg.id))
         if pending is None:
             return
