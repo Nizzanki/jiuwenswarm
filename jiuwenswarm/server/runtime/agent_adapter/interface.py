@@ -23,6 +23,7 @@ from typing import Any, AsyncIterator, Tuple
 
 from jiuwenswarm.dotenv_early import load_dotenv_runtime
 
+from jiuwenswarm.common.errors import record_boundary_exception
 from jiuwenswarm.agents.harness.common.rails.permissions.tool_permission_context import (
     SKILLS_REBUILD_SILENT,
 )
@@ -2955,6 +2956,7 @@ class JiuWenSwarm:
                 raise
             except Exception as exc:
                 logger.exception("[JiuWenSwarm] 流式任务异常: %s", exc)
+                record_boundary_exception("agent_adapter.stream", exc)
                 try:
                     await stream_queue.put(("error", exc))
                 except asyncio.CancelledError as cancel_exc:
