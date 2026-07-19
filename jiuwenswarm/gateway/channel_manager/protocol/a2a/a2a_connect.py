@@ -357,12 +357,18 @@ class A2AChannel(BaseChannel):
         pending = _PendingA2ARequest(queue=asyncio.Queue())
         self._pending[request_id] = pending
         try:
+            params = self._build_request_params(query=query, files=files)
+            # Allow an A2A caller to select the agent mode (e.g. "team") via request
+            # metadata. The gateway's channel-state mode injection does not run for the
+            # A2A channel, so honor it here.
+            if isinstance(metadata, dict) and str(metadata.get("mode") or "").strip():
+                params["mode"] = str(metadata["mode"]).strip()
             msg = Message(
                 id=request_id,
                 type="req",
                 channel_id=self.channel_id,
                 session_id=session_id or f"a2a_{uuid.uuid4().hex[:8]}",
-                params=self._build_request_params(query=query, files=files),
+                params=params,
                 timestamp=time.time(),
                 ok=True,
                 req_method=ReqMethod.CHAT_SEND,
@@ -406,14 +412,16 @@ class A2AChannel(BaseChannel):
 
         content = payload.get("content")
         if isinstance(content, str) and content.strip():
-            normalized_content = content.strip()
+            # Preserve whitespace: stripping each streamed chunk drops the spaces that
+            # ride at token boundaries, so the caller reassembles "Onamistydawn".
+            normalized_content = content
             if not A2AChannel.is_completion_sentinel_text(normalized_content):
                 parts.append(Part(text=normalized_content))
         elif content is not None and not isinstance(content, (dict, list)):
             parts.append(Part(text=str(content)))
         result = payload.get("result")
         if isinstance(result, str) and result.strip():
-            normalized_result = result.strip()
+            normalized_result = result
             if not A2AChannel.is_completion_sentinel_text(normalized_result):
                 parts.append(Part(text=normalized_result))
         # Surface tool events in stream mode so callers can observe progress.
