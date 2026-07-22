@@ -12,10 +12,9 @@
 
   <div class="notice">
     <b>Story Studio · Path 2</b>
-    <span>Your own studio UI with JiuwenSwarm running as a service behind it. <strong>Simulated</strong>
-      plays a scripted run (instant, no backend); <strong>Live · A2A</strong> runs a real JiuwenSwarm
-      multi-agent team over A2A — a leader spawns Writer &amp; Critic teammates who genuinely draft,
-      reject and revise the story (~1–3 min). Pick the engine, type an idea, press <strong>Go</strong>.</span>
+    <span>Your own studio UI with JiuwenSwarm running as a service behind it, over A2A — a leader
+      agent spawns Writer &amp; Critic teammates who genuinely draft, reject and revise the story
+      (~1–3 min). Type an idea, press <strong>Go</strong>.</span>
   </div>
 
   <div class="ribbon">
@@ -41,35 +40,44 @@
 
   <!-- ============ PROMPT BAR (interactive — new vs mockup) ============ -->
   <form class="promptbar" id="promptbar" autocomplete="off">
-    <div class="pb-field pb-idea">
-      <label for="idea">Story idea</label>
-      <input type="text" id="idea" name="idea"
-             value="A lonely lighthouse keeper befriends a sea monster."
-             maxlength="140" placeholder="One sentence: who, and what happens?">
-    </div>
-    <div class="pb-field pb-style">
-      <label for="style">Style</label>
-      <select id="style" name="style">
-        <option value="Warm storybook · Painterly" selected>Warm storybook · Painterly</option>
-        <option value="Inky noir · High contrast">Inky noir · High contrast</option>
-        <option value="Soft watercolor · Dreamy">Soft watercolor · Dreamy</option>
-        <option value="Retro comic · Bold ink">Retro comic · Bold ink</option>
-      </select>
-    </div>
-    <div class="pb-field pb-count">
-      <label for="count">Panels</label>
-      <select id="count" name="count">
-        <option value="5" selected>~5</option>
-      </select>
-    </div>
-    <div class="pb-field pb-mode">
-      <label>Engine</label>
-      <div class="seg" id="seg-mode" role="group" aria-label="Engine">
-        <button type="button" class="seg-btn active" id="mode-sim" data-mode="sim">Simulated</button>
-        <button type="button" class="seg-btn" id="mode-live" data-mode="live">Live · A2A</button>
+    <div class="pb-row pb-row-idea">
+      <div class="pb-field pb-idea">
+        <label for="idea">Story idea</label>
+        <div class="pb-idea-row">
+          <input type="text" id="idea" name="idea"
+                 value="A sleepy bear tries to stay awake to see the first snow."
+                 maxlength="140" placeholder="One sentence: who, and what happens?">
+          <button type="button" class="surprise" id="surprise" title="Fill in a random idea">🎲</button>
+        </div>
       </div>
     </div>
-    <button type="submit" class="go" id="go">Go</button>
+    <div class="pb-row pb-row-options">
+      <div class="pb-field pb-style">
+        <label for="style">Style</label>
+        <div class="style-row">
+          <select id="style-preset" aria-label="Style preset">
+            <option value="" selected disabled>Presets…</option>
+            <option value="Warm storybook · Painterly">Warm storybook · Painterly</option>
+            <option value="Inky noir · High contrast">Inky noir · High contrast</option>
+            <option value="Soft watercolor · Dreamy">Soft watercolor · Dreamy</option>
+            <option value="Retro comic · Bold ink">Retro comic · Bold ink</option>
+            <option value="Coloring book · Black &amp; white line art">Coloring book · Black &amp; white line art</option>
+          </select>
+          <input type="text" id="style" name="style"
+                 maxlength="60" placeholder="…or type your own">
+        </div>
+      </div>
+      <div class="pb-field pb-count">
+        <label for="count">Panels</label>
+        <select id="count" name="count">
+          <option value="3">~3</option>
+          <option value="4">~4</option>
+          <option value="5" selected>~5</option>
+          <option value="6">~6</option>
+        </select>
+      </div>
+      <button type="submit" class="go" id="go">Go</button>
+    </div>
   </form>
 
   <div class="studio">
@@ -78,7 +86,7 @@
     <div class="card">
       <div class="brief" id="brief">
         <div class="l">The author asked for</div>
-        <div class="q" id="brief-q">“A lonely lighthouse keeper befriends a sea monster.”</div>
+        <div class="q" id="brief-q">“A sleepy bear tries to stay awake to see the first snow.”</div>
         <div class="tags" id="brief-tags"><span>Warm storybook</span><span>Painterly</span><span>~5 panels</span></div>
       </div>
 
@@ -91,6 +99,27 @@
     <!-- ============ RIGHT RAIL ============ -->
     <div class="rail">
 
+      <!-- restyle: same text, same prompts, new style — no crew re-run -->
+      <div class="card">
+        <div class="hd"><span class="name">Restyle</span><span class="meta">same text · same prompts</span></div>
+        <div class="body">
+          <div class="restyle-row">
+            <div class="style-row">
+              <select id="restyle-style-preset" disabled aria-label="Restyle preset">
+                <option value="" selected disabled>Presets…</option>
+                <option value="Warm storybook · Painterly">Warm storybook · Painterly</option>
+                <option value="Inky noir · High contrast">Inky noir · High contrast</option>
+                <option value="Soft watercolor · Dreamy">Soft watercolor · Dreamy</option>
+                <option value="Retro comic · Bold ink">Retro comic · Bold ink</option>
+                <option value="Coloring book · Black &amp; white line art">Coloring book · Black &amp; white line art</option>
+              </select>
+              <input type="text" id="restyle-style" disabled placeholder="…or type your own">
+            </div>
+            <button type="button" class="download" id="restyle" disabled title="Same text, same prompts — new style. Live mode only.">🎨 Restyle images</button>
+          </div>
+        </div>
+      </div>
+
       <div class="card">
         <div class="hd"><span class="name">Story so far</span><span class="meta">The Loom</span></div>
         <div class="body">
@@ -98,6 +127,7 @@
           <div class="track"><i id="prog-bar" style="width:0%"></i></div>
           <button type="button" class="download" id="download" disabled>⤓ Download story (HTML)</button>
           <button type="button" class="download" id="download-gif" disabled>⤓ Download GIF</button>
+          <button type="button" class="download" id="download-pdf" disabled>⤓ Download PDF</button>
         </div>
       </div>
 
@@ -120,6 +150,18 @@
     </div>
   </div>
 
+  <!-- full text / debug: the whole story as prose + what the crew produced per panel -->
+  <div class="card fulltext" id="fulltext">
+    <div class="hd"><span class="name">The story · full text</span><span class="meta" id="ft-meta">—</span></div>
+    <div class="body">
+      <div class="story" id="ft-story"><span class="ft-empty">The finished story appears here once a run completes.</span></div>
+      <details id="ft-details">
+        <summary>Debug · what the crew produced per panel</summary>
+        <div id="ft-debug"></div>
+      </details>
+    </div>
+  </div>
+
   <div class="legend">
     <div class="z"><div class="n">The gallery — your UI</div><p>Panels, images and captions are <em>your</em> app’s components. The swarm returns each panel as data (image + caption + status); your front-end lays out the storybook.</p></div>
     <div class="z"><div class="n">The Crew — the swarm made visible</div><p>The differentiator: you <em>watch</em> the Critic reject a panel and the Writer revise it. Agents improving each other’s work is the whole show.</p></div>
@@ -127,7 +169,7 @@
   </div>
 
   <div class="foot-note">
-    <b>Path 2 notes:</b> this studio is a standalone app talking to JiuwenSwarm over A2A, so your front-end renders these panels from the swarm’s JSON (A2UI isn’t used — that’s the trade for the cleaner “embedded engine” story). <b>Phase 1</b> plays a scripted run so we can lock the UX; the same UI is driven by a normalized event stream, so Phase 2 just swaps the simulated source for a real A2A stream.
+    <b>Path 2 notes:</b> this studio is a standalone app talking to JiuwenSwarm over A2A, so your front-end renders these panels from the swarm’s JSON (A2UI isn’t used — that’s the trade for the cleaner “embedded engine” story). The UI is driven by a normalized event stream coming straight from the bridge’s SSE endpoint.
   </div>
 
 </div>
