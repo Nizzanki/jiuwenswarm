@@ -66,7 +66,7 @@ def _base():
     return img, ImageDraw.Draw(img)
 
 
-def _title_frame(idea: str, style: str) -> Image.Image:
+def _title_frame(idea: str, style: str, *, show_style: bool = True) -> Image.Image:
     img, d = _base()
     d.line([(MARGIN, 48), (W - MARGIN, 48)], fill=INK, width=2)
     f_brand = _font(20, bold=True)
@@ -79,7 +79,7 @@ def _title_frame(idea: str, style: str) -> Image.Image:
     for ln in lines:
         d.text(((W - _text_w(d, ln, f_idea)) / 2, y), ln, font=f_idea, fill=OX)
         y += 46
-    if style:
+    if style and show_style:
         f_s = _font(16)
         d.text(((W - _text_w(d, style, f_s)) / 2, y + 16), style, font=f_s, fill=MUT)
     f_foot = _font(13)

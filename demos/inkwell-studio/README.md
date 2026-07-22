@@ -12,29 +12,19 @@ itself from the swarm's JSON.
 > **Framework untouched.** Everything here lives under `demos/` and does not modify any
 > JiuwenSwarm source. The one framework bug we hit is worked around from our side (see below).
 
-## Two engines, one UI
+## One engine
 
-The front-end renders entirely from a `state` model mutated by a single `apply(event)` reducer.
-Events come from a swappable source with a `start(onEvent)/stop()` interface — pick with the
-**Engine** toggle in the prompt bar:
+The front-end renders entirely from a `state` model mutated by a single `apply(event)`
+reducer. Events come from `A2AEventSource`, which subscribes to the bridge's SSE stream — the
+bridge runs a **real JiuwenSwarm story over A2A** and forwards normalized events that the
+reducer/renderers turn into panels, crew status, and the revision log.
 
-- **Simulated** (`SimEventSource`) — a scripted, fully client-side run. No backend, no network.
-  This is Phase 1; use it to see the UX instantly.
-- **Live · A2A** (`A2AEventSource`) — subscribes to the bridge's SSE stream, which runs a **real
-  JiuwenSwarm story over A2A** and forwards the same normalized events. This is Phase 2.
-
-The reducer and every renderer are identical for both — the whole point of the seam.
+(An earlier phase had a `SimEventSource` — a scripted, client-side-only run used to lock the
+UX before the real A2A integration existed. It's since been removed; the live engine is the
+only path now.)
 
 ## Run it
 
-### Simulated (no backend)
-Open `index.html` directly, or serve the folder and open it:
-```bash
-python -m http.server 8000    # from demos/inkwell-studio/
-```
-Press **Go** (Engine = Simulated).
-
-### Live (real swarm over A2A)
 Needs the repo venv (`uv sync --extra a2a`) and three processes. From the repo root:
 
 ```bash
@@ -47,12 +37,11 @@ A2A_SERVER_ENABLED=true .venv/Scripts/python.exe -m jiuwenswarm.gateway.app_gate
 # 3. The Inkwell bridge (serves the front-end + SSE)
 .venv/Scripts/python.exe demos/inkwell-studio/server/bridge.py
 ```
-Then open **http://127.0.0.1:8800/** , flip Engine to **Live · A2A**, and press **Go**
-(or open `.../?live=1`). Model credentials must be set in `~/.jiuwenswarm/config/.env`
-(`API_BASE`/`API_KEY`/`MODEL_NAME`/`MODEL_PROVIDER`).
+Then open **http://127.0.0.1:8800/** and press **Go**. Model credentials must be set in
+`~/.jiuwenswarm/config/.env` (`API_BASE`/`API_KEY`/`MODEL_NAME`/`MODEL_PROVIDER`).
 
-> If the bridge/servers aren't up, Live mode notices it and **falls back to Simulated** so the
-> demo never dead-ends.
+> If the bridge/servers aren't reachable, the run aborts with a visible error instead of
+> silently continuing — there's no other engine to fall back to.
 
 ## How Live mode works
 
@@ -63,7 +52,7 @@ reviews and rejects a panel that the Writer then revises — all coordinated by 
 
 ```
 browser (unchanged reducer)
-  │  EventSource (SSE)                          ▲ same normalized events as Simulated
+  │  EventSource (SSE)                          ▲ normalized events from the bridge
   ▼                                             │
 server/bridge.py  ── buffer → line-parse → paced replay + concurrent images ──┐
   │  A2A SendStreamingMessage (metadata mode=team)                             │
@@ -79,9 +68,12 @@ Gateway (:19100/a2a) → AgentServer → jiuwen_team: leader ⇄ Writer/Critic t
   rendering, SSE, and the static front-end. If a team run doesn't yield usable protocol, it **falls
   back to the single agent** so Live still delivers a story.
 
-The protocol events are the Phase 1 shapes (`panel.status|caption|art|note`, `agent`, `log`,
+The protocol events are the original event shapes (`panel.status|caption|art|note`, `agent`, `log`,
 `progress`, `focus`, `brief`, `run.done`). `panel.art` carries the Art Director's **image prompt**;
-the bridge renders a picture and emits `panel.image` (a data URI) that the front-end swaps in.
+the bridge renders a picture and emits `panel.image` (a data URI) that the front-end swaps in. If the
+render fails the bridge emits `panel.image.failed` (with a `reason`) instead, so the panel shows
+**no image · why** rather than a `rendering…` badge that never resolves. Both are bridge-generated —
+they're not part of the agent-emitted protocol, so they're absent from `KNOWN_EVENTS`.
 
 ### What the framework edit / config does (real-team enablement)
 
@@ -105,27 +97,65 @@ and **pops them in progressively** (panels show caption/prompt immediately; imag
 | `a1111` | Automatic1111 / SD.Next `POST {IMAGE_URL}/sdapi/v1/txt2img` | `IMAGE_URL`, `IMAGE_STEPS` |
 | `openai` | OpenAI-compatible `POST {IMAGE_URL}/v1/images/generations` (DashScope Qwen-Image, local, hosted…) | `IMAGE_URL`, `IMAGE_KEY`, `IMAGE_MODEL` |
 
-Also: `IMAGE_SIZE` (default `768x480`), `IMAGE_TIMEOUT`, `IMAGE_CONCURRENCY` (default `3`). Any
-failure/timeout/unreachable backend → the panel keeps its prompt placeholder (graceful). Point
-`IMAGE_BACKEND` at a real **SDXL/Flux** endpoint for genuine art:
+Also: `IMAGE_SIZE` (default `768x480`), `IMAGE_TIMEOUT`, `IMAGE_RETRIES` (attempts on 429/5xx,
+default `3`), `IMAGE_CONCURRENCY` (default `2`).
+
+**On failures:** requests that come back `429` or `5xx` are retried with backoff, honoring
+`Retry-After` — free image tiers rate-limit on bursts, and a story is a burst (one render per panel,
+plus another per revision). If a panel still can't be rendered, the panel keeps its prompt placeholder
+**and says why**, and the bridge logs a warning. Raise `IMAGE_CONCURRENCY` only if your endpoint has
+the headroom. Point `IMAGE_BACKEND` at a real **SDXL/Flux** endpoint for genuine art:
 
 ```bash
 IMAGE_BACKEND=a1111 IMAGE_URL=http://127.0.0.1:7860 \
   .venv/Scripts/python.exe demos/inkwell-studio/server/bridge.py
 ```
 
+## Child-safety moderation
+
+Every caption and image prompt is required to be child-appropriate (roughly ages 4-8) —
+enforced at three layers, from softest to hardest:
+
+1. `server/prompt.py`'s brief instructs the crew directly: no violence, weapons, gore, death,
+   scary imagery, horror, or adult themes — including the intentionally-rejected panel-3
+   draft, which must be flawed for being flat/rushed, never for being scary.
+2. `server/imagegen.py` appends a child-safe tag to every real (`a1111`/`openai`) image
+   render, independent of what the crew's Art Director wrote — this also covers `/restyle`,
+   which reuses the same render call.
+3. `server/moderate.py` runs an independent classifier call (over A2A — the same path the
+   story itself uses, so it always hits the real configured model) on every caption and image
+   prompt **before** anything is shown or rendered. A flagged panel's text/prompt is replaced
+   with a neutral filler (visible directly in the caption, honestly, rather than hidden) —
+   only that panel is touched, the rest of the story is unaffected. All of a story's texts
+   (~10-12 for a typical run: every caption + every image prompt, including revisions) go in
+   **one** batched classification call, not one call per text — that was tried first and made
+   the initial run noticeably slower, since each call is a full A2A agent turn with real
+   framework overhead on top of the model's own inference time.
+
+**Honesty caveat:** layer 3 fails **open** by default — if the moderation call itself errors
+(timeout, unreachable Gateway, malformed response), the content passes rather than the run
+aborting on a moderation hiccup. Set `MODERATION_FAIL_OPEN=0` to fail closed instead. Other
+knob: `MODERATION_TIMEOUT` (default `45`s for the whole batch call).
+
 ## Download story
 
 At the end of a run the **⤓ Download story** button (in "Story so far") exports a **self-contained
-HTML** file — title/brief + each panel's picture (inline data URI or SVG) + serif caption, in the
-studio look. Works in both engines; opens and shares anywhere.
+HTML flip-book** — a cover page, one page per panel (picture + serif caption), and a closing page,
+turned with Prev/Next buttons, left/right click zones, or arrow keys. The turn is a real CSS 3D
+page-rotation, not a page reload — no external library, so the file still opens and works
+completely offline. Opens and shares anywhere.
+
+## Coloring book
+
+Pick the **Coloring book · Black & white line art** style preset (prompt bar or Restyle) — the
+crew/image backend is simply asked to draw in that style, same as any other preset.
 
 ## Demo clip
 
 `server/capture.py` grabs frames of a run over the DevTools Protocol; stitch them with `ffmpeg`
 (commands in the file's docstring). Actual recording/stitching is a manual step.
 
-## What's real vs. simulated (honesty)
+## What's real vs. approximate (honesty)
 
 - **Real multi-agent team (default):** Live runs the genuine `jiuwen_team` — a leader agent spawns
   real Writer and Critic **teammate agents** (separate LLM contexts) and coordinates them; the
@@ -164,8 +194,10 @@ Respects `prefers-reduced-motion`: shimmer, pulsing crew dots, the caption typew
 entrance animations are all disabled; runs still complete.
 
 ## Roadmap
-- **Phase 1 (done):** interactive simulated prototype — lock the UX.
+- **Phase 1 (done, later removed):** interactive simulated prototype — locked the UX before the
+  real A2A integration existed.
 - **Phase 2 (done):** real 5-role JiuwenSwarm run over A2A, streamed to the same UI via the bridge.
+  The simulated engine was removed once this became the sole, reliable path.
 - **Phase 3 (this):** pluggable image backend (stub default; A1111 / OpenAI-compatible for real
   SDXL/Flux) with concurrent progressive reveal, a self-contained **Download story** export, and a
   demo-clip frame grabber.

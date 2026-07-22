@@ -1,29 +1,41 @@
 // Inkwell Studio controller.
 //
 // The UI renders entirely from `state`, which is mutated by apply(event). Events arrive
-// from an event source with a start(onEvent)/stop() interface. Phase 1: SimEventSource
-// (a scripted timeline). Phase 2: A2AEventSource (SSE from the bridge, which runs a real
-// JiuwenSwarm story over A2A). Both emit the SAME event shape, so the reducer/renderers
-// below are identical for simulated and live runs.
+// from an event source with a start(onEvent)/stop() interface: A2AEventSource (SSE from the
+// bridge, which runs a real JiuwenSwarm story over A2A).
 
-import { buildTimeline, AGENT_LABELS } from './sim/timeline.js';
+const AGENT_LABELS = { imageGen: 'tool' };
+
+// Canned, child-safe one-liners for the "surprise me" idea button — purely client-side,
+// no LLM call needed for something this small.
+const SURPRISE_IDEAS = [
+  'A lonely lighthouse keeper befriends a sea monster.',
+  'A shy dragon just wants someone to read books with.',
+  'A little cloud loses her rain and asks the animals for help.',
+  'A snail dreams of racing the wind and finally gets his chance.',
+  'A grumpy old oak tree learns to share its shade with a new sapling.',
+  'A firefly who can\'t glow yet borrows light from the stars.',
+  'Two rival garden gnomes team up to save the vegetable patch.',
+  'A young otter finds a lost mitten and searches the whole river for its owner.',
+  'A sleepy bear tries to stay awake to see the first snow.',
+  'A paper boat sets sail to find where the stream ends.',
+  'A shy ghost just wants to make a new friend in the old attic.',
+  'A baker fox invents a cake that makes everyone in town smile.',
+];
+
+function surpriseIdea() {
+  if (state.running) return;
+  const field = $('idea');
+  const pool = SURPRISE_IDEAS.filter((s) => s !== field.value);
+  field.value = pool[Math.floor(Math.random() * pool.length)];
+}
 
 const REDUCED_MOTION = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-/* ------------------------------- event sources ------------------------------ */
+/* ------------------------------- event source -------------------------------- */
 // Interface: start(onEvent) begins emitting; stop() cancels.
-class SimEventSource {
-  constructor(seq) { this.seq = seq; this.timers = []; }
-  start(onEvent) {
-    for (const { at, event } of this.seq) {
-      this.timers.push(setTimeout(() => onEvent(event), at));
-    }
-  }
-  stop() { this.timers.forEach(clearTimeout); this.timers = []; }
-}
-
-// Live source: subscribes to the bridge's SSE endpoint, which streams the same
-// normalized events parsed from a real swarm run over A2A.
+// Subscribes to the bridge's SSE endpoint, which streams normalized events parsed from a
+// real swarm run over A2A.
 class A2AEventSource {
   constructor(brief, { onFatal } = {}) {
     this.brief = brief; this.onFatal = onFatal; this.es = null; this.got = 0; this.done = false;
@@ -102,19 +114,35 @@ function apply(ev) {
     case 'panel.status': {
       const p = ensurePanel(ev.panel);
       p.status = ev.status;
-      if (ev.status === 'approved') p.note = null;   // clear the kickback note once resolved
+      if (ev.status === 'approved') {                // clear the kickback note once resolved,
+        if (p.note) p.pastNote = p.note;             // but keep it for the debug section
+        p.note = null;
+      }
       renderPanel(p.n);
       break;
     }
     case 'panel.art': {
       const p = ensurePanel(ev.panel);
+      // A different prompt means the panel is being re-done (the Critic sent it back):
+      // archive the outgoing prompt + the image that was rendered for it, so the debug
+      // section can show rejected-vs-approved. (p.image still holds the OLD render here,
+      // because the new image event always follows its art event.)
+      if (p.svg && p.svg !== ev.svg) p.artHistory.push({ svg: p.svg, image: p.image });
       p.svg = ev.svg;
+      p.imageError = null;       // a new prompt means a fresh render is starting
       renderPanel(p.n);
       break;
     }
     case 'panel.image': {
       const p = ensurePanel(ev.panel);
       p.image = ev.src;                 // bridge-rendered picture (data URI)
+      p.imageError = null;              // a retry/revision succeeded — clear any earlier failure
+      renderPanel(p.n);
+      break;
+    }
+    case 'panel.image.failed': {
+      const p = ensurePanel(ev.panel);
+      if (!p.image) p.imageError = ev.reason || 'render failed';   // keep a picture we already have
       renderPanel(p.n);
       break;
     }
@@ -128,13 +156,18 @@ function apply(ev) {
     case 'panel.note': {
       const p = ensurePanel(ev.panel);
       p.note = { label: ev.label, text: ev.text };
+      // the caption that was on the panel when the Critic rejected it
+      if (p.rejectedCaption == null) p.rejectedCaption = p.caption;
       renderPanel(p.n);
       break;
     }
 
     case 'agent': {
       const a = state.agents[ev.id];
-      if (a) { a.status = ev.status; a.say = ev.say; if (ev.state) a.state = ev.state; else delete a.state; }
+      // Live-forwarded status updates (bridge.py's _live_view) send say:"" — the status dot
+      // still needs to update immediately, but an empty line shouldn't blank out whatever
+      // text is already showing; the real line follows once the run's text is corrected.
+      if (a) { a.status = ev.status; if (ev.say) a.say = ev.say; if (ev.state) a.state = ev.state; else delete a.state; }
       renderCrew();
       break;
     }
@@ -162,7 +195,11 @@ function apply(ev) {
 
 function ensurePanel(n) {
   let p = state.panels.find((x) => x.n === n);
-  if (!p) { p = { n, status: 'drafting', caption: '', dim: true, svg: '', image: '', note: null }; state.panels.push(p); state.panels.sort((a, b) => a.n - b.n); }
+  if (!p) {
+    p = { n, status: 'drafting', caption: '', dim: true, svg: '', image: '', imageError: null,
+          note: null, artHistory: [], rejectedCaption: null };
+    state.panels.push(p); state.panels.sort((a, b) => a.n - b.n);
+  }
   return p;
 }
 
@@ -177,16 +214,17 @@ function renderBrief() {
   $('brief-tags').innerHTML = tags.map((t) => `<span>${escapeHtml(t)}</span>`).join('');
 }
 
+// No entry for "approved" — once a panel lands, its status badge is removed rather than
+// left reading "Approved" over the finished picture.
 const PILL = {
   drafting:  { cls: 'draft',  text: 'Drafting' },
   rendering: { cls: 'draft',  text: 'Rendering' },
   review:    { cls: 'review', text: 'In review' },
   revising:  { cls: 'review', text: 'In review' },
-  approved:  { cls: 'ok',     text: 'Approved' },
 };
 
 function panelInnerHtml(p) {
-  const pill = PILL[p.status] || PILL.drafting;
+  const pill = PILL[p.status] || null;
   const num = String(p.n).padStart(2, '0');
   const revising = p.status === 'revising';
 
@@ -194,14 +232,20 @@ function panelInnerHtml(p) {
   let media;
   if (p.image) {
     media = `<img class="pimg-img" src="${p.image}" alt="${escapeHtml(p.caption || 'panel image')}">` + revTag;
-  } else if (p.svg && /^\s*<svg/i.test(p.svg)) {
-    media = p.svg + revTag;                                   // simulated: inline SVG art
   } else if (p.svg) {
-    // live: panel.art is the Art Director's image prompt; a real picture pops in when ready
-    const rendering = (p.status === 'review' || p.status === 'approved' || p.status === 'revising')
-      ? '<div class="rendering">rendering…</div>' : '';
+    // panel.art is the Art Director's image prompt; a real picture pops in when ready.
+    // If the render failed we say so — an endless "rendering…" is a lie.
+    let rendering = '';
+    if (p.imageError) {
+      rendering = `<div class="failed" title="${escapeHtml(p.imageError)}">no image</div>`;
+    } else if (p.status === 'review' || p.status === 'approved' || p.status === 'revising') {
+      rendering = '<div class="rendering">rendering…</div>';
+    }
     media = `<div class="artprompt">${rendering}<div class="k">Art Director · image prompt</div>`
-      + `<div class="p">“${escapeHtml(p.svg)}”</div><div class="tag">🎨 image prompt</div></div>` + revTag;
+      + `<div class="p">“${escapeHtml(p.svg)}”</div>`
+      + `<div class="tag${p.imageError ? ' bad' : ''}">`
+      + (p.imageError ? `⚠ ${escapeHtml(p.imageError)}` : '🎨 image prompt')
+      + `</div></div>` + revTag;
   } else {
     const lb = p.status === 'rendering' ? 'Rendering…' : 'Writer at work…';
     media = `<div class="skel"><div class="ic"></div><div class="lb">${lb}</div></div>`;
@@ -215,7 +259,7 @@ function panelInnerHtml(p) {
 
   return `
     <div class="pimg${revising ? ' revising' : ''}">
-      <span class="pill ${pill.cls}">${pill.text}</span><span class="pnum">${num}</span>
+      ${pill ? `<span class="pill ${pill.cls}">${pill.text}</span>` : ''}<span class="pnum">${num}</span>
       ${media}
     </div>
     <div class="pcap"><div class="${capClass}">${capText}</div>${note}</div>`;
@@ -242,6 +286,7 @@ function renderPanel(n) {
     if (!REDUCED_MOTION) el.addEventListener('animationend', () => el.classList.remove('enter'), { once: true });
   }
   el.innerHTML = panelInnerHtml(p);
+  renderFullText();          // keep the full-text / debug section in step with the panels
 }
 
 function renderCrew() {
@@ -252,7 +297,7 @@ function renderCrew() {
     const stCls = { active: 'st-active', reject: 'st-reject', done: 'st-done', idle: 'st-idle' }[a.status] || 'st-idle';
     const tool = AGENT_LABELS[id] ? ` <small>${AGENT_LABELS[id]}</small>` : '';
     return `
-      <div class="agent">
+      <div class="agent${a.status === 'active' ? ' agent-active' : ''}">
         <span class="dot ${dot}"></span>
         <div style="flex:1">
           <div class="row1"><span class="who">${AGENT_NAMES[id]}${tool}</span><span class="state ${stCls}">${escapeHtml(word)}</span></div>
@@ -316,8 +361,56 @@ function sanitizeLogHtml(html) {
   return tpl.innerHTML;
 }
 
+// The finished story as continuous prose + a per-panel debug breakdown.
+function renderFullText() {
+  const story = $('ft-story'), meta = $('ft-meta'), dbg = $('ft-debug');
+  if (!story) return;
+  const panels = state.panels.filter((p) => p.caption).sort((a, b) => a.n - b.n);
+  if (!panels.length) {
+    story.innerHTML = '<span class="ft-empty">The finished story appears here once a run completes.</span>';
+    meta.textContent = '—'; dbg.innerHTML = '';
+    return;
+  }
+  const words = panels.reduce((n, p) => n + p.caption.split(/\s+/).filter(Boolean).length, 0);
+  meta.textContent = `${panels.length} panel${panels.length > 1 ? 's' : ''} · ${words} words`;
+  story.innerHTML = panels.map((p) => `<p>${escapeHtml(p.caption)}</p>`).join('');
+  // `svg` holds the Art Director's text image prompt (show the words as the thumbnail's caption).
+  const thumb = (svg, image) => {
+    if (image) return `<img src="${image}" alt="">`;
+    return '<div class="ft-noimg">no image</div>';
+  };
+  const promptLine = (svg) => (svg ? `<div class="ft-vp">${escapeHtml(svg)}</div>` : '');
+  const version = (cls, label, svg, image, caption) => `
+    <div class="ft-v ${cls}">
+      <div class="ft-vh">${label}</div>
+      ${thumb(svg, image)}
+      ${caption ? `<div class="ft-vc">${escapeHtml(caption)}</div>` : ''}
+      ${promptLine(svg)}
+    </div>`;
+
+  dbg.innerHTML = panels.map((p) => {
+    const note = p.note || p.pastNote;
+    const kb = p.image ? Math.round((p.image.length * 0.75) / 1024) : 0;
+    const rej = (p.artHistory || [])[0];           // the version the Critic sent back
+    const compare = rej
+      ? `<div class="ft-versions">
+           ${version('rejected', '✕ Rejected', rej.svg, rej.image, p.rejectedCaption)}
+           ${version('approved', '✓ Approved', p.svg, p.image, p.caption)}
+         </div>`
+      : '';
+    return `<div class="ft-panel">
+      <div class="ft-h">Panel ${String(p.n).padStart(2, '0')} · ${escapeHtml(p.status || '')}${rej ? ' · revised' : ''}</div>
+      ${note ? `<div class="ft-row ft-note"><b>critic</b>${escapeHtml(note.text)}</div>` : ''}
+      ${compare || `
+        <div class="ft-row ft-cap"><b>caption</b>${escapeHtml(p.caption)}</div>
+        ${p.svg ? `<div class="ft-row"><b>image prompt</b>${escapeHtml(p.svg)}</div>` : ''}
+        <div class="ft-row"><b>image</b>${p.image ? `rendered · ~${kb} KB` : '— (placeholder)'}</div>`}
+    </div>`;
+  }).join('');
+}
+
 function renderAll() {
-  renderBrief(); renderCrew(); renderProgress(); renderLog();
+  renderBrief(); renderCrew(); renderProgress(); renderLog(); renderFullText();
 }
 
 /* ------------------------------ caption typewriter -------------------------- */
@@ -348,44 +441,47 @@ function typeCaption(n) {
 
 /* --------------------------------- run control ------------------------------ */
 
-let LIVE = false;   // false = Simulated (SimEventSource), true = Live (A2AEventSource)
-
 function startRun() {
   stopRun();
   state = freshState();
 
-  const idea = ($('idea').value || '').trim() || 'A lonely lighthouse keeper befriends a sea monster.';
+  const idea = ($('idea').value || '').trim() || 'A sleepy bear tries to stay awake to see the first snow.';
   const style = $('style').value;
   const total = parseInt($('count').value, 10) || 5;
   state.brief = { idea, style, total };
   state.running = true;
 
   // reset the view
-  const wait = LIVE
-    ? 'Contacting the JiuwenSwarm crew over A2A… first panels take ~20–40s while the story is written.'
-    : 'Sending the brief to the crew…';
-  $('gallery').innerHTML = `<div class="empty" id="gallery-empty">${wait}</div>`;
+  $('gallery').innerHTML = '<div class="empty" id="gallery-empty">'
+    + 'Contacting the JiuwenSwarm crew over A2A… first panels take ~20–40s while the story is written.</div>';
   renderAll();
   $('crew-live').textContent = 'live';
 
   setInputsDisabled(true);
   $('download').disabled = true;
   $('download-gif').disabled = true;
+  $('download-pdf').disabled = true;
+  $('restyle').disabled = true;
+  $('restyle-style').disabled = true;
+  $('restyle-style-preset').disabled = true;
   const go = $('go');
   go.textContent = 'Running…'; go.classList.add('running'); go.classList.remove('again'); go.disabled = true;
 
-  source = LIVE
-    ? new A2AEventSource(state.brief, { onFatal: fallbackToSim })
-    : new SimEventSource(buildTimeline(state.brief));
+  source = new A2AEventSource(state.brief, { onFatal: abortRun });
   source.start(apply);
 }
 
-// If the live bridge can't be reached, keep the demo alive: note it and run simulated.
-function fallbackToSim(msg) {
+// The live bridge/swarm is unreachable or dropped before producing anything usable — surface
+// it and reset to idle rather than pretending the run finished.
+function abortRun(msg) {
   stopRun();
-  showLiveNote(`${msg} Falling back to the simulated run.`);
-  source = new SimEventSource(buildTimeline(state.brief));
-  source.start(apply);
+  state.running = false; state.done = false;
+  renderProgress();
+  $('crew-live').textContent = 'idle';
+  const go = $('go');
+  go.textContent = 'Go'; go.classList.remove('running'); go.classList.remove('again'); go.disabled = false;
+  setInputsDisabled(false);
+  showLiveNote(msg);
 }
 
 function showLiveNote(text) {
@@ -400,6 +496,16 @@ function showLiveNote(text) {
 }
 
 function finishRun() {
+  // A run can end (backend completion, or a dropped connection) while a panel is still
+  // mid-render: it has an image prompt but no image and no error yet. Saying "Story
+  // complete" while that panel is stuck on "rendering…" forever would be a lie — settle
+  // it explicitly so the UI matches reality.
+  for (const p of state.panels) {
+    if (!p.image && !p.imageError && p.svg) {
+      p.imageError = 'run ended before this panel finished rendering';
+      renderPanel(p.n);
+    }
+  }
   state.running = false; state.done = true;
   renderProgress();
   $('crew-live').textContent = 'done';
@@ -409,6 +515,10 @@ function finishRun() {
   const hasStory = state.panels.filter((p) => p.caption).length > 0;
   $('download').disabled = !hasStory;
   $('download-gif').disabled = !hasStory;
+  $('download-pdf').disabled = !hasStory;
+  $('restyle').disabled = !hasStory;
+  $('restyle-style').disabled = !hasStory;
+  $('restyle-style-preset').disabled = !hasStory;
 }
 
 function stopRun() {
@@ -417,13 +527,22 @@ function stopRun() {
 }
 
 function setInputsDisabled(disabled) {
-  ['idea', 'style', 'count', 'mode-sim', 'mode-live'].forEach((id) => { $(id).disabled = disabled; });
+  ['idea', 'style', 'style-preset', 'count', 'surprise'].forEach((id) => { $(id).disabled = disabled; });
 }
 
-function setMode(live) {
-  LIVE = live;
-  $('mode-sim').classList.toggle('active', !live);
-  $('mode-live').classList.toggle('active', live);
+/* ------------------------------- style preset --------------------------------- */
+// A preset <select> next to a free-text style <input>: picking a preset fills the text
+// field, which stays the actual source of truth and is always directly editable. Resetting
+// the select back to its placeholder after each pick means it reads as a picker, not a
+// second copy of the current value, and re-picking the same preset later still fires 'change'.
+function wireStylePreset(selectId, inputId) {
+  const select = $(selectId);
+  const input = $(inputId);
+  select.addEventListener('change', () => {
+    if (!select.value) return;
+    input.value = select.value;
+    select.value = '';
+  });
 }
 
 /* ---------------------------------- helpers --------------------------------- */
@@ -435,39 +554,161 @@ function escapeHtml(s) {
 }
 
 /* --------------------------- download story (export) ------------------------ */
-// Self-contained HTML: title/brief + each panel's art (image data URI or inline SVG or
-// the prompt) + serif caption, styled in the studio look. Works for both engines.
+// Self-contained HTML "flip book": one page visible at a time (cover, then one page per
+// panel, then a closing page), turned with Prev/Next buttons, left/right click zones, or
+// arrow keys. The turn itself is a real CSS 3D rotateY animation, not a page reload/scroll —
+// each page shares the same absolutely-positioned box; the currently-turning page keeps the
+// highest z-index for the length of its own rotation so it visually covers everything until
+// backface-visibility:hidden makes it vanish past 90°, revealing the page already stacked
+// beneath it. No external library — everything here (CSS + nav JS) is inlined so the file
+// still opens and works completely offline, same as before.
 function buildStoryHtml() {
   const b = state.brief;
   const panels = state.panels.filter((p) => p.caption);
-  const figures = panels.map((p) => {
-    let art;
-    if (p.image) art = `<img src="${p.image}" alt="">`;
-    else if (p.svg && /^\s*<svg/i.test(p.svg)) art = p.svg;
-    else art = `<div class="ph">“${escapeHtml(p.svg || '')}”</div>`;
-    return `<figure><div class="art">${art}</div><figcaption>${escapeHtml(p.caption)}</figcaption></figure>`;
-  }).join('\n');
+
+  const coverPage = `
+    <div class="page-inner cover">
+      <div class="eyebrow">Inkwell Studio</div>
+      <p class="idea">“${escapeHtml(b.idea)}”</p>
+      <p class="hint">turn the page to begin →</p>
+    </div>`;
+
+  const panelPages = panels.map((p) => {
+    const art = p.image ? `<img src="${p.image}" alt="">` : `<div class="ph">“${escapeHtml(p.svg || '')}”</div>`;
+    return `
+    <div class="page-inner panel">
+      <div class="art">${art}</div>
+      <p class="cap">${escapeHtml(p.caption)}</p>
+    </div>`;
+  });
+
+  const closingPage = `
+    <div class="page-inner cover closing">
+      <div class="eyebrow">The End</div>
+      <p class="meta">An illustrated story, made by a crew of agents<br>powered by JiuwenSwarm over A2A</p>
+    </div>`;
+
+  const pages = [coverPage, ...panelPages, closingPage];
+  const pageHtml = pages.map((inner, i) => `<div class="page" data-i="${i}">${inner}</div>`).join('\n');
+  const dotsHtml = pages.map((_, i) => `<button class="dot" data-i="${i}" aria-label="Go to page ${i + 1}"></button>`).join('');
+
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(b.idea)} — Inkwell Studio</title>
 <style>
-  :root{color-scheme:dark}
-  body{margin:0;background:#11131a;color:#eceef2;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.5}
-  .wrap{max-width:760px;margin:0 auto;padding:48px 20px 64px}
-  header{border-bottom:1px solid #2f3542;padding-bottom:20px;margin-bottom:28px}
-  h1{font-size:13px;letter-spacing:.2em;text-transform:uppercase;color:#38b3a4;margin:0 0 12px}
-  .idea{font-family:Georgia,serif;font-style:italic;font-size:24px;margin:0}
-  .style{color:#99a1b0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;margin-top:8px;letter-spacing:.04em}
-  figure{margin:0 0 34px;border:1px solid #2f3542;border-radius:12px;overflow:hidden;background:#171a22}
-  .art,.art svg,.art img{display:block;width:100%;height:auto;line-height:0}
-  .ph{aspect-ratio:16/10;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;
-      font-family:Georgia,serif;font-style:italic;color:#99a1b0;background:linear-gradient(180deg,#1e222c,#171a22)}
-  figcaption{font-family:Georgia,serif;font-size:16px;padding:16px 18px 20px}
-  footer{margin-top:12px;color:#6a7382;font-family:ui-monospace,monospace;font-size:11px;letter-spacing:.08em;text-align:center}
-</style></head><body><div class="wrap">
-<header><h1>Inkwell Studio</h1><p class="idea">“${escapeHtml(b.idea)}”</p><p class="style">${escapeHtml(b.style)} · ${panels.length} panels</p></header>
-<main>${figures}</main>
-<footer>An illustrated story, made by a crew of agents · powered by JiuwenSwarm over A2A</footer>
-</div></body></html>`;
+  :root{color-scheme:light}
+  * { box-sizing: border-box; }
+  body{margin:0;
+       background:radial-gradient(1200px 620px at 82% -10%, #f4eddc 0%, rgba(244,237,220,0) 55%), #e9dfc8;
+       color:#241f18;font-family:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
+       min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;padding:24px}
+  h1{position:fixed;top:18px;left:22px;margin:0;font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:#8c2f2a;
+     font-family:ui-monospace,"Cascadia Code","SF Mono",Menlo,Consolas,monospace}
+  .stage{position:relative;width:min(640px,92vw);aspect-ratio:4/5;perspective:2200px}
+  .pages{position:absolute;inset:0}
+  .page{position:absolute;inset:0;backface-visibility:hidden;transform-style:preserve-3d;
+        transition:transform .7s cubic-bezier(.4,.1,.2,1);
+        border:1px solid #c3b490;border-radius:2px;overflow:hidden;background:#f6f0e2;
+        box-shadow:0 18px 50px rgba(60,45,20,.25)}
+  .page-inner{position:absolute;inset:0;display:flex;flex-direction:column}
+  /* Fixed-proportion art box (NOT flex-grow off the image's own intrinsic size) — that was
+     the actual bug: an unconstrained <img> could render taller than the page, pushing the
+     caption below the page's fixed height where overflow:hidden silently clipped it. Cover-fit
+     into a bounded box instead, so the caption always has real, guaranteed space beneath it. */
+  .page .art{flex:0 0 62%;position:relative;overflow:hidden;background:#f0e8d5}
+  .page .art img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
+  .page .ph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;
+      font-family:Georgia,serif;font-style:italic;color:#6a6051;background:linear-gradient(180deg,#f0e8d5,#e9dfc8)}
+  .page .cap{font-size:16px;line-height:1.55;padding:18px 20px 20px;margin:0;flex:1 1 auto;overflow:auto;color:#241f18}
+  .cover{align-items:center;justify-content:center;text-align:center;padding:40px;gap:14px;
+         background:linear-gradient(180deg,#f6f0e2,#efe6d0)}
+  .cover .eyebrow{font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:#8c2f2a;
+      font-family:ui-monospace,"Cascadia Code","SF Mono",Menlo,Consolas,monospace}
+  .cover .idea{font-family:Georgia,serif;font-style:italic;font-size:26px;margin:0;max-width:38ch;color:#241f18}
+  .cover .meta{color:#6a6051;font-family:ui-monospace,"Cascadia Code","SF Mono",Menlo,Consolas,monospace;font-size:12px;letter-spacing:.04em;line-height:1.7}
+  .cover .hint{color:#9a8e76;font-size:12px;margin-top:6px}
+  .closing .eyebrow{color:#9c3327}
+  .nav{position:absolute;top:50%;translate:0 -50%;width:44px;height:44px;border-radius:50%;border:1px solid #c3b490;
+       background:rgba(246,240,226,.92);color:#241f18;font-size:16px;cursor:pointer;z-index:9999}
+  .nav:disabled{opacity:.35;cursor:default}
+  .nav:hover:not(:disabled){background:#8c2f2a;color:#f6f0e2;border-color:#8c2f2a}
+  .nav.prev{left:-58px}
+  .nav.next{right:-58px}
+  @media (max-width:640px){ .nav.prev{left:6px} .nav.next{right:6px} }
+  .clickzone{position:absolute;top:0;bottom:0;width:35%;z-index:9998;cursor:pointer}
+  .clickzone.left{left:0} .clickzone.right{right:0}
+  .chrome{display:flex;flex-direction:column;align-items:center;gap:10px}
+  .pageno{font-family:ui-monospace,"Cascadia Code","SF Mono",Menlo,Consolas,monospace;font-size:12px;color:#6a6051;letter-spacing:.04em}
+  .dots{display:flex;gap:6px;flex-wrap:wrap;justify-content:center;max-width:80vw}
+  .dot{width:7px;height:7px;border-radius:50%;border:0;background:#d5c9ac;cursor:pointer;padding:0}
+  .dot.active{background:#8c2f2a}
+  @media (prefers-reduced-motion: reduce){ .page{ transition:none } }
+</style></head><body>
+<h1>Inkwell Studio</h1>
+<div class="stage" id="stage">
+  <div class="pages" id="pages">${pageHtml}</div>
+  <button class="nav prev" id="prev" aria-label="Previous page">‹</button>
+  <button class="nav next" id="next" aria-label="Next page">›</button>
+  <div class="clickzone left" id="zoneLeft"></div>
+  <div class="clickzone right" id="zoneRight"></div>
+</div>
+<div class="chrome">
+  <div class="pageno" id="pageno"></div>
+  <div class="dots" id="dots">${dotsHtml}</div>
+</div>
+<script>
+(function () {
+  var pages = Array.prototype.slice.call(document.querySelectorAll('.page'));
+  var total = pages.length;
+  var current = 0, animating = false, DURATION = 700;
+  var prevBtn = document.getElementById('prev');
+  var nextBtn = document.getElementById('next');
+  var pageno = document.getElementById('pageno');
+  var dots = Array.prototype.slice.call(document.querySelectorAll('.dot'));
+
+  function layout() {
+    pages.forEach(function (el, i) {
+      if (i === current) { el.style.transform = 'rotateY(0deg)'; el.style.zIndex = total; }
+      else if (i < current) { el.style.transform = 'rotateY(-180deg)'; el.style.zIndex = i; }
+      else { el.style.transform = 'rotateY(0deg)'; el.style.zIndex = total - (i - current); }
+    });
+    pageno.textContent = (current + 1) + ' / ' + total;
+    prevBtn.disabled = current === 0;
+    nextBtn.disabled = current === total - 1;
+    dots.forEach(function (d, i) { d.classList.toggle('active', i === current); });
+  }
+
+  function turn(to) {
+    if (animating || to === current || to < 0 || to > total - 1) return;
+    animating = true;
+    var dir = to > current ? 1 : -1;
+    // The "mover" is whichever page is doing the actual rotating this turn: the outgoing
+    // page when going forward, the already-flipped page coming back when going backward.
+    var mover = pages[dir > 0 ? current : to];
+    mover.style.zIndex = total + 1;
+    void mover.offsetWidth; // force reflow so the transform below actually transitions
+    mover.style.transform = dir > 0 ? 'rotateY(-180deg)' : 'rotateY(0deg)';
+    current = to;
+    pageno.textContent = (current + 1) + ' / ' + total;
+    prevBtn.disabled = current === 0;
+    nextBtn.disabled = current === total - 1;
+    dots.forEach(function (d, i) { d.classList.toggle('active', i === current); });
+    setTimeout(function () { layout(); animating = false; }, DURATION);
+  }
+
+  prevBtn.addEventListener('click', function () { turn(current - 1); });
+  nextBtn.addEventListener('click', function () { turn(current + 1); });
+  document.getElementById('zoneLeft').addEventListener('click', function () { turn(current - 1); });
+  document.getElementById('zoneRight').addEventListener('click', function () { turn(current + 1); });
+  dots.forEach(function (d, i) { d.addEventListener('click', function () { turn(i); }); });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') turn(current + 1);
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') turn(current - 1);
+  });
+
+  layout();
+})();
+</script>
+</body></html>`;
 }
 
 function storySlug() {
@@ -487,8 +728,8 @@ function downloadStory() {
 }
 
 /* --------------------------- download GIF (animatic) ------------------------ */
-// Rasterize a panel's art (inline SVG, a rendered image, or the prompt placeholder)
-// to a PNG data URI via canvas, so the bridge (Pillow) can assemble the GIF.
+// Rasterize a panel's art (the rendered image, or the prompt placeholder) to a PNG data
+// URI via canvas, so the bridge (Pillow) can assemble the GIF/PDF.
 function panelArtToPng(p) {
   return new Promise((resolve) => {
     const W = 640, Hh = 400;
@@ -499,22 +740,11 @@ function panelArtToPng(p) {
       drawer(ctx);
       try { resolve(c.toDataURL('image/png')); } catch { resolve(null); }
     };
-    let src = null;
     if (p.image) {
-      src = p.image;
-    } else if (p.svg && /^\s*<svg/i.test(p.svg)) {
-      // Inline panel SVGs omit xmlns + size (fine in the DOM, but loading one as a
-      // standalone image parses it as XML and needs both — else it fails / draws blank).
-      let svg = p.svg;
-      if (!/\bxmlns=/i.test(svg)) svg = svg.replace(/<svg/i, '<svg xmlns="http://www.w3.org/2000/svg"');
-      if (!/<svg[^>]*\bwidth=/i.test(svg)) svg = svg.replace(/<svg/i, `<svg width="${W}" height="${Hh}"`);
-      src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
-    }
-    if (src) {
       const img = new Image();
       img.onload = () => draw((ctx) => ctx.drawImage(img, 0, 0, W, Hh));
       img.onerror = () => resolve(null);
-      img.src = src;
+      img.src = p.image;
     } else {
       // prompt placeholder → render the prompt text on a paper card
       draw((ctx) => {
@@ -560,6 +790,77 @@ async function downloadGif() {
   }
 }
 
+/* --------------------------- download PDF (printable) ------------------------ */
+// Same title-card + one-page-per-panel composition as the GIF (server/pdfexport.py reuses
+// server/gifexport.py's frame builders), just paginated instead of animated — a printable
+// keepsake of the finished story.
+async function downloadPdf() {
+  const btn = $('download-pdf');
+  if (btn.disabled) return;
+  const label = btn.textContent;
+  btn.classList.add('busy'); btn.textContent = '⟳ Rendering PDF…'; btn.disabled = true;
+  try {
+    const panels = state.panels.filter((p) => p.caption);
+    const out = [];
+    for (const p of panels) {                      // rasterize sequentially (concurrent
+      out.push({ n: p.n, caption: p.caption, png: await panelArtToPng(p) });  // loads can race)
+    }
+    const payload = { idea: state.brief.idea, style: state.brief.style, panels: out };
+    const res = await fetch('/export/pdf', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(`bridge ${res.status}`);
+    triggerDownload(await res.blob(), `inkwell-${storySlug()}.pdf`);
+  } catch (e) {
+    showLiveNote(`Couldn't build the PDF (${e.message}). PDF export needs the bridge running.`);
+  } finally {
+    btn.classList.remove('busy'); btn.textContent = label; btn.disabled = false;
+  }
+}
+
+/* ------------------------------- restyle images ------------------------------ */
+// Re-render every panel's picture in a new style, WITHOUT touching text: same captions,
+// same image prompts, just a fresh /restyle call per panel with the new style. Each restyle
+// gets a genuinely fresh seed server-side (no seed reuse) — with a low-step distilled model
+// the seed can dominate the output enough that reusing it silently produces no visible
+// change. See server/bridge.py's /restyle for the backend side.
+async function restyleStory() {
+  const btn = $('restyle');
+  if (btn.disabled) return;
+  const newStyle = ($('restyle-style').value || '').trim();
+  const panels = state.panels.filter((p) => p.caption && p.svg);
+  if (!newStyle || !panels.length) return;
+
+  const label = btn.textContent;
+  btn.classList.add('busy'); btn.textContent = '⟳ Restyling…'; btn.disabled = true;
+  try {
+    const payload = {
+      style: newStyle,
+      panels: panels.map((p) => ({ n: p.n, prompt: p.svg })),
+    };
+    const res = await fetch('/restyle', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(`bridge ${res.status}`);
+    const { panels: results } = await res.json();
+    let failed = 0;
+    for (const r of results || []) {
+      const p = state.panels.find((x) => x.n === r.n);
+      if (!p) continue;
+      if (r.src) { p.image = r.src; p.imageError = null; }
+      else failed += 1;
+      renderPanel(p.n);
+    }
+    state.brief.style = newStyle;
+    renderBrief();
+    if (failed) showLiveNote(`${failed} panel${failed > 1 ? 's' : ''} couldn't be restyled — kept the previous image.`);
+  } catch (e) {
+    showLiveNote(`Couldn't restyle (${e.message}). Restyle needs the bridge running.`);
+  } finally {
+    btn.classList.remove('busy'); btn.textContent = label; btn.disabled = false;
+  }
+}
+
 /* ----------------------------------- boot ----------------------------------- */
 
 $('promptbar').addEventListener('submit', (e) => {
@@ -568,19 +869,22 @@ $('promptbar').addEventListener('submit', (e) => {
   startRun();
 });
 
-$('mode-sim').addEventListener('click', () => { if (!state.running) setMode(false); });
-$('mode-live').addEventListener('click', () => { if (!state.running) setMode(true); });
+$('surprise').addEventListener('click', surpriseIdea);
+wireStylePreset('style-preset', 'style');
+wireStylePreset('restyle-style-preset', 'restyle-style');
 $('download').addEventListener('click', () => { if (!$('download').disabled) downloadStory(); });
 $('download-gif').addEventListener('click', downloadGif);
+$('download-pdf').addEventListener('click', downloadPdf);
+$('restyle').addEventListener('click', restyleStory);
 
-// Default to Live when served by the bridge (http origin) with ?live=1; else Simulated.
 const params = new URLSearchParams(location.search);
-setMode(params.get('live') === '1');
-
 renderAll();   // show the idle crew / progress on load
 
 // dev/demo aid: open with ?autorun=1 to start a run immediately on load
 if (params.has('autorun')) startRun();
 
 // small automation/debug hook (export + state), used by verification tooling
-window.__inkwell = { buildStoryHtml, downloadStory, downloadGif, panelArtToPng, getState: () => state };
+window.__inkwell = {
+  buildStoryHtml, downloadStory, downloadGif, downloadPdf, panelArtToPng,
+  getState: () => state,
+};
