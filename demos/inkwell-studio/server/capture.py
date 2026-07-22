@@ -8,7 +8,7 @@ while a run plays. Stitching the frames into a video is a manual step (ffmpeg), 
 
 Usage (from repo root, with the bridge + servers running for live):
     .venv/Scripts/python.exe demos/inkwell-studio/server/capture.py \
-        --url "http://127.0.0.1:8800/index.html?live=1&autorun=1" \
+        --url "http://127.0.0.1:8800/index.html?autorun=1" \
         --out ./frames --frames 40 --interval 2
 
 Requires: websockets (already in the venv) and Chrome. Nothing here touches the app.
@@ -98,7 +98,7 @@ async def _run(args) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Capture frames of an Inkwell Studio run.")
-    p.add_argument("--url", default="http://127.0.0.1:8800/index.html?live=1&autorun=1")
+    p.add_argument("--url", default="http://127.0.0.1:8800/index.html?autorun=1")
     p.add_argument("--out", default="./frames")
     p.add_argument("--frames", type=int, default=40)
     p.add_argument("--interval", type=float, default=2.0)

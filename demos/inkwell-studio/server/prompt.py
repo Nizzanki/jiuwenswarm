@@ -33,13 +33,22 @@ JSON object. Allowed events (field names are exact):
 {"t":"run.done"}
 
 Rules:
+- CHILD-SAFE, ALWAYS: every caption AND every image prompt (panel.art) must be appropriate
+  for young children (roughly ages 4-8) — warm, gentle, wonder-filled. No violence, weapons,
+  blood/gore, death, scary or frightening imagery, horror, adult themes, or innuendo. This
+  applies to EVERY panel, including the intentionally-flawed panel-3 draft below — reject
+  that draft for being flat, rushed, or lacking warmth, never for being graphic or scary.
 - Output events in the ORDER they happen, so a viewer watches the story build live.
 - The crew has exactly five members with these ids: writer, critic, artDirector, imageGen, editor.
 - `panel.art.svg` is a short IMAGE PROMPT sentence (no real image is generated in this phase).
 - Emit a `brief` first, then build each panel through its lifecycle:
   drafting -> rendering -> review -> approved, updating the relevant `agent` and `progress`.
-- Captions are REAL, evocative one-to-two-sentence story beats in the author's language,
-  matching the requested style. Keep them vivid but short.
+- CAPTIONS ARE THE STORY ITSELF. Read end to end, the captions must form ONE continuous
+  short story — narrative prose in past tense, each panel picking up exactly where the last
+  left off, with a real beginning, middle and end (and a closing line that lands).
+  Write the story, NOT a description of the picture: no "we see", no scene-setting inventory
+  of objects, no present-tense camera directions. 1-3 sentences per panel, in the author's
+  language and the requested style. The image prompt (panel.art) is where visual detail goes.
 - EXACTLY ONE panel (choose panel 3 if there are >=3 panels) MUST be genuinely REJECTED by
   the Critic: emit a `focus` on that panel, a `panel.note` with a specific reason, set that
   panel `panel.status:"revising"`, set critic `status:"reject"` and writer `status:"active"`
@@ -55,7 +64,7 @@ Rules:
 
 
 def build_brief(idea: str, style: str, panels: int = 5) -> str:
-    idea = (idea or "").strip() or "A lonely lighthouse keeper befriends a sea monster."
+    idea = (idea or "").strip() or "A sleepy bear tries to stay awake to see the first snow."
     style = (style or "").strip() or "Warm storybook · Painterly"
     panels = max(3, min(int(panels or 5), 6))
     return (
@@ -68,8 +77,8 @@ def build_brief(idea: str, style: str, panels: int = 5) -> str:
         "Produce the story as a LIVE EVENT STREAM using the protocol below. Narrate the "
         "crew's real work: the Writer drafts beats, the Art Director writes image prompts, "
         "the Image Generator renders, the Critic reviews, and on one panel the Critic "
-        "genuinely rejects the work and the Writer revises it warmer. Write real, "
-        "evocative captions in the author's language and the requested style.\n"
+        "genuinely rejects the work and the Writer revises it warmer. The captions must read "
+        "as one continuous short story (past tense narrative), not picture descriptions.\n"
         f"{PROTOCOL_SPEC}"
     )
 
@@ -78,7 +87,7 @@ def build_team_brief(idea: str, style: str, panels: int = 3) -> str:
     """Brief for NATIVE team mode. Deliberately LEAN so the real multi-agent team completes
     in bounded time (heavy briefs make the leader poll/coordinate forever and deadlock):
     small crew, few panels, one revision, and the protocol emitted as the FINAL answer."""
-    idea = (idea or "").strip() or "A lonely lighthouse keeper befriends a sea monster."
+    idea = (idea or "").strip() or "A sleepy bear tries to stay awake to see the first snow."
     style = (style or "").strip() or "Warm storybook · Painterly"
     panels = max(2, min(int(panels or 3), 4))
     return (
@@ -87,8 +96,9 @@ def build_team_brief(idea: str, style: str, panels: int = 3) -> str:
         f"IDEA: \"{idea}\"\nSTYLE: {style}\nPANELS: exactly {panels}\n\n"
         "Do this efficiently:\n"
         f"1. Spawn TWO teammates: a Writer and a Critic.\n"
-        f"2. In ONE task, have the Writer draft all {panels} panel captions (vivid, in the style) "
-        "plus a one-line image prompt per panel.\n"
+        f"2. In ONE task, have the Writer write a real short story told across {panels} panels — "
+        "the captions, read in order, must be one continuous narrative (past tense, a proper "
+        "beginning/middle/end), not descriptions of pictures — plus a one-line image prompt per panel.\n"
         "3. In ONE task, have the Critic review and REJECT exactly one panel as too flat, with a "
         "short reason; the Writer revises just that panel warmer.\n"
         "4. Then STOP delegating and finish.\n"
@@ -98,6 +108,37 @@ def build_team_brief(idea: str, style: str, panels: int = 3) -> str:
         "status, the crew members and their activity, the Critic's rejection note on the revised "
         "panel, the revision-loop log, progress, and a final run.done. No prose, no markdown.\n"
         f"{PROTOCOL_SPEC}"
+    )
+
+
+def build_fill_brief(idea: str, style: str, total: int, prior: list[tuple[int, str]], missing: list[int]) -> str:
+    """Patch brief for when the team wrote most of the story but skipped panel(s) `missing`
+    (see bridge.py's _incomplete_panels): ask a single agent for ONLY those panels as a
+    direct continuation, not the whole story over again. This is deliberately the smallest
+    possible ask (no crew role-play, no revision loop, no progress/agent bookkeeping —
+    bridge.py synthesizes the status/progress events itself) so the patch is fast; a full
+    single-agent re-run is reserved for when the team produced nothing usable to patch."""
+    idea = (idea or "").strip() or "A sleepy bear tries to stay awake to see the first snow."
+    style = (style or "").strip() or "Warm storybook · Painterly"
+    context = "\n".join(f"Panel {n}: {cap}" for n, cap in prior) or "(no earlier panels — write from the idea)"
+    panel_list = ", ".join(str(n) for n in missing)
+    return (
+        "You are completing an illustrated children's story that a crew already started but "
+        f"left unfinished. Write ONLY the missing panel(s): {panel_list}. Do not rewrite or "
+        "repeat the panels already written below — they are done.\n\n"
+        f"THE AUTHOR'S IDEA: \"{idea}\"\nSTYLE: {style}\nTOTAL PANELS IN THE FINISHED STORY: {total}\n\n"
+        f"STORY SO FAR (already written, for continuity only — do not repeat it):\n{context}\n\n"
+        "Continue the narrative from exactly where it left off, in the SAME past-tense prose "
+        "voice, one continuous story — and if the missing panel(s) include the last panel, "
+        "land a real ending, not a cliffhanger.\n\n"
+        "CHILD-SAFE, ALWAYS: warm, gentle, wonder-filled — no violence, weapons, blood/gore, "
+        "death, scary or frightening imagery, horror, adult themes, or innuendo.\n\n"
+        "Emit ONLY these two event types, one compact JSON object per line, nothing else (no "
+        "prose, no markdown fences) — one art line and one caption line per missing panel:\n"
+        '{"t":"panel.art","panel":<int>,"svg":"<a ONE-SENTENCE image prompt describing the picture>"}\n'
+        '{"t":"panel.caption","panel":<int>,"text":"<the story caption for this panel, continuing the narrative>","dim":false}\n'
+        f"Only emit these for panel numbers in: {panel_list}. No other panels, no other event types, "
+        "no commentary."
     )
 
 
