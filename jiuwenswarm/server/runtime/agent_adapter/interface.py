@@ -4074,6 +4074,28 @@ class JiuWenSwarm:
         except Exception:
             logger.exception("[JiuWenSwarm] adapter.abort_on_gateway_disconnect failed")
 
+    async def cleanup_session_runtime(self, session_id: str) -> bool:
+        """释放单个 session 的运行时状态（任务处理器 + adapter 侧 session 状态）."""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+
+        closed = await self._session_manager.close_session(sid)
+
+        adapter = self._adapter
+        if adapter is not None:
+            cleanup_fn = getattr(adapter, "cleanup_session_adapter", None)
+            if callable(cleanup_fn):
+                try:
+                    await cleanup_fn(sid)
+                except Exception:
+                    logger.exception(
+                        "[JiuWenSwarm] adapter.cleanup_session_adapter failed: session_id=%s",
+                        sid,
+                    )
+
+        return closed
+
     async def cleanup(self) -> None:
         """清理资源，准备销毁实例.
 
@@ -4081,6 +4103,8 @@ class JiuWenSwarm:
         不清理记忆数据（记忆数据保留在文件系统中）。
         """
         logger.info("[JiuWenSwarm] cleanup: 清理资源")
+        await self._session_manager.close_all_sessions()
+
         await self._session_manager.close_all_sessions()
 
         if self._adapter is not None:
