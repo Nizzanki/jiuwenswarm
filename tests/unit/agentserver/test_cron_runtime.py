@@ -238,6 +238,45 @@ async def test_cron_tools_create_job_resolves_route_project_dir(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_cron_tools_create_job_uses_route_project_id_and_work_mode(
+    tmp_path, monkeypatch,
+) -> None:
+    project_store = _setup_project_store(tmp_path, monkeypatch)
+    project_dir = tmp_path / "shared-project"
+    project_dir.mkdir()
+    project_store.create_project("WorkP", str(project_dir), work_mode="work")
+    code_project = project_store.create_project("CodeP", str(project_dir), work_mode="code")
+    tools, push = _make_cron_tools(tmp_path, monkeypatch)
+
+    token = tools.push_cron_route(
+        CronToolRoute(
+            project_dir=str(project_dir),
+            project_id=code_project.project_id,
+            work_mode="code",
+        )
+    )
+    try:
+        job = await tools.create_job(
+            {
+                "id": "job-route-project",
+                "name": "daily",
+                "cron_expr": "0 9 * * *",
+                "timezone": "Asia/Shanghai",
+                "description": "hello",
+                "targets": "web",
+            }
+        )
+    finally:
+        tools.reset_cron_route(token)
+
+    assert job["project_id"] == code_project.project_id
+    assert job["work_mode"] == "code"
+    synced = push.payloads[-1]["body"]["data"]
+    assert synced["project_id"] == code_project.project_id
+    assert synced["work_mode"] == "code"
+
+
+@pytest.mark.asyncio
 async def test_cron_tools_create_job_rejects_relative_project_dir(tmp_path, monkeypatch) -> None:
     _setup_project_store(tmp_path, monkeypatch)
     tools, push = _make_cron_tools(tmp_path, monkeypatch)
@@ -445,3 +484,42 @@ async def test_cron_tools_update_job_rejects_invalid_patch(tmp_path, monkeypatch
     with pytest.raises(ValueError, match=match):
         await tools.update_job("job-reject", patch)
     assert push.payloads == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "session_pid, expected_pid",
+    [
+        pytest.param("default", "default", id="session_default_work"),
+        pytest.param("default_code", "default_code", id="session_default_code"),
+        pytest.param("", "", id="session_empty_like_manual"),
+    ],
+)
+async def test_cron_tools_create_job_inherits_session_default_project_id(
+    tmp_path, monkeypatch, session_pid, expected_pid
+):
+    """Issue #2653：对话创建未显式传 project_id 时注入会话 project_id。
+
+    会话在默认项目下会落库 default/default_code（与手动未选的空串不同）；
+    列表展示层须把二者统一显示为「-」。
+    """
+    _setup_project_store(tmp_path, monkeypatch)
+    tools, push = _make_cron_tools(tmp_path, monkeypatch)
+    token = tools.push_cron_route(CronToolRoute(project_id=session_pid))
+    try:
+        job = await tools.create_job(
+            {
+                "id": "job-session-default",
+                "name": "reminder",
+                "cron_expr": "0 9 * * *",
+                "timezone": "Asia/Shanghai",
+                "description": "drink",
+                "targets": "web",
+            }
+        )
+    finally:
+        tools.reset_cron_route(token)
+
+    assert job["project_id"] == expected_pid
+    synced = push.payloads[-1]["body"]["data"]
+    assert synced["project_id"] == expected_pid

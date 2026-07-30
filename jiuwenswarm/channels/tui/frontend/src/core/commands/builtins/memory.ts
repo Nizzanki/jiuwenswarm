@@ -473,18 +473,22 @@ async function editMemoryByPath(
         writeFileSync(path, "");
       }
       if (ctx.openInEditor) {
-        ctx.openInEditor(path);
         const { source, value } = getEditorInfo();
         const editorHint = source !== "default"
           ? `(${source}="${value}")`
           : "(default: vi)";
-        ctx.addItem(
-          addInfo(
-            ctx.sessionId,
-            `Opened memory file at ${displayPath} ${editorHint}`,
-            "m",
-          ),
-        );
+        // openInEditor blocks until the editor window closes (TUI frozen in
+        // the meantime). Emit the "Opened…" line in onDone, i.e. AFTER the
+        // editor exits — matches CC's editFileInEditor → onDone("Opened…").
+        ctx.openInEditor(path, () => {
+          ctx.addItem(
+            addInfo(
+              ctx.sessionId,
+              `Opened memory file at ${displayPath} ${editorHint}`,
+              "m",
+            ),
+          );
+        });
       } else {
         ctx.addItem(
           addInfo(
@@ -510,8 +514,6 @@ async function editMemoryByPath(
     }
 
     if (ctx.openInEditor) {
-      ctx.openInEditor(payload.path);
-
       const projectDir = ctx.getCurrentProjectDir();
       const displayPath = getDisplayPath(payload.path, projectDir);
       const { source, value } = getEditorInfo();
@@ -519,13 +521,18 @@ async function editMemoryByPath(
         ? `(${source}="${value}")`
         : "(default: vi)";
 
-      ctx.addItem(
-        addInfo(
-          ctx.sessionId,
-          `Opened memory file at ${displayPath} ${editorHint}`,
-          "m",
-        ),
-      );
+      // openInEditor blocks until the editor window closes (TUI frozen in
+      // the meantime). Emit the "Opened…" line in onDone, AFTER the editor
+      // exits — matches CC's editFileInEditor → onDone("Opened…").
+      ctx.openInEditor(payload.path, () => {
+        ctx.addItem(
+          addInfo(
+            ctx.sessionId,
+            `Opened memory file at ${displayPath} ${editorHint}`,
+            "m",
+          ),
+        );
+      });
     } else {
       const projectDir = ctx.getCurrentProjectDir();
       const displayPath = getDisplayPath(payload.path, projectDir);
@@ -898,9 +905,15 @@ export function createMemoryCommand(): SlashCommand {
     example: "/memory",
     kind: CommandKind.BUILT_IN,
     takesArgs: true,
-    action: async (ctx) => {
+    action: async (ctx, args) => {
       // 无参 → 弹出页签选择器（edit/status/toggle/open）；
       // 子命令 /memory <sub> 由各自 subCommand 直达对应页签。
+      // 若跟了不存在的子命令（如已废弃的 list），参考 CC 报错而非触发页签选择器。
+      const firstArg = args.trim().split(/\s+/)[0];
+      if (firstArg && !(MEMORY_TABS as readonly string[]).includes(firstArg)) {
+        ctx.addItem(addError(ctx.sessionId, `Unknown memory subcommand: ${firstArg}`));
+        return;
+      }
       await showMemoryConsole(ctx);
     },
     completion: async () => {

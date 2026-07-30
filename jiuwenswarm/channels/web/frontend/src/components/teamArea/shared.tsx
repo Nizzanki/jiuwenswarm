@@ -2,6 +2,7 @@ import { Check, ChevronRight, Circle } from 'lucide-react';
 import i18n from '../../i18n';
 import { ParsedTeamEvent, parseTeamEventMessage } from '../ChatPanel/teamEventUtils';
 import type { Message, TodoItem } from '../../types';
+import type { ReactNode } from 'react';
 import type {
   TeamTask as SessionTeamTask,
   TeamMemberExecutionEvent,
@@ -32,6 +33,13 @@ export interface TeamTaskEvent {
   team_name?: string;
   title?: string;
   content?: string;
+  // Truncation observability flags — kept aligned with TeamTaskEvent in
+  // stores/sessionStore.ts and components/TeamTaskEvents.tsx so the event
+  // panel can surface them if needed (currently passthrough/observability only).
+  title_truncated?: boolean;
+  title_original_size?: number;
+  content_truncated?: boolean;
+  content_original_size?: number;
   updated_at?: number | string | null;
 }
 
@@ -63,6 +71,7 @@ export interface ProcessItem {
 interface BaseTeamAreaProps {
   members: TeamMember[];
   historyMessages?: Message[];
+  reviewPanel?: ReactNode;
 }
 
 export type TeamAreaProps = BaseTeamAreaProps & (
@@ -82,7 +91,7 @@ export type TeamAreaProps = BaseTeamAreaProps & (
   }
 );
 
-export type TabType = 'planning' | 'team' | 'artifacts';
+export type TabType = 'planning' | 'team' | 'artifacts' | 'review';
 export type TeamDetailTab = 'members' | 'group';
 export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'cancelled' | 'error';
 export type TaskColumnKey = 'waiting' | 'running' | 'completed' | 'cancelled';

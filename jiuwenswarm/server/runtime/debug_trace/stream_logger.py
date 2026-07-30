@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from jiuwenswarm.server.runtime.debug_trace.config import DebugTraceSettings
+from jiuwenswarm.common.utils import _sanitize_log_text, _masked_with_fp
 
 _logger = logging.getLogger(__name__)
 
@@ -112,18 +113,45 @@ def _mask_secrets(value: Any) -> Any:
     """Recursively mask values whose dict key looks secret-like.
 
     Returns a shallow-ish copy for dicts/lists so the caller's payload is
-    untouched. Non-container values pass through unchanged.
+    untouched. Non-container values pass through unchanged. 命中敏感键名的
+    值替换为 ``******(fp:xxxxxxxx)``（与主 ``SensitiveDataFilter`` 指纹算法一致），
+    便于 trace 文件与其他日志跨文件关联同一 key。字符串值里夹带的凭证由
+    ``_write_raw`` 落盘前统一经 ``_sanitize_log_text`` 兜底脱敏。
     """
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for k, v in value.items():
             if isinstance(k, str) and _looks_secret(k):
-                out[k] = "***"
+                out[k] = _masked_with_fp(v)
             else:
                 out[k] = _mask_secrets(v)
         return out
     if isinstance(value, list):
         return [_mask_secrets(v) for v in value]
+    return value
+
+
+def _mask_arguments(value: Any) -> Any:
+    """Mask secret keys inside tool-call arguments, tolerating JSON-string shape.
+
+    LLM-emitted tool calls usually deliver ``arguments`` as a JSON *string*
+    (e.g. ``'{"api_key": "sk-..."}'``), not a structured dict. ``_mask_secrets``
+    only recurses dict/list values, so a JSON-string value would pass through
+    unchanged. Parse it, mask, and re-serialise so secrets are masked in both
+    the string and dict shapes; non-JSON strings are returned verbatim.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                parsed = json.loads(value)
+            except ValueError:  # JSONDecodeError is a ValueError subclass
+                return value
+            if isinstance(parsed, (dict, list)):
+                return _stringify(_mask_secrets(parsed))
+        return value
+    if isinstance(value, (dict, list)):
+        return _stringify(_mask_secrets(value))
     return value
 
 
@@ -160,11 +188,16 @@ def _classify(ctype: str, payload: Any) -> str:
 class _Run:
     """A pending accumulation of token-streamed chunks (single source)."""
 
-    __slots__ = ("category", "buf")
+    __slots__ = ("category", "source", "buf", "llm_output_seen")
 
-    def __init__(self, category: str) -> None:
+    def __init__(self, category: str, source: str = "main") -> None:
         self.category = category
+        self.source = source
         self.buf: list[str] = []
+        # Per-run dedup flag: drop a trailing `answer` chunk that just repeats
+        # already-streamed llm_output. Kept per-_Run so main and subagent
+        # streams don't interfere.
+        self.llm_output_seen = False
 
 
 class DebugTraceLogger:
@@ -199,9 +232,11 @@ class DebugTraceLogger:
         self._start_monotonic: float | None = None
         self._chunk_count = 0
 
-        # Single-source accumulation (Phase 1: no subagent source metadata).
+        # Current accumulator. source is tracked per-_Run so the main run and
+        # any in-flight subagent stream coexist in one dump; begin_subagent /
+        # end_subagent bracket subagent sections, feed_subagent tags their
+        # chunks. See invoke_subagent_with_trace for the dispatch wiring.
         self._run: _Run | None = None
-        self._llm_output_seen = False
 
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -248,15 +283,66 @@ class DebugTraceLogger:
         except Exception as exc:
             self._safe_warn(f"start_run error: {exc!r}")
 
+    def captures_subagent_flow(self) -> bool:
+        """True if this run should capture subagent streams into the dump."""
+        return not self._disabled and self._settings.include_subagent_flow
+
     def feed(self, chunk: Any) -> None:
+        self._feed_safe(chunk, "main")
+
+    def feed_subagent(self, *, source: str, chunk: Any) -> None:
+        """Feed a chunk from an in-flight subagent stream.
+
+        Tags the chunk with *source* (e.g. ``subagent:builtin:explore_agent``)
+        so it appears in the dump under that source rather than ``main``.
+        No-op when disabled or when ``include_subagent_flow`` is off.
+        """
+        if self._disabled or not self._settings.include_subagent_flow:
+            return
+        self._feed_safe(chunk, source)
+
+    def begin_subagent(self, *, source: str, prompt: str = "") -> None:
         if self._disabled:
             return
         try:
-            self._feed(chunk)
+            self._flush_run()
+            self._write_raw("\n".join([
+                "========== subagent start ==========",
+                f"timestamp={_now_ts()}",
+                f"source={source}",
+                f"prompt={_truncate(prompt or '', self._settings.generic_payload_max_chars)}",
+            ]))
+        except Exception as exc:
+            self._safe_warn(f"begin_subagent error: {exc!r}")
+
+    def end_subagent(self, *, source: str, status: str = "ok") -> None:
+        if self._disabled:
+            return
+        try:
+            self._flush_run()
+            self._write_raw(
+                "========== subagent end ==========\n"
+                f"timestamp={_now_ts()}\nsource={source}\nstatus={status}"
+            )
+        except Exception as exc:
+            self._safe_warn(f"end_subagent error: {exc!r}")
+
+    def _feed_safe(self, chunk: Any, source: str) -> None:
+        if self._disabled:
+            return
+        try:
+            self._feed_chunk(chunk, source)
         except Exception as exc:  # never break the stream
             self._safe_warn(f"feed error: {exc!r}")
 
-    def end_run(self, *, status: str, error: BaseException | None = None) -> None:
+    def end_run(
+        self,
+        *,
+        status: str,
+        error: BaseException | None = None,
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
         if self._disabled or self._ended:
             return
         self._ended = True
@@ -277,6 +363,14 @@ class DebugTraceLogger:
             if error is not None:
                 lines.append(f"error_type={type(error).__name__}")
                 lines.append(f"error={error}")
+            elif error_type is not None or error_message is not None:
+                # Non-exception failure surfaced as an in-stream event
+                # (e.g. controller task_failed): record the same error_type /
+                # error lines so run-end status reflects it.
+                if error_type:
+                    lines.append(f"error_type={error_type}")
+                if error_message:
+                    lines.append(f"error={error_message}")
             self._write_raw("\n".join(lines))
         except Exception as exc:
             self._safe_warn(f"end_run error: {exc!r}")
@@ -299,20 +393,21 @@ class DebugTraceLogger:
                 self._file = None
 
     # ── internals ────────────────────────────────────────────────────────
-    def _feed(self, chunk: Any) -> None:
+    def _feed_chunk(self, chunk: Any, source: str) -> None:
         self._chunk_count += 1
 
         ctype, payload = self._unpack(chunk)
         if ctype is None:
             # Dict / untyped chunk: record as 'other' for visibility.
             self._flush_run()
-            self._emit("other", "main", _truncate(_safe_str(chunk), self._settings.generic_payload_max_chars))
+            self._emit("other", source, _truncate(_safe_str(chunk), self._settings.generic_payload_max_chars))
             return
 
         category = _classify(ctype, payload)
 
+        run = self._run
         # `answer` duplicates already-streamed llm_output — drop if seen.
-        if ctype == _CHUNK_ANSWER and self._llm_output_seen:
+        if ctype == _CHUNK_ANSWER and run is not None and run.llm_output_seen:
             return
 
         if ctype in _ACCUMULATING_TYPES:
@@ -323,20 +418,24 @@ class DebugTraceLogger:
             content = _extract_content(payload)
             if not content:
                 return
-            if self._run is not None and self._run.category != category:
+            # Flush if the pending run is for a different category OR a different
+            # source (main vs a subagent) so streams never bleed into each other.
+            if run is not None and (run.category != category or run.source != source):
                 self._flush_run()
-            if self._run is None:
-                self._run = _Run(category)
-            self._run.buf.append(content)
+                run = self._run
+            if run is None:
+                run = _Run(category, source)
+                self._run = run
+            run.buf.append(content)
             if ctype == _CHUNK_LLM_OUTPUT:
-                self._llm_output_seen = True
+                run.llm_output_seen = True
             return
 
         # Discrete chunk: flush pending text, then emit a summary now.
         self._flush_run()
         summary = self._discrete_summary(ctype, category, payload)
         if summary:
-            self._emit(category, "main", summary)
+            self._emit(category, source, summary)
 
     @staticmethod
     def _unpack(chunk: Any) -> tuple[str | None, Any]:
@@ -376,6 +475,9 @@ class DebugTraceLogger:
         args_raw = info.get("arguments") or info.get("args") or info.get("tool_args") or ""
         if not self._settings.include_tool_args:
             args_raw = "<redacted>"
+        else:
+            # arguments often arrive as a JSON string; mask secrets inside it.
+            args_raw = _mask_arguments(args_raw)
         args = _truncate(_stringify(args_raw), args_limit)
         return f"tool_name={name} tool_call_id={call_id}\narguments={args}"
 
@@ -408,7 +510,13 @@ class DebugTraceLogger:
         name = update.get("tool_name") or update.get("name") or ""
         status = update.get("status", "")
         call_id = update.get("tool_call_id") or update.get("id") or ""
-        args = _truncate(_stringify(update.get("arguments", "")), args_limit)
+        args_raw = update.get("arguments", "")
+        if not self._settings.include_tool_args:
+            args_raw = "<redacted>"
+        else:
+            # arguments often arrive as a JSON string; mask secrets inside it.
+            args_raw = _mask_arguments(args_raw)
+        args = _truncate(_stringify(args_raw), args_limit)
         return f"tool_name={name} status={status} tool_call_id={call_id}\narguments={args}"
 
     def _usage_summary(self, payload: Any) -> str:
@@ -433,7 +541,7 @@ class DebugTraceLogger:
             return
         text = "".join(run.buf)
         limit = self._settings.max_model_output_chars if run.category == "text" else None
-        self._emit(run.category, "main", _truncate(text, limit))
+        self._emit(run.category, run.source, _truncate(text, limit))
 
     def _emit(self, category: str, source: str, content: str) -> None:
         if not content:
@@ -447,7 +555,12 @@ class DebugTraceLogger:
         if self._file is None:
             return
         try:
-            self._file.write(f"{body}\n")
+            # 落盘前统一脱敏：trace 文件直接 file.write，不走 logging，
+            # 主 SensitiveDataFilter 管不到。此处对 body 走与主 filter 一致
+            # 的脱敏（含字符串值里夹带的 api_key/Bearer 等，并附指纹），
+            # 兜底覆盖所有写入路径（_emit / run 边界 / _safe_warn）。
+            masked = _sanitize_log_text(body) if body else body
+            self._file.write(f"{masked}\n")
             self._file.flush()
         except Exception as exc:
             _logger.debug("[DebugTrace] write failed: %s", exc)
@@ -456,8 +569,7 @@ class DebugTraceLogger:
         _logger.warning("[DebugTrace] %s (session=%s)", msg, self._session_id)
         if self._file is not None:
             try:
-                self._file.write(f"{_now_ts()} [WARN] {msg}\n")
-                self._file.flush()
+                self._write_raw(f"{_now_ts()} [WARN] {msg}")
             except Exception as exc:
                 _logger.debug("[DebugTrace] failed to write warning to dump file: %s", exc)
 

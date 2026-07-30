@@ -1,11 +1,11 @@
-﻿﻿﻿import { useState, useRef, useCallback, KeyboardEvent, useEffect, ClipboardEvent, DragEvent, ChangeEvent, useMemo } from 'react';
+﻿import { useState, useRef, useCallback, KeyboardEvent, useEffect, ClipboardEvent, DragEvent, ChangeEvent, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import { AtSign, CircleX, FileImage, Loader2, Plus, Square, X } from 'lucide-react';
+import { AtSign, CircleX, FileImage, Loader2, Plus, Square, Target, X } from 'lucide-react';
 import { useSpeechRecognition } from '../../hooks';
 
 // import { stopAllTts } from '../../utils';
-import { useChatStore, useSessionStore, useWorkspaceStore } from '../../stores';
+import { useChatStore, useGoalStore, useSessionStore, useWorkspaceStore, resolveEffectiveModel } from '../../stores';
 import { AgentMode, MediaItem, Permission, type ProjectInfo } from '../../types';
 import { NEW_CONVERSATION_ID } from '../../multi-session/state/newConversationLifecycle';
 import { ProjectCreateMenu, type ProjectCreateMode } from '../../multi-session/sidebar/ProjectCreateMenu';
@@ -16,6 +16,7 @@ import { PermissionWarningDialog } from './PermissionWarningDialog';
 import { ModelProviderIcon } from '../ModelProviderIcon';
 import { getEvolutionPillLabel } from './evolution-status';
 import { webRequest } from '../../services/webClient';
+import { getSkillAvatar } from '../../utils/skillAvatar';
 import {
   isLikelyAbsolutePath,
   isProjectDirectoryPickerSupported,
@@ -25,10 +26,14 @@ import { getInputProjectOptions, isDefaultInputProject } from './projectSelectio
 import sendIcon from '../../assets/send.svg';
 import sendActiveIcon from '../../assets/send_active.svg';
 import { TeamMemberAvatar } from '../TeamMemberAvatar';
+import { CodeBranchSelector } from '../../features/code-mode/CodeBranchSelector';
+import { generateUuidV4 } from '../../utils/uuid';
 
 /** 输入栏下拉所需的最小技能数据结构（与 SkillPanel 中的 SkillItem 保持一致） */
 type InputAreaSkillItem = {
   name: string;
+  /** 展示名（保留安装来源的原始大小写，如 ClawHub 的 Weather）；缺省回退到 name */
+  display_name?: string;
   description: string;
   source: string;
   is_builtin?: boolean;
@@ -90,7 +95,7 @@ function WorkIcon({ name, className }: { name: WorkIconName; className?: string 
 }
 
 function isDefaultProject(project: ProjectInfo): boolean {
-  return project.is_default || project.project_id === 'default';
+  return project.is_default || project.project_id === 'default' || project.project_id === 'default_code';
 }
 
 interface InputAreaProps {
@@ -105,6 +110,17 @@ interface InputAreaProps {
   onNavigateToSkills?: () => void;
   permissionsEnabled: boolean;
   onSavePermission: (updates: Record<string, string>) => Promise<void>;
+  /** 目标待设置态（"+"菜单选了「目标」）下发送时调用，取代普通 onSubmit/排队逻辑 */
+  onSetGoal?: (sessionId: string, objective: string) => void;
+  /** 工具栏"目标"标签的 × 按钮：目标已存在时点击等同删除目标 */
+  onClearGoal?: (sessionId: string) => void;
+  /**
+   * 目标 active 时消息按设计走排队（见下方 isGoalActive 注释），但如果入队那一刻当前没有
+   * 任何任务在处理，现有的自动排空触发点（chat.processing_status/interrupt_result）都要求
+   * "之前在 processing"，不会命中，消息会永久卡住。入队后调用它兜底：内部会判断当前是否
+   * 真的空闲，空闲才会真正发送，不会重复触发。
+   */
+  onDrainTaskQueueIfIdle?: (sessionId: string) => void;
 }
 
 const ACCEPTED_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
@@ -145,10 +161,7 @@ function formatAttachmentSize(size: number): string {
 }
 
 function makeAttachmentId(file: File): string {
-  const random = typeof crypto !== 'undefined' && 'randomUUID' in crypto
-    ? crypto.randomUUID()
-    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  return `${file.name || 'image'}-${file.size}-${random}`;
+  return `${file.name || 'image'}-${file.size}-${generateUuidV4()}`;
 }
 
 function attachmentToMediaItem(attachment: AttachmentDraft): MediaItem {
@@ -236,13 +249,15 @@ export function InputArea({
   onNavigateToSkills,
   permissionsEnabled,
   onSavePermission,
+  onSetGoal,
+  onClearGoal,
+  onDrainTaskQueueIfIdle,
 }: InputAreaProps) {
   const [pendingVoiceText, setPendingVoiceText] = useState('');
   const [isModeMenuOpen, setIsModeMenuOpen] = useState(false);
   const [attachments, setAttachments] = useState<AttachmentDraft[]>([]);
   const [attachmentAlerts, setAttachmentAlerts] = useState<AttachmentAlert[]>([]);
   const [attachmentMenuId, setAttachmentMenuId] = useState<string | null>(null);
-  const [isDraggingImage, setIsDraggingImage] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [workMenuOpen, setWorkMenuOpen] = useState<'project' | null>(null);
   const [workDialogOpen, setWorkDialogOpen] = useState(false);
@@ -253,15 +268,26 @@ export function InputArea({
   const [projectCreateMode, setProjectCreateMode] = useState<ProjectCreateMode>('blank');
   const [menuDirection, setMenuDirection] = useState<'up' | 'down'>('up');
   const [hoveredOptionDesc, setHoveredOptionDesc] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!projectDirError || workDialogOpen) return;
+    const timeoutId = window.setTimeout(() => setProjectDirError(null), 3000);
+    return () => window.clearTimeout(timeoutId);
+  }, [projectDirError, workDialogOpen]);
+
   const [composerSuggestion, setComposerSuggestion] = useState<ComposerSuggestionState | null>(null);
   const [composerSuggestionIndex, setComposerSuggestionIndex] = useState(0);
   const [modeMenuAnchor, setModeMenuAnchor] = useState<DOMRect | null>(null);
+  const [attachMenuOpen, setAttachMenuOpen] = useState(false);
+  const [attachMenuAnchor, setAttachMenuAnchor] = useState<DOMRect | null>(null);
   const inputRef = useRef<HTMLDivElement>(null);
   /** 保存技能插入前的光标位置，用于在光标处插入 chip */
   const savedRangeRef = useRef<Range | null>(null);
   const modeMenuRef = useRef<HTMLDivElement>(null);
   const workMenuRef = useRef<HTMLDivElement>(null);
   const modeMenuPortalRef = useRef<HTMLDivElement>(null);
+  const attachMenuRef = useRef<HTMLDivElement>(null);
+  const attachMenuPortalRef = useRef<HTMLDivElement>(null);
   const autoSendTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const attachmentMenuTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const attachmentMenuOpenedByLongPressRef = useRef(false);
@@ -285,6 +311,7 @@ export function InputArea({
   });
   const canPersistAttachments = Boolean(activeSessionId && activeSessionId !== NEW_CONVERSATION_ID);
   const {
+    workMode,
     projects,
     selectedProject,
     setSelectedProject,
@@ -292,12 +319,26 @@ export function InputArea({
   } = useWorkspaceStore();
   const loadedMsgLen = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.messages?.length ?? 0);
   const hasHistory = (currentSession?.message_count ?? 0) > 0 || loadedMsgLen > 0;
-  const isInterruptible = isProcessing || isPaused;
+  const goalArmed = useGoalStore((s) => s.runtimes[activeSessionId ?? '']?.armed ?? false);
+  const currentGoal = useGoalStore((s) => s.runtimes[activeSessionId ?? '']?.goal ?? null);
+  // 目标 active 时普通发送改走排队，而不是文档 §5.1 原定的 input_mode:'steer' 实时插话——
+  // 用户明确要求改成这个语义（steer 目前收不到任何反馈，体验上等同于消息发出去石沉大海，
+  // 见 backend-requests.md #1）。走排队后消息复用现有的通用队列机制，行为和普通排队一致。
+  const isGoalActive = currentGoal?.status === 'active';
+  // 未完成目标：active/paused/blocked 都算，只有 completed（或没有目标）才能再设新目标
+  const hasUnfinishedGoal = currentGoal != null && currentGoal.status !== 'completed';
+  const isInterruptible = isProcessing || isPaused || isGoalActive;
   const isAgentMode = mode === 'agent';
   const isTeamMode = mode === 'team';
   const isAutoHarnessMode = mode === 'auto_harness';
   const isWorkContextLocked = Boolean(activeSessionId && activeSessionId !== NEW_CONVERSATION_ID);
   const showWorkContextRow = activeSessionId === NEW_CONVERSATION_ID;
+  /** Goal 入口是否适用于当前上下文（agent 模式 + 已接入 onSetGoal，如欢迎页新会话就不适用） */
+  const canUseGoalMenu = isAgentMode && Boolean(onSetGoal);
+  // 只跟 armed 挂钩：这个 tag 是"下一条消息将用于设置目标"的过渡态指示，发送后 armed 变 false
+  // 就该跟着消失，不能靠"目标是否存在"续命——目标存在与否、当前状态、编辑/暂停/删除，已经由
+  // 输入框上方常驻的 GoalBar 完整覆盖，工具栏这里再挂一份重复的常驻入口只会显得"选择没解除"。
+  const goalTagVisible = canUseGoalMenu && goalArmed;
 
   const mentionableMembers = useMemo(() => {
     return teamMembers
@@ -339,7 +380,9 @@ export function InputArea({
   );
 
   const displayedProject = useMemo<ProjectInfo | null>(() => {
-    if (activeSession?.project_id && activeSession.project_id !== 'default') {
+    if (activeSession?.project_id
+      && activeSession.project_id !== 'default'
+      && activeSession.project_id !== 'default_code') {
       const matched = projects.find((project) => project.project_id === activeSession.project_id);
       if (matched && !isDefaultProject(matched)) return matched;
     }
@@ -355,6 +398,17 @@ export function InputArea({
         pin_order: 0,
         is_default: path === '',
         hidden: false,
+        work_mode: activeSession.work_mode ?? workMode,
+        git: {
+          enabled: false,
+          repo_root: '',
+          initialized_by_jiuwenswarm: false,
+          detected_at: 0,
+          status: 'disabled',
+          branch: '',
+          error: '',
+          is_dirty: false,
+        },
         session_count: 0,
         last_message_at: null,
         last_user_message_at: null,
@@ -362,7 +416,7 @@ export function InputArea({
       };
     }
     return selectedProject && !isDefaultInputProject(selectedProject) ? selectedProject : null;
-  }, [activeSession, projects, selectedProject, t]);
+  }, [activeSession, projects, selectedProject, t, workMode]);
 
   const {
     isListening,
@@ -389,6 +443,9 @@ export function InputArea({
   });
 
   const imageInputDisabled = isListening || (isInterruptible && !isTeamMode);
+  // "+" 触发按钮本身不跟图片/目标的可用性挂钩：菜单以后可能挂其他跟图片/目标无关的功能，
+  // 触发按钮只要不在录音就该能点开；具体某一项能不能选，交给菜单里每一项各自的禁用态处理。
+  const attachTriggerDisabled = isListening;
   const readyAttachments = useMemo(
     () => attachments.filter((attachment) => attachment.status === 'ready' && attachment.base64Data),
     [attachments],
@@ -608,6 +665,25 @@ export function InputArea({
   }, [isModeMenuOpen]);
 
   useEffect(() => {
+    if (!attachMenuOpen) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (
+        !attachMenuRef.current?.contains(event.target as Node) &&
+        !attachMenuPortalRef.current?.contains(event.target as Node)
+      ) {
+        setAttachMenuOpen(false);
+      }
+    };
+
+    document.addEventListener('pointerdown', handlePointerDown);
+
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+    };
+  }, [attachMenuOpen]);
+
+  useEffect(() => {
     if (!attachmentMenuId) return;
 
     const handlePointerDown = (event: PointerEvent) => {
@@ -745,7 +821,23 @@ export function InputArea({
     }
 
     const sid = useChatStore.getState().activeSessionId;
-    if (isTeamMode) {
+    if (goalArmed && trimmed && sid && onSetGoal && sid !== NEW_CONVERSATION_ID) {
+      // command.goal 是独立控制信令，不受聊天排队影响，跳过 team/queue/interrupt 判断；
+      // 消息仍要本地落进 chatStore 才能在气泡上显示"设为目标"徽章（见 MessageItem.tsx）
+      useChatStore.getState().addMessage(sid, {
+        id: `user-${Date.now()}`,
+        role: 'user',
+        content: trimmed,
+        timestamp: new Date().toISOString(),
+        isGoalObjectiveMessage: true,
+      });
+      useGoalStore.getState().setArmed(sid, false);
+      onSetGoal(sid, trimmed);
+    } else if (goalArmed && trimmed && sid === NEW_CONVERSATION_ID) {
+      // 欢迎页尚无真实 session，armed 状态先保留，交给 App.tsx 的 handleSendMessage
+      // 在 session.create 成功、拿到真实 session id 后再落地消息 + 调 onSetGoal
+      onSubmit(trimmed, readyMediaItems);
+    } else if (isTeamMode) {
       onSubmit(trimmed, readyMediaItems);
     } else if (queuePaused && isAgentMode && sid) {
       // 队列已暂停时，弹窗提示用户选择
@@ -764,6 +856,8 @@ export function InputArea({
       if (isAgentMode) {
         if (sid) {
           useChatStore.getState().addToTaskQueue(sid, trimmed);
+          // 目标 active 但当前没有任务在处理时，常规的自动排空触发点不会命中，主动兜底一次
+          onDrainTaskQueueIfIdle?.(sid);
         }
       } else {
         onInterrupt(trimmed);
@@ -797,6 +891,9 @@ export function InputArea({
     isAgentMode,
     isTeamMode,
     queuePaused,
+    goalArmed,
+    onSetGoal,
+    onDrainTaskQueueIfIdle,
     t,
   ]);
 
@@ -1036,39 +1133,21 @@ export function InputArea({
   }, [appendImageFiles]);
 
   const handlePaste = useCallback((event: ClipboardEvent<HTMLDivElement>) => {
-    const items = Array.from(event.clipboardData.items);
-    const files = items
-      .filter((item) => item.kind === 'file' && ACCEPTED_IMAGE_TYPES.has(item.type))
-      .map((item) => item.getAsFile())
-      .filter((file): file is File => Boolean(file));
-    if (files.length) {
+    if (Array.from(event.clipboardData.items).some((item) => item.kind === 'file')) {
       event.preventDefault();
-      void appendImageFiles(files);
-    }
-  }, [appendImageFiles]);
-
-  const handleDragOver = useCallback((event: DragEvent<HTMLDivElement>) => {
-    const hasImage = Array.from(event.dataTransfer.items).some(
-      (item) => item.kind === 'file' && ACCEPTED_IMAGE_TYPES.has(item.type)
-    );
-    if (!hasImage) return;
-    event.preventDefault();
-    setIsDraggingImage(true);
-  }, []);
-
-  const handleDragLeave = useCallback((event: DragEvent<HTMLDivElement>) => {
-    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
-      setIsDraggingImage(false);
     }
   }, []);
 
-  const handleDrop = useCallback((event: DragEvent<HTMLDivElement>) => {
-    setIsDraggingImage(false);
-    const files = Array.from(event.dataTransfer.files).filter((file) => ACCEPTED_IMAGE_TYPES.has(file.type));
-    if (!files.length) return;
+  const handleFileDragOver = useCallback((event: DragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
     event.preventDefault();
-    void appendImageFiles(files);
-  }, [appendImageFiles]);
+    event.dataTransfer.dropEffect = 'none';
+  }, []);
+
+  const handleFileDrop = useCallback((event: DragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+    event.preventDefault();
+  }, []);
 
   /** 在光标处插入技能 chip（不可编辑原子节点） */
   const insertSkillChip = useCallback((skillName: string) => {
@@ -1333,11 +1412,9 @@ export function InputArea({
             (isModeMenuOpen || workMenuOpen) && 'chat-input-container--menu-open',
             composerSuggestion && 'chat-input-container--suggestion-open',
             isListening && 'chat-input-container--recording',
-            isDraggingImage && 'chat-input-container--dragging',
           )}
-          onDragOver={handleDragOver}
-          onDragLeave={handleDragLeave}
-          onDrop={handleDrop}
+          onDragOver={handleFileDragOver}
+          onDrop={handleFileDrop}
         >
       {isListening && (
         <div className="chat-input-recording-bar">
@@ -1496,19 +1573,104 @@ export function InputArea({
             className="hidden"
             onChange={handleFileInputChange}
           />
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={imageInputDisabled}
-            className={cx(
-              'chat-input-btn chat-input-btn--add-file',
-              imageInputDisabled && 'chat-input-btn--disabled',
+          <div ref={attachMenuRef} className="chat-input-attach-menu-anchor">
+            {canUseGoalMenu ? (
+              <button
+                type="button"
+                onClick={() => {
+                  if (attachTriggerDisabled) return;
+                  if (!attachMenuOpen && attachMenuRef.current) {
+                    setAttachMenuAnchor(attachMenuRef.current.getBoundingClientRect());
+                  }
+                  setAttachMenuOpen((open) => !open);
+                }}
+                disabled={attachTriggerDisabled}
+                className={cx(
+                  'chat-input-btn chat-input-btn--add-file',
+                  attachTriggerDisabled && 'chat-input-btn--disabled',
+                )}
+                title={attachTriggerDisabled ? t('chat.addImageDisabled') : t('chat.addImage')}
+                aria-label={attachTriggerDisabled ? t('chat.addImageDisabled') : t('chat.addImage')}
+                aria-haspopup="menu"
+                aria-expanded={attachMenuOpen}
+              >
+                <Plus className="chat-input-btn-icon" strokeWidth={1.8} />
+              </button>
+            ) : (
+              // 没有 onSetGoal（如欢迎页新会话尚未创建）时，Goal 入口本来就不适用——
+              // 保持原来"+"直接打开文件选择器的单击行为，不额外套一层菜单
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={imageInputDisabled}
+                className={cx(
+                  'chat-input-btn chat-input-btn--add-file',
+                  imageInputDisabled && 'chat-input-btn--disabled',
+                )}
+                title={imageInputDisabled ? t('chat.addImageDisabled') : t('chat.addImage')}
+                aria-label={imageInputDisabled ? t('chat.addImageDisabled') : t('chat.addImage')}
+              >
+                <Plus className="chat-input-btn-icon" strokeWidth={1.8} />
+              </button>
             )}
-            title={imageInputDisabled ? t('chat.addImageDisabled') : t('chat.addImage')}
-            aria-label={imageInputDisabled ? t('chat.addImageDisabled') : t('chat.addImage')}
-          >
-            <Plus className="chat-input-btn-icon" strokeWidth={1.8} />
-          </button>
+            {canUseGoalMenu && attachMenuOpen && attachMenuAnchor && createPortal(
+              <div
+                ref={attachMenuPortalRef}
+                className="chat-mode-select__menu"
+                role="menu"
+                style={{
+                  position: 'fixed',
+                  bottom: window.innerHeight - attachMenuAnchor.top + 10,
+                  left: attachMenuAnchor.left,
+                  zIndex: 9999,
+                }}
+              >
+                <button
+                  type="button"
+                  className="chat-mode-select__option"
+                  role="menuitem"
+                  disabled={imageInputDisabled}
+                  title={imageInputDisabled ? t('chat.addImageDisabled') : undefined}
+                  onClick={() => {
+                    if (imageInputDisabled) return;
+                    setAttachMenuOpen(false);
+                    fileInputRef.current?.click();
+                  }}
+                >
+                  <span className="chat-mode-select__option-main">
+                    <span className="chat-mode-select__icon" aria-hidden="true">
+                      <FileImage className="w-4 h-4" />
+                    </span>
+                    <span className="chat-mode-select__label">{t('chat.addImage')}</span>
+                  </span>
+                </button>
+                {isAgentMode && onSetGoal && (
+                  <button
+                    type="button"
+                    className="chat-mode-select__option"
+                    role="menuitem"
+                    disabled={hasUnfinishedGoal}
+                    title={hasUnfinishedGoal ? t('goal.toolbarUnavailable') : undefined}
+                    onClick={() => {
+                      if (hasUnfinishedGoal) return;
+                      setAttachMenuOpen(false);
+                      if (activeSessionId) {
+                        useGoalStore.getState().setArmed(activeSessionId, true);
+                      }
+                    }}
+                  >
+                    <span className="chat-mode-select__option-main">
+                      <span className="chat-mode-select__icon" aria-hidden="true">
+                        <Target className="w-4 h-4" />
+                      </span>
+                      <span className="chat-mode-select__label">{t('goal.toolbarTag')}</span>
+                    </span>
+                  </button>
+                )}
+              </div>,
+              document.body
+            )}
+          </div>
           <div
             ref={modeMenuRef}
             className={clsx(
@@ -1610,6 +1772,33 @@ export function InputArea({
             onRemoveSkill={removeSkillChip}
           />}
 
+          {goalTagVisible && (
+            <div className="chat-goal-tag">
+              <button type="button" className="chat-mode-select__trigger">
+                <span className="chat-mode-select__value">
+                  <span className="chat-mode-select__icon" aria-hidden="true">
+                    <Target className="w-4 h-4" />
+                  </span>
+                  <span className="chat-mode-select__label">{t('goal.toolbarTag')}</span>
+                </span>
+              </button>
+              <button
+                type="button"
+                className="chat-goal-tag__close"
+                title={t('goal.closeTag')}
+                onClick={() => {
+                  if (!activeSessionId) return;
+                  if (currentGoal) {
+                    onClearGoal?.(activeSessionId);
+                  }
+                  useGoalStore.getState().setArmed(activeSessionId, false);
+                }}
+              >
+                <X size={11} strokeWidth={2.5} />
+              </button>
+            </div>
+          )}
+
           {evolutionLabel && (
             <div className="chat-input-evolution-pill" title={evolutionLabel}>
               <span className="chat-input-evolution-pill__dot" />
@@ -1643,7 +1832,10 @@ export function InputArea({
             </button>
           )} */}
 
-          <ModelSelector disabled={hasHistory || isProcessing} />
+          <ModelSelector
+            disabled={isTeamMode || isProcessing}
+            lockedToDefault={isTeamMode}
+          />
 
           <button
             type="button"
@@ -1683,14 +1875,12 @@ export function InputArea({
             >
               <WorkIcon name="folder" className="chat-work-select__root-icon" />
               <span>{getProjectLabel(displayedProject, t('multiSession.project.chooseProjectDirectory'))}</span>
-              <WorkIcon
-                className="chat-work-select__chevron"
-                name={workMenuOpen === 'project' ? 'collapse' : 'expand'}
-              />
+              <svg className="chat-work-select__chevron" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 8l4 4 4-4" />
+              </svg>
             </button>
             {displayedProject && !isWorkContextLocked ? (
               <span className="chat-work-select__clear-wrap" aria-hidden="false">
-                <span className="chat-work-select__clear-label">{t('multiSession.project.clearProject')}</span>
                 <button
                   type="button"
                   className="chat-work-select__clear"
@@ -1726,30 +1916,32 @@ export function InputArea({
                         placeholder={t('multiSession.project.searchProject')}
                       />
                     </label>
-                    {inputProjectOptions.map((project) => {
-                      const active = selectedProject?.project_id === project.project_id;
-                      return (
-                        <button
-                          type="button"
-                          key={project.project_id}
-                          className={clsx('chat-work-select__option', active && 'is-active')}
-                          onClick={() => {
-                            setSelectedProject(project);
-                            setWorkMenuOpen(null);
-                          }}
-                          role="menuitemradio"
-                          aria-checked={active}
-                          title={project.project_dir}
-                        >
-                          <WorkIcon name="folder" />
-                          <span>{project.name}</span>
-                          {active ? <WorkIcon name="check" className="chat-work-select__check" /> : null}
-                        </button>
-                      );
-                    })}
-                    {inputProjectOptions.length === 0 ? (
-                      <div className="chat-work-select__empty">{t('multiSession.project.noProjectMatches')}</div>
-                    ) : null}
+                    <div className="chat-work-select__options">
+                      {inputProjectOptions.map((project) => {
+                        const active = selectedProject?.project_id === project.project_id;
+                        return (
+                          <button
+                            type="button"
+                            key={project.project_id}
+                            className={clsx('chat-work-select__option', active && 'is-active')}
+                            onClick={() => {
+                              setSelectedProject(project);
+                              setWorkMenuOpen(null);
+                            }}
+                            role="menuitemradio"
+                            aria-checked={active}
+                            title={project.project_dir}
+                          >
+                            <WorkIcon name="folder" />
+                            <span>{project.name}</span>
+                            {active ? <WorkIcon name="check" className="chat-work-select__check" /> : null}
+                          </button>
+                        );
+                      })}
+                      {inputProjectOptions.length === 0 ? (
+                        <div className="chat-work-select__empty">{t('multiSession.project.noProjectMatches')}</div>
+                      ) : null}
+                    </div>
                     <ProjectAddSubmenu
                       onCreate={(mode) => {
                         void openProjectCreateDialog(mode);
@@ -1760,8 +1952,15 @@ export function InputArea({
               </div>
             ) : null}
           </div>
+          {workMode === 'code' ? (
+            <CodeBranchSelector project={displayedProject} disabled={isProcessing} compact />
+          ) : null}
           {projectDirError && !workDialogOpen ? (
-            <div className="chat-work-select__error" role="alert">{projectDirError}</div>
+            <div className="app-toast-wrapper app-toast-wrapper--top-center">
+              <div className="app-session-toast" role="status" aria-live="polite">
+                {projectDirError}
+              </div>
+            </div>
           ) : null}
         </div>
       ) : null}
@@ -1915,10 +2114,17 @@ function ComposerSuggestionMenu({
   );
 }
 
-function ModelSelector({ disabled = false }: { disabled?: boolean }) {
+function ModelSelector({
+  disabled = false,
+  lockedToDefault = false,
+}: {
+  disabled?: boolean;
+  lockedToDefault?: boolean;
+}) {
   const chatAvailableModels = useSessionStore((s) => s.chatAvailableModels);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const selectedModelName = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.selectedModelName ?? null);
+  const defaultModelName = useSessionStore((s) => s.defaultModelName);
   const setSelectedModelName = useSessionStore((s) => s.setSelectedModelName);
   const { t } = useTranslation();
 
@@ -1942,8 +2148,14 @@ function ModelSelector({ disabled = false }: { disabled?: boolean }) {
 
   if (chatAvailableModels.length === 0) return null;
 
+  // 集群模式下 UI 禁止手动改模型（见下方 disabled/tooltip），但显示仍应优先反映
+  // 该会话实际记录的模型（如定时任务在集群模式下显式指定了非默认模型，后端也确实
+  // 按该模型执行——见 bug002 回归），而不是不管三七二十一恒显示全局默认模型；
+  // 从未指定过模型的会话 selectedModelName 本就兜底等于默认模型，行为不变。
+  // 与实际发给后端的 model_name（sessionStore.getEffectiveModelName）复用同一套解析逻辑，
+  // 避免模型改名/改别名后 UI 显示值和实际请求参数走出两份不同的兜底结果（bug003）。
   const selectedModel =
-    chatAvailableModels.find((m) => (m.alias || m.model_name) === selectedModelName) ??
+    resolveEffectiveModel(chatAvailableModels, selectedModelName, defaultModelName) ??
     chatAvailableModels[0];
 
   const handleSelect = (modelKey: string) => {
@@ -1964,7 +2176,7 @@ function ModelSelector({ disabled = false }: { disabled?: boolean }) {
       <button
         type="button"
         className="chat-mode-select__trigger"
-        title={t('chat.modelSelector.tooltip')}
+        title={t(lockedToDefault ? 'chat.modelSelector.clusterLockedTooltip' : 'chat.modelSelector.tooltip')}
         onClick={() => {
           if (disabled) return;
           if (!isOpen && menuRef.current) {
@@ -1975,6 +2187,7 @@ function ModelSelector({ disabled = false }: { disabled?: boolean }) {
           setIsOpen((v) => !v);
         }}
         style={disabled ? { cursor: 'default' } : undefined}
+        aria-disabled={disabled}
         aria-haspopup="menu"
         aria-expanded={isOpen}
         data-testid="chat-model-selector"
@@ -2212,32 +2425,6 @@ function SkillSelector({ onNavigateToSkills, onInsertSkill, onRemoveSkill }: {
   const [searchQuery, setSearchQuery] = useState('');
   const menuRef = useRef<HTMLDivElement>(null);
 
-  const avatarColors = [
-    'bg-red-500',
-    'bg-orange-500',
-    'bg-amber-500',
-    'bg-yellow-500',
-    'bg-lime-500',
-    'bg-green-500',
-    'bg-emerald-500',
-    'bg-teal-500',
-    'bg-cyan-500',
-    'bg-sky-500',
-    'bg-blue-500',
-    'bg-indigo-500',
-    'bg-violet-500',
-    'bg-purple-500',
-    'bg-fuchsia-500',
-    'bg-pink-500',
-    'bg-rose-500',
-  ];
-
-  const getSkillAvatar = (name: string) => {
-    const firstChar = name.charAt(0).toUpperCase();
-    const colorIndex = name.charCodeAt(0) % avatarColors.length;
-    return { firstChar, color: avatarColors[colorIndex] };
-  };
-
   const installedSkillMap = useMemo(() => {
     const map = new Map<string, InputAreaInstalledPlugin>();
     plugins.forEach((plugin) => {
@@ -2267,8 +2454,9 @@ function SkillSelector({ onNavigateToSkills, onInsertSkill, onRemoveSkill }: {
     if (!q) return installedSkills;
     return installedSkills.filter((s) => {
       const name = s.name.toLowerCase();
+      const displayName = (s.display_name || '').toLowerCase();
       const desc = (s.description || '').toLowerCase();
-      return name.includes(q) || desc.includes(q);
+      return name.includes(q) || displayName.includes(q) || desc.includes(q);
     });
   }, [installedSkills, searchQuery]);
 
@@ -2411,7 +2599,7 @@ function SkillSelector({ onNavigateToSkills, onInsertSkill, onRemoveSkill }: {
                         {avatar.firstChar}
                       </div>
                       <div className="chat-skill-select__item-main">
-                        <div className="chat-skill-select__item-name">{skill.name}</div>
+                        <div className="chat-skill-select__item-name">{skill.display_name || skill.name}</div>
                         <div className="chat-skill-select__item-desc">
                           {skill.description || t('skills.noDescription')}
                         </div>

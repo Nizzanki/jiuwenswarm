@@ -10,7 +10,7 @@ import { ArrowRight, CheckCircle2, ClipboardList, Copy, Info, LoaderCircle, Shar
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 import { useChatStore, useHarnessStore, useSessionStore, useTodoStore } from '../../stores';
-import { AgentMode, MediaItem, Message, UserAnswer } from '../../types';
+import { AgentMode, MediaItem, Message, UserAnswer, type ProjectInfo } from '../../types';
 import type { HumanShareCommand } from '../../stores/sessionStore';
 import { MessageList } from './MessageList';
 import { ContextCompressionLines } from './MessageItem';
@@ -26,6 +26,7 @@ import restartIcon from '../../assets/restart.svg';
 import { SubtaskProgress } from './SubtaskProgress';
 import { InlineQuestionCard } from './InlineQuestionCard';
 import { InteractionSlot } from '../InteractionSlot';
+import { GoalBar } from '../GoalBar';
 import { HistoryPagerBar } from './HistoryPagerBar';
 import { HarnessProgressBar } from './HarnessProgressBar';
 import { AgentTeamActivityCard } from './TeamEventGroupDisplay';
@@ -34,6 +35,9 @@ import { isTeamLeaderMember } from '../../utils/teamMemberAvatar';
 import { TeamMemberAvatar } from '../TeamMemberAvatar';
 import welcomeBanner from '../../assets/home-banner.svg';
 import './ChatPanel.css';
+import { CodeChangesCard } from '../../features/code-mode/CodeChangesCard';
+import { useCodeTurnDiffHistory } from '../../features/code-mode/useCodeTurnDiffHistory';
+import type { CodeReviewTarget } from '../../features/code-mode/types';
 
 export interface ChatHistoryPagerProps {
   loadedPages: number;
@@ -61,6 +65,7 @@ interface ChatPanelProps {
   canExportShare?: boolean;
   sessionTitle?: string;
   sessionProjectName?: string;
+  sessionProject?: ProjectInfo | null;
   /** 自会话管理恢复历史后出现；支持分页加载更早消息 */
   historyPager?: ChatHistoryPagerProps | null;
   /** 历史会话首屏恢复中：保持聊天布局，避免短暂退回欢迎态 */
@@ -72,22 +77,17 @@ interface ChatPanelProps {
   onNavigateToSkills?: () => void;
   /** 切换右侧紧缩面板展开状态 */
   onToggleTeamArea?: (expanded: boolean) => void;
+  /** 打开右侧面板并切换到代码审核 Tab */
+  onOpenCodeReview?: (target: CodeReviewTarget) => void;
   permissionsEnabled: boolean;
   onSavePermission: (updates: Record<string, string>) => Promise<void>;
-}
-
-function ThinkingIndicator() {
-  return (
-    <div className="flex justify-start animate-rise">
-      <div className="chat-bubble assistant chat-reading-indicator">
-        <div className="chat-reading-indicator__dots">
-          <span />
-          <span />
-          <span />
-        </div>
-      </div>
-    </div>
-  );
+  /** Goal（持续目标）控制，见 GoalBar 组件 */
+  onSetGoal?: (sessionId: string, objective: string) => void;
+  onPauseGoal?: (sessionId: string) => void;
+  onResumeGoal?: (sessionId: string) => void;
+  onClearGoal?: (sessionId: string) => void;
+  /** 目标 active 但当前无处理中任务时，消息入队后主动排空一次，见 InputArea.tsx 对应调用点 */
+  onDrainTaskQueueIfIdle?: (sessionId: string) => void;
 }
 
 function SuggestionCard({ text, onClick }: { text: string; onClick: () => void }) {
@@ -656,14 +656,21 @@ export function ChatPanel({
   canExportShare = false,
   sessionTitle,
   sessionProjectName,
+  sessionProject = null,
   historyPager = null,
   isHistoryRestoring = false,
   teamAreaExpanded = false,
   autoFocusKey = null,
   onNavigateToSkills,
   onToggleTeamArea,
+  onOpenCodeReview,
   permissionsEnabled,
   onSavePermission,
+  onSetGoal,
+  onPauseGoal,
+  onResumeGoal,
+  onClearGoal,
+  onDrainTaskQueueIfIdle,
 }: ChatPanelProps) {
   const { t } = useTranslation();
   const activeSessionId = useChatStore((s) => s.activeSessionId);
@@ -721,6 +728,29 @@ export function ChatPanel({
   const shouldShowShareExport = Boolean(onExportShare);
   const shouldShowHumanShare = mode === 'team' && teamHumanShareCommands.length > 0;
   const [humanShareOpen, setHumanShareOpen] = React.useState(false);
+  const {
+    turnsByMessageId: codeTurnsByMessageId,
+    loading: codeTurnHistoryLoading,
+    reload: reloadCodeTurnHistory,
+  } = useCodeTurnDiffHistory({
+    project: sessionProject,
+    sessionId: activeSessionId,
+    isProcessing,
+    messages,
+  });
+  const renderCodeChangesAfterMessage = useCallback((message: Message) => {
+    const turns = codeTurnsByMessageId.get(message.id);
+    if (!turns?.length) return null;
+    return turns.map(turn => (
+      <CodeChangesCard
+        key={turn.change_set_id || `turn-${turn.turn_index}`}
+        diff={turn}
+        refreshing={codeTurnHistoryLoading}
+        onRefresh={() => void reloadCodeTurnHistory()}
+        onReview={target => onOpenCodeReview?.(target)}
+      />
+    ));
+  }, [codeTurnHistoryLoading, codeTurnsByMessageId, onOpenCodeReview, reloadCodeTurnHistory]);
 
   // 跟踪用户是否正在查看历史消息（不在底部）
   const userScrolledUpRef = useRef(false);
@@ -1044,7 +1074,7 @@ export function ChatPanel({
               )}
               {hasTimelineContent ? (
                 <>
-                  <MessageList messages={messages} />
+                  <MessageList messages={messages} renderAfterMessage={renderCodeChangesAfterMessage} />
                   {shouldShowHumanShare && (
                     <HumanShareCard
                       commands={teamHumanShareCommands}
@@ -1054,8 +1084,6 @@ export function ChatPanel({
                   <SubtaskProgress />
                   {/* 内联审批卡片（演进审批 & 权限审批共用） */}
                   <InlineQuestionCard onSubmit={onUserAnswer} />
-                  {/* 思考中指示器 */}
-                  {isThinking && <ThinkingIndicator />}
                   <ContextCompressionLines
                     runtime={contextCompressionRuntime}
                     summary={contextCompressionSummary}
@@ -1089,6 +1117,8 @@ export function ChatPanel({
                   onNavigateToSkills={onNavigateToSkills}
                   permissionsEnabled={permissionsEnabled}
                   onSavePermission={onSavePermission}
+                  onSetGoal={onSetGoal}
+                  onClearGoal={onClearGoal}
                 />
               </div>
               <div className="chat-suggestions">
@@ -1108,6 +1138,14 @@ export function ChatPanel({
           <AgentActivityCard isProcessing={isProcessing} onSendTask={handleSendMessage} />
           <InterruptResultBubble />
           <InteractionSlot onSubmit={onUserAnswer} />
+          {onSetGoal && onPauseGoal && onResumeGoal && onClearGoal && (
+            <GoalBar
+              onSetGoal={onSetGoal}
+              onPauseGoal={onPauseGoal}
+              onResumeGoal={onResumeGoal}
+              onClearGoal={onClearGoal}
+            />
+          )}
           <InputArea
             onSubmit={handleSendMessage}
             onPersistMedia={onPersistMedia}
@@ -1119,6 +1157,9 @@ export function ChatPanel({
             onNavigateToSkills={onNavigateToSkills}
             permissionsEnabled={permissionsEnabled}
             onSavePermission={onSavePermission}
+            onSetGoal={onSetGoal}
+            onClearGoal={onClearGoal}
+            onDrainTaskQueueIfIdle={onDrainTaskQueueIfIdle}
           />
         </div>
       )}

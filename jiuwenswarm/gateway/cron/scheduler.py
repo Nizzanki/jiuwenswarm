@@ -24,6 +24,7 @@ from jiuwenswarm.gateway.message_handler.message_handler import MessageHandler
 from jiuwenswarm.common.e2a.gateway_normalize import e2a_from_agent_fields
 from jiuwenswarm.common.schema.message import EventType, Message, ReqMethod
 from jiuwenswarm.common.work_mode import DEFAULT_WEB_WORK_MODE
+from jiuwenswarm.server.runtime.session.session_history import append_history_record
 
 logger = logging.getLogger(__name__)
 
@@ -121,8 +122,8 @@ def _extract_text_from_stream_payload(payload: dict | None) -> str | None:
             return content
     if event_type == "chat.error":
         error = payload.get("error")
-        if error is not None:
-            return f"[cron] 任务执行失败: {error}"
+        if isinstance(error, str) and error.strip():
+            return error
     workflow_text = _extract_workflow_result_text(payload)
     if workflow_text:
         return workflow_text
@@ -181,6 +182,11 @@ def _resolve_cron_team_timeout_result(
 def _extract_text_from_agent_payload(payload: dict | None) -> str:
     if not isinstance(payload, dict):
         return ""
+    # AgentServer unary error responses use ok=False, payload={"error": "..."}
+    # Pass through raw error text, same as normal chat behavior
+    error = payload.get("error")
+    if isinstance(error, str) and error.strip():
+        return error
     # Common: {"content": {"output": "...", "result_type": "answer"}}
     content = payload.get("content")
     if isinstance(content, dict):
@@ -227,7 +233,7 @@ def _cron_next_push_dt(cron_expr: str, base_dt: datetime) -> datetime:
     return nxt
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, order=True)
 class _Event:
     at_ts: float
     seq: int
@@ -377,7 +383,10 @@ class CronSchedulerService:
             if ev.kind == "push_update" and ev.job_id in new_job_ids
         ]
         self._events.clear()
-        self._seq = 0
+        # 不重置 _seq：保留的 push_update 事件携带原始 seq 值，
+        # 若重置为 0，新调度事件的 seq 会从 1 开始递增，与保留事件的 seq 碰撞。
+        # 当 at_ts 也相同时，heapq 元组比较回退到 _Event 比较（即使 _Event
+        # 已加 order=True，仍应避免 seq 碰撞以保证排序语义正确）。
         for item in pending_push_updates:
             heapq.heappush(self._events, item)
 
@@ -805,6 +814,10 @@ class CronSchedulerService:
         async def _run_agent() -> None:
             state.status = "running"
             state.started_at = self._now_fn()
+            ok = False
+            mode = CRON_JOB_DEFAULT_MODE
+            channel_id = ""
+            exec_session_id = ""
             try:
                 mode = str(job.mode or CRON_JOB_DEFAULT_MODE).strip() or CRON_JOB_DEFAULT_MODE
                 if state.exec_channel_id and state.exec_session_id:
@@ -868,8 +881,6 @@ class CronSchedulerService:
                         timeout_seconds=timeout_seconds,
                     )
                 await self._mark_last_session_ready(job, exec_session_id)
-                if not text:
-                    text = "[cron] 任务完成，但未返回可展示文本"
                 state.result_text = text
                 state.status = "succeeded" if ok else "failed"
             except asyncio.CancelledError:
@@ -893,6 +904,17 @@ class CronSchedulerService:
                 # a job the user has removed.
                 if not state.result_text and state.error and not is_cancelled_ghost:
                     state.result_text = f"[cron] 任务执行失败: {state.error}"
+                if state.result_text and not ok and not is_cancelled_ghost:
+                    append_history_record(
+                        session_id=exec_session_id,
+                        request_id=getattr(envelope, "request_id", ""),
+                        channel_id=job.targets or channel_id,
+                        role="assistant",
+                        event_type="chat.final",
+                        content=state.result_text,
+                        timestamp=self._now_fn(),
+                        mode=mode,
+                    )
                 if not state.pushed_final and state.result_text and not is_cancelled_ghost:
                     logger.info(
                         "[Cron] scheduling push_update after agent finished "
@@ -1199,6 +1221,8 @@ class CronSchedulerService:
                 "run_id": state.run_id,
                 "push_at": state.push_at_iso,
                 "wake_at": state.wake_at_iso,
+                "exec_channel_id": state.exec_channel_id,
+                "exec_session_id": state.exec_session_id,
                 "is_placeholder": bool(is_placeholder),
                 "status": state.status,
             },
