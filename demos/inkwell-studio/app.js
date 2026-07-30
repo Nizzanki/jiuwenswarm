@@ -554,14 +554,8 @@ function escapeHtml(s) {
 }
 
 /* --------------------------- download story (export) ------------------------ */
-// Self-contained HTML "flip book": one page visible at a time (cover, then one page per
-// panel, then a closing page), turned with Prev/Next buttons, left/right click zones, or
-// arrow keys. The turn itself is a real CSS 3D rotateY animation, not a page reload/scroll —
-// each page shares the same absolutely-positioned box; the currently-turning page keeps the
-// highest z-index for the length of its own rotation so it visually covers everything until
-// backface-visibility:hidden makes it vanish past 90°, revealing the page already stacked
-// beneath it. No external library — everything here (CSS + nav JS) is inlined so the file
-// still opens and works completely offline, same as before.
+// Self-contained HTML "flip book": rendered as a two-page open book spread where pages
+// turn cleanly around a central book spine.
 function buildStoryHtml() {
   const b = state.brief;
   const panels = state.panels.filter((p) => p.caption);
@@ -603,17 +597,35 @@ function buildStoryHtml() {
        min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;padding:24px}
   h1{position:fixed;top:18px;left:22px;margin:0;font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:#8c2f2a;
      font-family:ui-monospace,"Cascadia Code","SF Mono",Menlo,Consolas,monospace}
-  .stage{position:relative;width:min(640px,92vw);aspect-ratio:4/5;perspective:2200px}
-  .pages{position:absolute;inset:0}
-  .page{position:absolute;inset:0;backface-visibility:hidden;transform-style:preserve-3d;
+  
+  /* Book spread stage */
+  .stage{position:relative;width:min(900px,94vw);aspect-ratio:8/5}
+  
+  /* Underlying paper base for left side of the open book */
+  .book-base-left {
+    position:absolute; top:0; left:0; width:50%; height:100%;
+    background:#efe8da; border:1px solid #c3b490; border-radius:4px 0 0 4px;
+    box-shadow:-10px 18px 40px rgba(60,45,20,.15);
+  }
+  
+  /* Central book spine visual guide */
+  .stage::after {
+    content:''; position:absolute; top:0; bottom:0; left:50%; width:2px;
+    background:linear-gradient(90deg, rgba(0,0,0,0.15), rgba(0,0,0,0.05), rgba(0,0,0,0.15));
+    z-index:9990; transform:translateX(-50%);
+  }
+
+  .pages{position:absolute;inset:0;perspective:2200px}
+  
+  /* Page takes up the right half and turns along its left edge (spine) */
+  .page{position:absolute;top:0;right:0;width:50%;height:100%;
+        transform-origin:left center;
+        backface-visibility:hidden;transform-style:preserve-3d;
         transition:transform .7s cubic-bezier(.4,.1,.2,1);
-        border:1px solid #c3b490;border-radius:2px;overflow:hidden;background:#f6f0e2;
+        border:1px solid #c3b490;border-radius:0 4px 4px 0;overflow:hidden;background:#f6f0e2;
         box-shadow:0 18px 50px rgba(60,45,20,.25)}
+        
   .page-inner{position:absolute;inset:0;display:flex;flex-direction:column}
-  /* Fixed-proportion art box (NOT flex-grow off the image's own intrinsic size) — that was
-     the actual bug: an unconstrained <img> could render taller than the page, pushing the
-     caption below the page's fixed height where overflow:hidden silently clipped it. Cover-fit
-     into a bounded box instead, so the caption always has real, guaranteed space beneath it. */
   .page .art{flex:0 0 62%;position:relative;overflow:hidden;background:#f0e8d5}
   .page .art img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
   .page .ph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;
@@ -645,6 +657,7 @@ function buildStoryHtml() {
 </style></head><body>
 <h1>Inkwell Studio</h1>
 <div class="stage" id="stage">
+  <div class="book-base-left"></div>
   <div class="pages" id="pages">${pageHtml}</div>
   <button class="nav prev" id="prev" aria-label="Previous page">‹</button>
   <button class="nav next" id="next" aria-label="Next page">›</button>
@@ -667,9 +680,18 @@ function buildStoryHtml() {
 
   function layout() {
     pages.forEach(function (el, i) {
-      if (i === current) { el.style.transform = 'rotateY(0deg)'; el.style.zIndex = total; }
-      else if (i < current) { el.style.transform = 'rotateY(-180deg)'; el.style.zIndex = i; }
-      else { el.style.transform = 'rotateY(0deg)'; el.style.zIndex = total - (i - current); }
+      if (i === current) { 
+        el.style.transform = 'rotateY(0deg)'; 
+        el.style.zIndex = total; 
+      }
+      else if (i < current) { 
+        el.style.transform = 'rotateY(-180deg)'; 
+        el.style.zIndex = i; 
+      }
+      else { 
+        el.style.transform = 'rotateY(0deg)'; 
+        el.style.zIndex = total - (i - current); 
+      }
     });
     pageno.textContent = (current + 1) + ' / ' + total;
     prevBtn.disabled = current === 0;
@@ -681,11 +703,9 @@ function buildStoryHtml() {
     if (animating || to === current || to < 0 || to > total - 1) return;
     animating = true;
     var dir = to > current ? 1 : -1;
-    // The "mover" is whichever page is doing the actual rotating this turn: the outgoing
-    // page when going forward, the already-flipped page coming back when going backward.
     var mover = pages[dir > 0 ? current : to];
     mover.style.zIndex = total + 1;
-    void mover.offsetWidth; // force reflow so the transform below actually transitions
+    void mover.offsetWidth; // force reflow
     mover.style.transform = dir > 0 ? 'rotateY(-180deg)' : 'rotateY(0deg)';
     current = to;
     pageno.textContent = (current + 1) + ' / ' + total;

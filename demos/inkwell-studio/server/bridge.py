@@ -63,6 +63,9 @@ IMAGE_CONCURRENCY = int(os.getenv("IMAGE_CONCURRENCY", "2") or 2)
 IMAGE_PANEL_RETRIES = max(1, int(os.getenv("IMAGE_PANEL_RETRIES", "3") or 3))
 # Native multi-agent team (real jiuwen_team via A2A) vs single-agent guided run.
 TEAM = os.getenv("INKWELL_TEAM", "1").strip().lower() in {"1", "true", "yes", "on"}
+# Retries for the targeted single-agent fill patch (see _incomplete_panels) before giving up
+# and paying for a full single-agent redo that discards the team's already-good panels.
+FILL_RETRIES = max(1, int(os.getenv("INKWELL_FILL_RETRIES", "2") or 2))
 
 CAPTION_REDACTED = "— this part of the story was redacted (didn't meet our content guidelines) —"
 ART_REDACTED_PROMPT = "a soft, warm, gentle abstract illustration, no specific subject"
@@ -360,6 +363,34 @@ async def _collect_fill(
     return events
 
 
+_PANEL_SCOPED_EVENTS = {"panel.status", "panel.art", "panel.caption", "panel.image", "panel.note"}
+
+
+def _valid_panel_events(events: list[dict], total: int) -> list[dict]:
+    """Drop the model's own duplicate `brief` (the bridge's synthetic opener already sent the
+    authoritative, server-computed total — a second one from the model can only disagree with
+    it) and any panel-scoped event whose `panel` is missing or outside 1..total.
+
+    Without this, two real failure modes reach the viewer: (1) a hallucinated event missing
+    its `panel` key creates a permanent ghost panel front-end-side (`ensurePanel(undefined)`
+    renders as the literal text "undefined"), and (2) a model that drifts past the requested
+    panel count leaves an extra panel stuck mid-render forever, since `_incomplete_panels`
+    below only ever looks at 1..total.
+    """
+    out = []
+    for ev in events:
+        t = ev.get("t")
+        if t == "brief":
+            continue
+        if t in _PANEL_SCOPED_EVENTS:
+            n = ev.get("panel")
+            if not isinstance(n, int) or not (1 <= n <= total):
+                log.warning("dropping %s event with invalid panel %r", t, n)
+                continue
+        out.append(ev)
+    return out
+
+
 def _incomplete_panels(events: list[dict], total: int) -> list[int]:
     """Panel numbers (1..total) missing a caption or an art prompt.
 
@@ -494,34 +525,43 @@ async def stream_story(idea: str, style: str, panels: int):
             # The team otherwise wrote a good story but silently skipped panel(s) — team mode
             # is deliberately capped at a lean panel count (see build_team_brief) to avoid the
             # coordination deadlocks a heavier brief can trigger, so this is routine whenever
-            # the requested total exceeds that cap, not a rare failure. Patch just the gap
-            # with a small targeted single-agent call instead of redoing the whole story.
+            # the requested total exceeds that cap, not a rare failure. Patch the gap with a
+            # small targeted single-agent call instead of redoing the whole story — and if that
+            # patch itself comes up short, retry it for whatever's STILL missing (cheap: 1-2
+            # panels of prose) before paying for a full redo that would throw away the team's
+            # already-good panels.
             missing = _incomplete_panels(events, total)
-            log.warning("team run missing content for panel(s) %s — patching with a targeted fill", missing)
-            prior = sorted(
-                (ev["panel"], ev["text"]) for ev in events
-                if ev.get("t") == "panel.caption" and ev.get("panel") not in missing
-            )
-            fill_raw = await _collect_fill(idea, style, total, prior, missing)
-            fill_events = [
-                ev for ev in _best_variants(fill_raw)
-                if ev.get("t") in ("panel.art", "panel.caption") and ev.get("panel") in missing
-            ]
-            filled = {ev["panel"] for ev in fill_events if ev.get("t") == "panel.caption"} & \
-                     {ev["panel"] for ev in fill_events if ev.get("t") == "panel.art"}
-            events = events + fill_events + [
-                {"t": "panel.status", "panel": n, "status": "approved"} for n in sorted(filled)
-            ]
-            if filled == set(missing):
-                events.append({"t": "progress", "approved": total, "inReview": 0, "drafting": 0, "total": total})
+            for attempt in range(1, FILL_RETRIES + 1):
+                log.warning("team run missing content for panel(s) %s — patching with a targeted fill (attempt %d/%d)",
+                            missing, attempt, FILL_RETRIES)
+                prior = sorted(
+                    (ev["panel"], ev["text"]) for ev in events
+                    if ev.get("t") == "panel.caption" and ev.get("panel") not in missing
+                )
+                fill_raw = await _collect_fill(idea, style, total, prior, missing)
+                fill_events = [
+                    ev for ev in _best_variants(fill_raw)
+                    if ev.get("t") in ("panel.art", "panel.caption") and ev.get("panel") in missing
+                ]
+                filled = {ev["panel"] for ev in fill_events if ev.get("t") == "panel.caption"} & \
+                         {ev["panel"] for ev in fill_events if ev.get("t") == "panel.art"}
+                events = events + fill_events + [
+                    {"t": "panel.status", "panel": n, "status": "approved"} for n in sorted(filled)
+                ]
+                missing = sorted(set(missing) - filled)
+                if not missing:
+                    events.append({"t": "progress", "approved": total, "inReview": 0, "drafting": 0, "total": total})
+                    break
             else:
-                # The fill itself came up short — last resort, full single-agent redo (same
-                # reasoning as above: a fresh generation, so clear what was live-shown so far).
-                still_missing = sorted(set(missing) - filled)
-                log.warning("fill still missing panel(s) %s — falling back to full single-agent run", still_missing)
+                # Still missing panel(s) after every retry — actual last resort, full
+                # single-agent redo (same reasoning as above: a fresh generation, so clear
+                # whatever was live-shown so far).
+                log.warning("fill still missing panel(s) %s after %d attempts — falling back to full single-agent run",
+                            missing, FILL_RETRIES)
                 seen_live.clear()
                 raw = await _collect_swarm(idea, style, total, team=False)
                 events = _best_variants(raw)
+        events = _valid_panel_events(events, total)
         events = await _moderate_events(events)
         if seen_live:
             # Don't replay-with-pacing what the viewer already watched happen live.
