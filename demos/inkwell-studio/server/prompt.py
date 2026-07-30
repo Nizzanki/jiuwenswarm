@@ -55,10 +55,13 @@ Rules:
   (state "revising"), fill the `log` with the numbered handoffs (draft, prompt, render,
   rejected, revising...), THEN actually revise: a new warmer `panel.caption` and `panel.art`,
   and finally `panel.status:"approved"`. This revision loop is the whole point — make it real.
-- When all panels are approved, SETTLE the crew: emit `agent` events setting writer and
-  critic to status "done", and artDirector and imageGen to status "idle", so no dots are
-  left active. Then the Editor does a final pass (`agent editor status:"done"`), a final
-  `progress` with approved == total, and a single `{"t":"run.done"}`.
+- When all panels are approved, SETTLE the crew: emit `agent` events setting writer, critic,
+  artDirector, and imageGen ALL to status "done" (matching the Editor's own final status
+  below), so no dots are left active and none read as still pending. Do NOT include a
+  `state` field on any of these settle events — the run has finished, so words like
+  "queued"/"drafting"/"revising" no longer describe anything and must not linger on screen.
+  Then the Editor does a final pass (`agent editor status:"done"`), a final `progress` with
+  approved == total, and a single `{"t":"run.done"}`.
 - Do NOT wrap the JSON in an array. One object per line. No trailing commentary.
 """
 
@@ -73,7 +76,8 @@ def build_brief(idea: str, style: str, panels: int = 5) -> str:
         "one idea into an illustrated short story, panel by panel.\n\n"
         f"THE AUTHOR'S IDEA: \"{idea}\"\n"
         f"STYLE: {style}\n"
-        f"TARGET PANELS: about {panels}\n\n"
+        f"TARGET PANELS: EXACTLY {panels} — not more, not fewer. Number every panel 1..{panels}, "
+        "with no gaps and no extra panels beyond that range.\n\n"
         "Produce the story as a LIVE EVENT STREAM using the protocol below. Narrate the "
         "crew's real work: the Writer drafts beats, the Art Director writes image prompts, "
         "the Image Generator renders, the Critic reviews, and on one panel the Critic "
