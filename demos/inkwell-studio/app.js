@@ -19,8 +19,11 @@ const SURPRISE_IDEAS = [
   'A young otter finds a lost mitten and searches the whole river for its owner.',
   'A sleepy bear tries to stay awake to see the first snow.',
   'A paper boat sets sail to find where the stream ends.',
-  'A shy ghost just wants to make a new friend in the old attic.',
-  'A baker fox invents a cake that makes everyone in town smile.',
+  'A tiny mole who\'s afraid of the dark discovers she can glow.',
+  'A young owl is scared of heights but must learn to fly before winter.',
+  'A scarecrow secretly longs to dance with the cornstalks at night.',
+  'A hedgehog too prickly for hugs invents a soft blanket instead.',
+  'A whale sings the same song every night, hoping someone finally sings back.',
 ];
 
 function surpriseIdea() {
@@ -31,6 +34,43 @@ function surpriseIdea() {
 }
 
 const REDUCED_MOTION = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/* --------------------------------- read-aloud narration ----------------------------------- */
+// Browser-native SpeechSynthesis — no backend, no cost, no setup. Panels arrive progressively
+// over SSE and each one's caption reveal is already paced, so a small FIFO queue keeps
+// utterances spoken one at a time in panel order instead of overlapping/racing if two panels
+// settle close together.
+const SPEECH_SUPPORTED = 'speechSynthesis' in window;
+let narrationOn = false;   // live narration off by default (no toggle in the UI); "Read story aloud" bypasses this
+const narrateQueue = [];
+let narrating = false;
+let narrateOnIdle = null;   // fires once when the queue fully drains (see readStoryAloud)
+
+function narratePump() {
+  if (narrating) return;
+  if (!narrateQueue.length) {
+    if (narrateOnIdle) { const fn = narrateOnIdle; narrateOnIdle = null; fn(); }
+    return;
+  }
+  narrating = true;
+  const utter = new SpeechSynthesisUtterance(narrateQueue.shift());
+  utter.rate = 0.92;   // a touch slower than default — easier to follow as a read-aloud story
+  utter.onend = utter.onerror = () => { narrating = false; narratePump(); };
+  speechSynthesis.speak(utter);
+}
+
+function narrateEnqueue(text) {
+  if (!narrationOn || !SPEECH_SUPPORTED || !text) return;
+  narrateQueue.push(text);
+  narratePump();
+}
+
+function narrateStop() {
+  narrateQueue.length = 0;
+  narrating = false;
+  narrateOnIdle = null;
+  if (SPEECH_SUPPORTED) speechSynthesis.cancel();
+}
 
 /* ------------------------------- event source -------------------------------- */
 // Interface: start(onEvent) begins emitting; stop() cancels.
@@ -117,6 +157,10 @@ function apply(ev) {
       if (ev.status === 'approved') {                // clear the kickback note once resolved,
         if (p.note) p.pastNote = p.note;             // but keep it for the debug section
         p.note = null;
+        // Read the FINISHED line aloud — triggering off "approved" (not panel.caption)
+        // means a rejected draft never gets narrated, only whatever the caption reads by
+        // the time the panel actually lands (the revised text, if it was sent back).
+        if (p.caption) narrateEnqueue(p.caption);
       }
       renderPanel(p.n);
       break;
@@ -197,7 +241,7 @@ function ensurePanel(n) {
   let p = state.panels.find((x) => x.n === n);
   if (!p) {
     p = { n, status: 'drafting', caption: '', dim: true, svg: '', image: '', imageError: null,
-          note: null, artHistory: [], rejectedCaption: null };
+          note: null, artHistory: [], rejectedCaption: null, regenerating: false };
     state.panels.push(p); state.panels.sort((a, b) => a.n - b.n);
   }
   return p;
@@ -257,10 +301,20 @@ function panelInnerHtml(p) {
     ? `<div class="note"><b>${escapeHtml(p.note.label)}</b>${escapeHtml(p.note.text)}</div>`
     : '';
 
+  // Redo this one panel's picture — same caption/prompt, a fresh render. Only offered once
+  // there's a prompt to render from and the crew isn't actively mid-run (during a run the
+  // panel is still being written/rendered for the first time, so "redo" doesn't apply yet).
+  const canRegen = !!p.svg && !state.running;
+  const regenBtn = canRegen
+    ? `<button type="button" class="regen-btn" data-panel="${p.n}" ${p.regenerating ? 'disabled' : ''}
+         title="Redo this image — same caption, a fresh picture">${p.regenerating ? '⟳ Redrawing…' : '↻ Redo image'}</button>`
+    : '';
+
   return `
     <div class="pimg${revising ? ' revising' : ''}">
       ${pill ? `<span class="pill ${pill.cls}">${pill.text}</span>` : ''}<span class="pnum">${num}</span>
       ${media}
+      ${regenBtn}
     </div>
     <div class="pcap"><div class="${capClass}">${capText}</div>${note}</div>`;
 }
@@ -458,6 +512,9 @@ function startRun() {
   $('crew-live').textContent = 'live';
 
   setInputsDisabled(true);
+  // stopRun() (above) already called narrateStop() — just reset this button's own label/state.
+  const readBtn = $('read-story');
+  readBtn.disabled = true; readBtn.textContent = '🔊 Read story aloud'; readBtn.classList.remove('reading');
   $('download').disabled = true;
   $('download-gif').disabled = true;
   $('download-pdf').disabled = true;
@@ -496,23 +553,51 @@ function showLiveNote(text) {
 }
 
 function finishRun() {
+  // Flip running BEFORE re-rendering panels: panelInnerHtml's canRegen check reads
+  // state.running, so every panel's card needs a repaint under the new value to pick up
+  // the "↻ Redo image" button — not just the ones this loop settles below.
+  state.running = false; state.done = true;
   // A run can end (backend completion, or a dropped connection) while a panel is still
   // mid-render: it has an image prompt but no image and no error yet. Saying "Story
   // complete" while that panel is stuck on "rendering…" forever would be a lie — settle
   // it explicitly so the UI matches reality.
+  //
+  // Separately: the crew's own terminal events (panel.status:"approved", an agent's final
+  // status:"done") are sometimes dropped from a run's protocol — a documented
+  // non-determinism (see README "What's real vs approximate"), not something this bridge
+  // can fully guarantee. Once the run is genuinely done, any panel/agent still showing a
+  // mid-run status (a "Drafting" pill, an agent stuck on "revising") is stale, not real —
+  // reconcile it the same way the image-stragglers above are reconciled.
   for (const p of state.panels) {
     if (!p.image && !p.imageError && p.svg) {
       p.imageError = 'run ended before this panel finished rendering';
-      renderPanel(p.n);
     }
+    if (p.status !== 'approved') {
+      p.status = 'approved';
+      if (p.note) p.pastNote = p.note;
+      p.note = null;
+    }
+    renderPanel(p.n);
   }
-  state.running = false; state.done = true;
+  for (const id of AGENT_ORDER) {
+    const a = state.agents[id];
+    if (a.status === 'reject') continue;   // preserve a genuine error indicator
+    // Unconditional, even if status already reads "done": a model's settle event has been
+    // seen carrying a stray leftover `state` (e.g. "revising") alongside status:"done" even
+    // though the brief tells it to omit `state` on settle events. The UI prefers `state`
+    // over `status` for its display word (see renderCrew), so a leftover `state` field
+    // alone — independent of `status` — is enough to leave an agent looking stuck.
+    a.status = 'done';
+    delete a.state;
+  }
+  renderCrew();
   renderProgress();
   $('crew-live').textContent = 'done';
   const go = $('go');
   go.textContent = 'Run again'; go.classList.remove('running'); go.classList.add('again'); go.disabled = false;
   setInputsDisabled(false);
   const hasStory = state.panels.filter((p) => p.caption).length > 0;
+  $('read-story').disabled = !hasStory || !SPEECH_SUPPORTED;
   $('download').disabled = !hasStory;
   $('download-gif').disabled = !hasStory;
   $('download-pdf').disabled = !hasStory;
@@ -524,6 +609,7 @@ function finishRun() {
 function stopRun() {
   if (source) { source.stop(); source = null; }
   Object.keys(typers).forEach(cancelTyper);
+  narrateStop();   // a fresh run (or an abort) shouldn't keep reading a previous/abandoned one
 }
 
 function setInputsDisabled(disabled) {
@@ -881,6 +967,62 @@ async function restyleStory() {
   }
 }
 
+/* ------------------------------- read story aloud ------------------------------ */
+// On-demand replay of a FINISHED story through the same narration engine as the live
+// narration (above), but deliberately bypasses the narrationOn gate — clicking this
+// button IS the explicit ask, regardless of whether SpeechSynthesis is otherwise
+// unavailable/unsupported. Click again while reading to stop early.
+function readStoryAloud() {
+  const btn = $('read-story');
+  if (!SPEECH_SUPPORTED || btn.disabled) return;
+  if (narrating || narrateQueue.length) {
+    narrateStop();
+    btn.textContent = '🔊 Read story aloud';
+    btn.classList.remove('reading');
+    return;
+  }
+  const panels = state.panels.filter((p) => p.caption).sort((a, b) => a.n - b.n);
+  if (!panels.length) return;
+  panels.forEach((p) => narrateQueue.push(p.caption));
+  btn.textContent = '⏹ Stop reading';
+  btn.classList.add('reading');
+  narrateOnIdle = () => { btn.textContent = '🔊 Read story aloud'; btn.classList.remove('reading'); };
+  narratePump();
+}
+
+/* --------------------------- regenerate one panel ----------------------------- */
+// Redo a single panel's picture — same caption, same image prompt, just a fresh /panel/
+// regenerate call with a new render — without touching any other panel or re-running the
+// crew. The single-panel sibling of restyleStory() above (see server/bridge.py's
+// /panel/regenerate). Like restyle, never reuses a seed, so the result is guaranteed to
+// actually look different from what's on screen.
+async function regeneratePanel(n) {
+  const p = state.panels.find((x) => x.n === n);
+  if (!p || !p.svg || state.running || p.regenerating) return;
+  p.regenerating = true;
+  renderPanel(n);
+  try {
+    const res = await fetch('/panel/regenerate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ n, prompt: p.svg, style: state.brief.style }),
+    });
+    if (!res.ok) throw new Error(`bridge ${res.status}`);
+    const { src, error } = await res.json();
+    if (src) {
+      p.image = src; p.imageError = null;
+    } else {
+      if (!p.image) p.imageError = error || 'render failed';   // keep a picture we already have
+      showLiveNote(`Couldn't redo panel ${n}'s image${error ? ` (${error})` : ''}`
+        + `${p.image ? ' — kept the previous picture.' : '.'}`);
+    }
+  } catch (e) {
+    showLiveNote(`Couldn't redo panel ${n}'s image (${e.message}). Needs the bridge running.`);
+  } finally {
+    p.regenerating = false;
+    renderPanel(n);
+  }
+}
+
 /* ----------------------------------- boot ----------------------------------- */
 
 $('promptbar').addEventListener('submit', (e) => {
@@ -896,6 +1038,18 @@ $('download').addEventListener('click', () => { if (!$('download').disabled) dow
 $('download-gif').addEventListener('click', downloadGif);
 $('download-pdf').addEventListener('click', downloadPdf);
 $('restyle').addEventListener('click', restyleStory);
+$('gallery').addEventListener('click', (e) => {
+  const btn = e.target.closest('.regen-btn');
+  if (!btn || btn.disabled) return;
+  regeneratePanel(parseInt(btn.dataset.panel, 10));
+});
+
+if (!SPEECH_SUPPORTED) {
+  $('read-story').disabled = true;
+  $('read-story').title = 'This browser does not support speech synthesis.';
+} else {
+  $('read-story').addEventListener('click', readStoryAloud);
+}
 
 const params = new URLSearchParams(location.search);
 renderAll();   // show the idle crew / progress on load

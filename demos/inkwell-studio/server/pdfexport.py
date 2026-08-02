@@ -55,7 +55,7 @@ def build_pdf(idea: str, style: str, panels: list[dict]) -> bytes:
     gifexport.build_gif but isn't drawn — see module docstring."""
     idea = (idea or "").strip() or "An illustrated story"
 
-    frames: list[Image.Image] = [_title_frame(idea, style, show_style=False)]
+    frames: list[Image.Image] = [_title_frame(idea, style)]
     for p in panels:
         art = None
         if p.get("png"):
