@@ -66,7 +66,32 @@ def _base():
     return img, ImageDraw.Draw(img)
 
 
-def _title_frame(idea: str, style: str, *, show_style: bool = True) -> Image.Image:
+def _fit_caption(draw, text, max_w, max_h, *, start_size=24, min_size=15):
+    """Wrap `text` at the largest size in [min_size, start_size] whose lines fit max_h;
+    if even min_size overflows, truncate the last visible line with an ellipsis."""
+    size = start_size
+    while size >= min_size:
+        font = _font(size)
+        line_h = size + 10
+        lines = _wrap(draw, text, font, max_w)
+        if len(lines) * line_h <= max_h:
+            return font, lines, line_h
+        size -= 1
+
+    font = _font(min_size)
+    line_h = min_size + 10
+    lines = _wrap(draw, text, font, max_w)
+    max_lines = max(1, int(max_h // line_h))
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        last = lines[-1]
+        while last and _text_w(draw, last + "…", font) > max_w:
+            last = last[:-1].rstrip()
+        lines[-1] = (last + "…") if last else "…"
+    return font, lines, line_h
+
+
+def _title_frame(idea: str, style: str) -> Image.Image:
     img, d = _base()
     d.line([(MARGIN, 48), (W - MARGIN, 48)], fill=INK, width=2)
     f_brand = _font(20, bold=True)
@@ -79,9 +104,6 @@ def _title_frame(idea: str, style: str, *, show_style: bool = True) -> Image.Ima
     for ln in lines:
         d.text(((W - _text_w(d, ln, f_idea)) / 2, y), ln, font=f_idea, fill=OX)
         y += 46
-    if style and show_style:
-        f_s = _font(16)
-        d.text(((W - _text_w(d, style, f_s)) / 2, y + 16), style, font=f_s, fill=MUT)
     f_foot = _font(13)
     foot = "an illustrated story, made by a crew of agents"
     d.text(((W - _text_w(d, foot, f_foot)) / 2, H - 70), foot, font=f_foot, fill=DIM)
@@ -90,17 +112,22 @@ def _title_frame(idea: str, style: str, *, show_style: bool = True) -> Image.Ima
 
 def _panel_frame(n: int, total: int, art: Image.Image | None, caption: str) -> Image.Image:
     img, d = _base()
-    # eyebrow + plate number
-    f_eye = _font(13)
-    d.text((MARGIN, 40), f"PANEL {n:02d}", font=f_eye, fill=DIM)
-    f_num = _font(40, italic=True)
+    # header: brand + tail, rule below
+    f_head = _font(12)
+    d.text((MARGIN, 24), "INKWELL STUDIO", font=f_head, fill=DIM)
+    tail = "powered by JiuwenSwarm over A2A"
+    d.text((W - MARGIN - _text_w(d, tail, f_head), 24), tail, font=f_head, fill=DIM)
+    d.line([(MARGIN, 46), (W - MARGIN, 46)], fill=RULE, width=1)
+
+    # plate number
+    f_num = _font(36, italic=True)
     num = f"{n:02d}"
-    d.text((W - MARGIN - _text_w(d, num, f_num), 30), num, font=f_num, fill=OX)
+    d.text((W - MARGIN - _text_w(d, num, f_num), 54), num, font=f_num, fill=OX)
 
     # art box
     box_w = W - 2 * MARGIN
-    box_top = 76
-    box_h = 300
+    box_top = 100
+    box_h = 296
     if art is not None:
         a = art.convert("RGB")
         scale = min(box_w / a.width, box_h / a.height)
@@ -114,18 +141,11 @@ def _panel_frame(n: int, total: int, art: Image.Image | None, caption: str) -> I
         d.rectangle([MARGIN, box_top, W - MARGIN, box_top + box_h], outline=RULE, width=1)
         cap_y = box_top + box_h + 30
 
-    # caption
-    f_cap = _font(24)
-    for ln in _wrap(d, caption, f_cap, box_w):
+    # caption — auto-shrink/wrap to fit the remaining frame height, else ellipsize
+    f_cap, cap_lines, cap_line_h = _fit_caption(d, caption, box_w, max(0, H - 24 - cap_y))
+    for ln in cap_lines:
         d.text((MARGIN, cap_y), ln, font=f_cap, fill=INK)
-        cap_y += 34
-
-    # footer
-    d.line([(MARGIN, H - 52), (W - MARGIN, H - 52)], fill=RULE, width=1)
-    f_foot = _font(12)
-    d.text((MARGIN, H - 42), "INKWELL STUDIO", font=f_foot, fill=DIM)
-    tail = "powered by JiuwenSwarm over A2A"
-    d.text((W - MARGIN - _text_w(d, tail, f_foot), H - 42), tail, font=f_foot, fill=DIM)
+        cap_y += cap_line_h
     return img
 
 

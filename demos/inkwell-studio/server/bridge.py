@@ -211,10 +211,11 @@ _LIVE_SAFE_TYPES = {"panel.status", "progress", "focus"}
 _LIVE_DONE = object()
 
 
-def _live_view(ev: dict) -> dict | None:
+def _live_view(ev: dict, total: int) -> dict | None:
     """A live-safe rendition of `ev`, or None if it either (a) carries free text that must
-    wait for the corrected final replay, or (b) is a TERMINAL/completion state — agent done,
-    panel approved, progress at 100%.
+    wait for the corrected final replay, (b) is a TERMINAL/completion state — agent done,
+    panel approved, progress at 100% — or (c) is a panel-scoped event with an invalid `panel`
+    number.
 
     (b) matters because the crew's "settle the crew" events (see prompt.py's protocol) are
     emitted near the END of its own generation, but moderation + the paced replay still run
@@ -223,8 +224,18 @@ def _live_view(ev: dict) -> dict | None:
     "caption pending". That's more confusing than the frozen-UI problem this was built to
     fix. Intermediate states (active/drafting/rendering/review/reject/revising) are genuine,
     non-misleading progress and stay live; terminal ones are left for the final replay, where
-    they land in sync with the content they actually describe."""
+    they land in sync with the content they actually describe.
+
+    (c) matters because `_valid_panel_events` (below) only runs on the authoritative buffer
+    AFTER the whole run finishes — a malformed/hallucinated `panel.status` or `focus` event
+    with a missing or out-of-range `panel` reaches the browser straight from here otherwise,
+    creating a permanent ghost panel card (`ensurePanel(undefined)` front-end-side) well
+    before that later filter ever gets a chance to drop it."""
     t = ev.get("t")
+    if t in ("panel.status", "focus"):
+        n = ev.get("panel")
+        if not isinstance(n, int) or not (1 <= n <= total):
+            return None
     if t == "panel.status":
         return None if ev.get("status") == "approved" else ev
     if t == "progress":
@@ -244,7 +255,7 @@ async def _collect_swarm_live(
     """_collect_swarm, forwarding live-safe events onto `live_q` as they're seen and always
     signalling _LIVE_DONE when finished (success or error) so the drainer never hangs."""
     def _on_event(ev: dict) -> None:
-        live = _live_view(ev)
+        live = _live_view(ev, total)
         if live is None:
             return
         ident = _identity(live)
@@ -723,6 +734,29 @@ async def restyle(request: Request):
 
     results = await asyncio.gather(*(one(p) for p in panels_in))
     return JSONResponse({"panels": results})
+
+
+@app.post("/panel/regenerate")
+async def regenerate_panel(request: Request):
+    """Re-render ONE panel's picture — same caption/prompt, a fresh image — without touching
+    any other panel or re-running the crew. The single-panel sibling of /restyle (which redoes
+    every panel at once for a style change); this is for "four panels are great, redo just this
+    one." Body: {n, prompt, style}.
+
+    Shares /restyle's two properties: the retry-then-stub-fallback of _render_panel_resilient
+    (so a transient 429/4xx doesn't cost the panel with zero chance to recover), and no seed
+    reuse (a fresh random seed every time), for the same reason — a low-step distilled model can
+    let a reused seed dominate the output enough that nothing visibly changes, which would make
+    "redo this image" silently do nothing."""
+    data = await request.json()
+    n = data.get("n")
+    prompt = str(data.get("prompt") or "").strip()
+    style = str(data.get("style") or "").strip()
+    if not isinstance(n, int) or not prompt:
+        return JSONResponse({"error": "n and prompt are required"}, status_code=400)
+    sem = asyncio.Semaphore(IMAGE_CONCURRENCY)
+    src, err = await _render_panel_resilient(n, prompt, style, sem)
+    return JSONResponse({"src": src, "error": err})
 
 
 @app.get("/events")
