@@ -114,6 +114,13 @@ const AGENT_NAMES = {
   imageGen: 'Image Gen', editor: 'Editor',
 };
 const STATE_WORD = { active: 'working', done: 'done', idle: 'idle', reject: 'rejected' };
+// Canned filler for the "say" line when a live-forwarded `agent` event arrives with
+// say:"" (see the reducer's 'agent' case) — keyed by the free-form `state` word the
+// crew emits (drafting/rendering/revising/queued/review/...), falling back to `status`.
+const GENERIC_SAY = {
+  drafting: 'Drafting…', rendering: 'Rendering…', revising: 'Revising…',
+  queued: 'Queued…', review: 'Reviewing…',
+};
 
 function freshAgents() {
   return {
@@ -208,10 +215,21 @@ function apply(ev) {
 
     case 'agent': {
       const a = state.agents[ev.id];
-      // Live-forwarded status updates (bridge.py's _live_view) send say:"" — the status dot
-      // still needs to update immediately, but an empty line shouldn't blank out whatever
-      // text is already showing; the real line follows once the run's text is corrected.
-      if (a) { a.status = ev.status; if (ev.say) a.say = ev.say; if (ev.state) a.state = ev.state; else delete a.state; }
+      // Live-forwarded status updates (bridge.py's _live_view) send say:"" — the free-form
+      // line is corrupted in transit (whitespace bug) and must wait for the corrected final
+      // replay. But leaving the OLD say text showing is misleading once the state badge has
+      // already moved on (e.g. badge flips to "rendering" while the line still reads the
+      // opener's "Standing by."), so fill in a generic, known-safe line from state/status
+      // instead of leaving stale text stuck on screen.
+      if (a) {
+        a.status = ev.status;
+        if (ev.state) a.state = ev.state; else delete a.state;
+        if (ev.say) a.say = ev.say;
+        else {
+          const canned = GENERIC_SAY[ev.state] || (ev.status === 'active' ? 'Working…' : null);
+          if (canned) a.say = canned;
+        }
+      }
       renderCrew();
       break;
     }
@@ -351,7 +369,7 @@ function renderCrew() {
     const stCls = { active: 'st-active', reject: 'st-reject', done: 'st-done', idle: 'st-idle' }[a.status] || 'st-idle';
     const tool = AGENT_LABELS[id] ? ` <small>${AGENT_LABELS[id]}</small>` : '';
     return `
-      <div class="agent${a.status === 'active' ? ' agent-active' : ''}">
+      <div class="agent${a.status === 'active' || a.status === 'reject' ? ' agent-active' : ''}">
         <span class="dot ${dot}"></span>
         <div style="flex:1">
           <div class="row1"><span class="who">${AGENT_NAMES[id]}${tool}</span><span class="state ${stCls}">${escapeHtml(word)}</span></div>
