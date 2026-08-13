@@ -30,6 +30,7 @@ from openjiuwen.agent_teams.rails.team_context import (
     get_permissions_override,
     get_team_backend,
 )
+from openjiuwen.harness.rails import ModelAnomalyDetectionRail
 
 from jiuwenswarm.agents.harness.common.plugins.rail_manager import get_rail_manager
 from jiuwenswarm.agents.harness.common.rails.runtime_prompt_rail import (
@@ -62,10 +63,10 @@ TEAM_SKILL_STORAGE_POLICY = "swarm.team_skill_storage_policy"
 TEAM_SHARED_SKILL_LINK_REFRESH = "swarm.team_shared_skill_link_refresh"
 TEAM_WORKSPACE_REPORT_PATH = "swarm.team_workspace_report_path"
 CONTEXT_PROCESSOR = "swarm.context_processor"
+MODEL_ANOMALY_DETECTION = "swarm.model_anomaly_detection"
 PLUGIN_RAILS = "swarm.plugin_rails"
 SKILL_RETRIEVAL_PROMPT = "swarm.skill_retrieval_prompt"
 SYMPHONY_ORCHESTRATION_PROMPT = "swarm.symphony_orchestration_prompt"
-TEAM_PERMISSION_POLICY = "swarm.team_permission_policy"
 
 
 def _workspace_root(ctx: SwarmBuildContext) -> str | None:
@@ -147,6 +148,10 @@ class RuntimePromptInput(ConstructionInput):
         resolver=_workspace_root,
         description="Current member workspace root (cwd fallback without a project).",
     )
+    trusted_dirs: list[str] | None = context_field(
+        attr="trusted_dirs",
+        description="Directories the client declared as trusted for this request.",
+    )
 
 
 @harness_element(
@@ -185,17 +190,19 @@ def _build_runtime_prompt_rail(
         project_dir=inp.project_dir,
         workspace_dir=inp.member_workspace_root,
     )
+    # Without this the member never renders the trusted_dirs policy section a
+    # single agent gets from ``_apply_runtime_config_stages``.
+    rail.set_trusted_dirs(inp.trusted_dirs)
     return rail
 
 
 class TeamSkillStoragePolicyInput(ConstructionInput):
-    """Construction inputs for the team skill storage policy rail."""
+    """Construction inputs for the team skill storage policy rail.
 
-    language: str = context_field(
-        attr="language",
-        default="cn",
-        description="Resolved member language code.",
-    )
+    Team-level paths only: the member's own workspace is per-member and the
+    team rail tells the member about it as part of its identity.
+    """
+
     global_skills_dir: str | None = context_field(
         attr="global_skills_dir",
         description="Global shared skills source directory.",
@@ -207,10 +214,6 @@ class TeamSkillStoragePolicyInput(ConstructionInput):
     team_skills_dir: str | None = context_field(
         attr="team_skills_dir",
         description="Team shared skills linked view.",
-    )
-    member_workspace_root: str | None = context_field(
-        resolver=_workspace_root,
-        description="Current member workspace root.",
     )
 
 
@@ -242,8 +245,6 @@ def _build_team_skill_storage_policy_rail(
         global_skills_dir=inp.global_skills_dir,
         team_workspace_root=inp.team_ws_root,
         team_skills_dir=inp.team_skills_dir,
-        member_workspace_root=inp.member_workspace_root,
-        language=inp.language,
     )
 
 
@@ -342,11 +343,13 @@ def _build_team_workspace_report_path_rail(
     inp = TeamWorkspaceReportPathInput.resolve(params, context)
     if not inp.team_ws_root:
         return None
-    return TeamWorkspaceReportPathRail(
+    rail = TeamWorkspaceReportPathRail(
         root_dir=inp.team_ws_root,
         team_id=inp.team_id,
         language=inp.language,
     )
+    rail.bind_swarm_context(context)
+    return rail
 
 
 class ContextProcessorInput(ConstructionInput):
@@ -388,6 +391,49 @@ def _build_context_processor(
     return _build_context_processor_rail(
         {"context_engine_config": inp.context_engine_config}
     )
+
+
+class ModelAnomalyDetectionInput(ConstructionInput):
+    """Construction inputs for the model-anomaly / tool-loop compact rail."""
+
+    rail_config: dict[str, Any] = param_field(
+        default_factory=dict,
+        description="execution_guard.model_anomaly_detection_rail section.",
+    )
+
+
+@harness_element(
+    kind=ElementKind.RAIL,
+    name=MODEL_ANOMALY_DETECTION,
+    description="Model anomaly detection rail (repeat/stream retry + tool_loop_compact). "
+    "Mounted when execution_guard.model_anomaly_detection_rail.enabled is true; "
+    "overrides openjiuwen's default ModelAnomalyDetectionRail() so tool_loop_compact "
+    "can be enabled from config.",
+    input_model=ModelAnomalyDetectionInput,
+)
+def _build_model_anomaly_detection(
+    params: dict[str, Any],
+    context: SwarmBuildContext,
+) -> Any | None:
+    """Build openjiuwen ``ModelAnomalyDetectionRail`` from execution_guard config."""
+    inp = ModelAnomalyDetectionInput.resolve(params, context)
+    rail_cfg = inp.rail_config if isinstance(inp.rail_config, dict) else {}
+    if rail_cfg.get("enabled", False) is not True:
+        return None
+    try:
+        return ModelAnomalyDetectionRail(
+            max_retries=rail_cfg.get("max_retries", 2),
+            repeat_min_pattern_chars=rail_cfg.get("repeat_min_pattern_chars", 2),
+            repeat_max_pattern_chars=rail_cfg.get("repeat_max_pattern_chars", 64),
+            repeat_min_count=rail_cfg.get("repeat_min_count", 6),
+            repeat_min_total_chars=rail_cfg.get("repeat_min_total_chars", 160),
+            repeat_window_chars=rail_cfg.get("repeat_window_chars", 1024),
+            single_char_repeat_count=rail_cfg.get("single_char_repeat_count", 100),
+            tool_loop_compact=rail_cfg.get("tool_loop_compact"),
+        )
+    except Exception as exc:
+        logger.warning("[SwarmRails] ModelAnomalyDetectionRail create failed: %s", exc)
+        return None
 
 
 @harness_element(
@@ -436,6 +482,7 @@ __all__ = [
     "TEAM_SHARED_SKILL_LINK_REFRESH",
     "TEAM_WORKSPACE_REPORT_PATH",
     "CONTEXT_PROCESSOR",
+    "MODEL_ANOMALY_DETECTION",
     "PLUGIN_RAILS",
     "SKILL_RETRIEVAL_PROMPT",
     "SYMPHONY_ORCHESTRATION_PROMPT",
