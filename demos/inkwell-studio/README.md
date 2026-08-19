@@ -19,10 +19,6 @@ reducer. Events come from `A2AEventSource`, which subscribes to the bridge's SSE
 bridge runs a **real JiuwenSwarm story over A2A** and forwards normalized events that the
 reducer/renderers turn into panels, crew status, and the revision log.
 
-(An earlier phase had a `SimEventSource` — a scripted, client-side-only run used to lock the
-UX before the real A2A integration existed. It's since been removed; the live engine is the
-only path now.)
-
 ## Run it
 
 Needs the repo venv (`uv sync --extra a2a`) and three processes. From the repo root:
