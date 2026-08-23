@@ -1,37 +1,39 @@
 """Inkwell Studio bridge — Phase 2.
 
 Our own app's tiny backend (still Path 2). It:
-  1. serves the static front-end (same origin, so no CORS),
+  1. serves the static front-end (same origin, so no CORS unless a different-origin embed
+     needs it — see add_cors below),
   2. exposes GET /events (SSE) which runs one JiuwenSwarm story over A2A and forwards
      the swarm's line-delimited JSON protocol to the browser as normalized events —
      the exact events the Phase 1 reducer already renders.
 
-A2A streaming quirk (confirmed in the Step 0 spike): the swarm streams token deltas as
-`artifact_update` events, then a final consolidated artifact carrying the full text (a
-byte-identical duplicate of the deltas). So we brace-match complete JSON objects from an
-accumulating buffer and dedup by canonical JSON string; first-seen order is correct.
+Transport, JSON-protocol framing, whitespace dedup, live-progress forwarding, the resilient-
+retry pattern, and the FastAPI auth/CORS/rate-limit/SSE plumbing all now live in the
+`a2a_embed` package (packages/a2a-embed/) — this file keeps only what's genuinely Inkwell's:
+the guided-protocol prompt wiring (prompt.py), panel/brief validation, moderation, the
+team/single-agent fallback and fill-retry orchestration, and image rendering + the story-
+specific export/restyle/regenerate endpoints. See
+demos/inkwell-studio/docs/productization-architecture.md for the before/after picture.
 
 Run:  .venv/Scripts/python.exe demos/inkwell-studio/server/bridge.py
-Env:  A2A_URL (default http://127.0.0.1:19100), BRIDGE_HOST, BRIDGE_PORT (default 8800)
+Env:  A2A_URL (default http://127.0.0.1:19100), BRIDGE_HOST, BRIDGE_PORT (default 8800),
+      INKWELL_API_TOKEN (unset = no auth), INKWELL_MAX_CONCURRENT_RUNS (default 4, 0 = no cap)
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
-import json
 import logging
 import os
 import sys
-import uuid
-from collections.abc import Callable
 from pathlib import Path
 
-import httpx
-import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, Response
+
+from a2a_embed import ConcurrencyGuard, LiveRelay, best_variants, call_resilient, identity, run_agent
+from a2a_embed import server as embed_server
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # Load this folder's .env (image backend config etc.) BEFORE importing imagegen,
@@ -44,10 +46,6 @@ import imagegen  # noqa: E402
 import gifexport  # noqa: E402
 import pdfexport  # noqa: E402
 import moderate  # noqa: E402
-
-from a2a.client import ClientConfig, create_client  # noqa: E402
-from a2a.helpers import get_stream_response_text, new_text_message  # noqa: E402
-from a2a.types import SendMessageRequest  # noqa: E402
 
 log = logging.getLogger("inkwell.bridge")
 
@@ -66,107 +64,34 @@ TEAM = os.getenv("INKWELL_TEAM", "1").strip().lower() in {"1", "true", "yes", "o
 # Retries for the targeted single-agent fill patch (see _incomplete_panels) before giving up
 # and paying for a full single-agent redo that discards the team's already-good panels.
 FILL_RETRIES = max(1, int(os.getenv("INKWELL_FILL_RETRIES", "2") or 2))
+# Opt-in Bearer/query token (a2a_embed.auth); unset = no auth, matching the demo's original
+# zero-config behavior. Concurrency cap targets the real documented risk (a team-mode run
+# hanging for a long time and tying up a slot), not request volume — see ratelimit.py.
+API_TOKEN_ENV_VAR = "INKWELL_API_TOKEN"
+RUN_GUARD = ConcurrencyGuard.from_env("INKWELL_MAX_CONCURRENT_RUNS", 4)
 
 CAPTION_REDACTED = "— this part of the story was redacted (didn't meet our content guidelines) —"
 ART_REDACTED_PROMPT = "a soft, warm, gentle abstract illustration, no specific subject"
 
 app = FastAPI(title="Inkwell Studio bridge")
-
-
-# --------------------------- JSON protocol extraction ---------------------------
-
-def extract_json_objects(buf: str) -> tuple[list[str], str]:
-    """Pull complete top-level {...} objects out of `buf`.
-
-    Returns (objects, remaining) where `remaining` holds an incomplete trailing object
-    (or noise before the next '{'). Brace-matching respects JSON strings/escapes.
-    """
-    objs: list[str] = []
-    start: int | None = None
-    depth = 0
-    in_str = False
-    esc = False
-    for idx, c in enumerate(buf):
-        if start is None:
-            if c == "{":
-                start, depth, in_str, esc = idx, 1, False, False
-            continue
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-        else:
-            if c == '"':
-                in_str = True
-            elif c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    objs.append(buf[start:idx + 1])
-                    start = None
-    remaining = buf[start:] if start is not None else ""
-    return objs, remaining
-
-
-def _parse_line(line: str) -> list[dict]:
-    """Extract known protocol events from a single line (see parse_events). Split out so the
-    live incremental scanner in _collect_swarm can reuse the exact same per-line extraction
-    without waiting for the whole buffer."""
-    out: list[dict] = []
-
-    def _keep(raw: str) -> None:
-        try:
-            ev = json.loads(raw)
-        except (ValueError, TypeError):
-            return
-        if isinstance(ev, dict) and ev.get("t") in KNOWN_EVENTS:
-            out.append(ev)
-
-    s = line.strip().rstrip(",")
-    if "{" not in s:
-        return out
-    if s.startswith("{") and s.endswith("}"):
-        before = len(out)
-        _keep(s)
-        if len(out) > before:
-            return out
-    objs, _ = extract_json_objects(s)  # concatenated objects on one line
-    for raw in objs:
-        _keep(raw)
-    return out
-
-
-def parse_events(buf: str) -> list[dict]:
-    """Extract known protocol events from `buf`, line-scoped so it's robust to the heavy
-    tool-event noise of a real team run (Python-dict reprs, unbalanced braces). The team
-    emits one JSON object per line; single-agent output is clean too."""
-    out: list[dict] = []
-    for line in buf.splitlines():
-        out.extend(_parse_line(line))
-    return out
-
-
-def _new_complete_lines(buf: str, scanned: int) -> tuple[list[str], int]:
-    """Complete (newline-terminated) lines in buf[scanned:] not yet handed to a caller, and
-    the new scan offset. The trailing partial line (no newline yet) is left for next time."""
-    idx = buf.rfind("\n", scanned)
-    if idx == -1:
-        return [], scanned
-    return buf[scanned:idx].splitlines(), idx + 1
+embed_server.add_cors(app)
+# Allowlist, not blanket protection: the static front-end (STATIC_DIR, mounted at the very
+# end of this file) and /health stay open so the page can load at all — a plain browser
+# navigation can't attach an Authorization header. /events isn't in this list either: it
+# validates the same token via ?token= instead (wired below through sse_route's
+# token_env_var), since EventSource can't set headers at all.
+_PROTECTED_ROUTES = {"/export/gif", "/export/pdf", "/restyle", "/panel/regenerate"}
+embed_server.add_auth(app, env_var=API_TOKEN_ENV_VAR, protect_paths=_PROTECTED_ROUTES)
 
 
 # --------------------------------- swarm run ------------------------------------
 #
-# Why buffer + replay instead of pure passthrough: the A2A channel strips whitespace
-# from every streamed chunk (message_to_a2a_parts does content.strip()), so live token
-# deltas lose the spaces between tokens ("Eliasworkedthrough..."). Only the final
-# consolidated artifact carries correctly-spaced text. So we collect the whole run,
-# pick the best-spaced variant of each event, then replay it with gentle pacing — the
-# swarm's work is real; we just render it readably. (Latency tuning is Phase 3.)
+# Why buffer + replay instead of pure passthrough: some A2A streaming paths strip
+# whitespace from per-chunk deltas (see docs/en/A2A.md), so live token deltas can lose the
+# spaces between tokens ("Eliasworkedthrough..."). Only the final consolidated artifact is
+# guaranteed correctly-spaced. So we collect the whole run, pick the best-spaced variant of
+# each event (a2a_embed.dedup), then replay it with gentle pacing — the swarm's work is
+# real; we just render it readably. (Latency tuning is Phase 3.)
 
 # Per-event replay delay (seconds) — mimics the Phase 1 timeline's cadence.
 _PACE = {
@@ -176,39 +101,18 @@ _PACE = {
 }
 
 
-def _identity(ev: dict) -> str:
-    """Whitespace-insensitive identity so spaced/unspaced variants collapse together."""
-    return "".join(json.dumps(ev, sort_keys=True, ensure_ascii=False).split())
-
-
-def _best_variants(events: list[dict]) -> list[dict]:
-    """Dedup by identity, keeping the longest (best-spaced) variant, in first-seen order."""
-    order: list[str] = []
-    best: dict[str, tuple[int, dict]] = {}
-    for ev in events:
-        ident = _identity(ev)
-        raw_len = len(json.dumps(ev, ensure_ascii=False))
-        if ident not in best:
-            order.append(ident)
-            best[ident] = (raw_len, ev)
-        elif raw_len > best[ident][0]:
-            best[ident] = (raw_len, ev)
-    return [best[i][1] for i in order]
-
-
 # --------------------------- live status while the crew writes -------------------------
 #
 # The whitespace-stripping bug (see the block comment above) only corrupts FREE-TEXT fields.
 # panel.status/progress/focus carry none at all (just panel numbers, an enum status, counts);
 # `agent` mixes a safe enum `status`/`state` with a free-form `say` sentence. So instead of
 # leaving the whole UI frozen on "Contacting the crew…" for the entire single A2A call that
-# writes the full story, forward the text-safe SLICE of these live, as _collect_swarm sees
-# them — the Crew panel's dots and each panel's status genuinely animate in real time while
-# the crew is still working. Caption/art-prompt/note/log text still waits for the corrected,
-# fully-deduped final replay, same as before.
+# writes the full story, forward the text-safe SLICE of these live, as run_agent's on_event
+# sees them (via a2a_embed.LiveRelay) — the Crew panel's dots and each panel's status
+# genuinely animate in real time while the crew is still working. Caption/art-prompt/note/log
+# text still waits for the corrected, fully-deduped final replay, same as before.
 
 _LIVE_SAFE_TYPES = {"panel.status", "progress", "focus"}
-_LIVE_DONE = object()
 
 
 def _live_view(ev: dict, total: int) -> dict | None:
@@ -249,95 +153,22 @@ def _live_view(ev: dict, total: int) -> dict | None:
     return None
 
 
-async def _collect_swarm_live(
-    idea: str, style: str, total: int, *, team: bool, live_q: asyncio.Queue, seen_live: set[str],
-) -> list[dict]:
-    """_collect_swarm, forwarding live-safe events onto `live_q` as they're seen and always
-    signalling _LIVE_DONE when finished (success or error) so the drainer never hangs."""
-    def _on_event(ev: dict) -> None:
-        live = _live_view(ev, total)
-        if live is None:
-            return
-        ident = _identity(live)
-        if ident in seen_live:
-            return
-        seen_live.add(ident)
-        live_q.put_nowait(live)
-
+async def _run_story(idea: str, style: str, total: int, *, team: bool, relay: LiveRelay) -> list[dict]:
+    """run_agent, forwarding live-safe events onto `relay` as they're seen and always
+    closing it when finished (success or error) so the drainer never hangs."""
+    prompt = build_team_brief(idea, style, total) if team else build_brief(idea, style, total)
+    meta = {"source": "inkwell-studio"}
+    if team:
+        meta["mode"] = "team"          # route to the real jiuwen_team
     try:
-        return await _collect_swarm(idea, style, total, team=team, on_event=_on_event)
+        return await run_agent(
+            A2A_URL, prompt,
+            known_events=KNOWN_EVENTS, metadata=meta, context_prefix="inkwell",
+            timeout=900.0 if team else 600.0,
+            on_event=lambda ev: relay.on_event(ev),
+        )
     finally:
-        live_q.put_nowait(_LIVE_DONE)
-
-
-async def _drain_live(live_q: asyncio.Queue):
-    """Yield live-safe events as they arrive until _LIVE_DONE is seen."""
-    while True:
-        item = await live_q.get()
-        if item is _LIVE_DONE:
-            return
-        yield item
-
-
-async def _collect_swarm(
-    idea: str, style: str, panels: int, *, team: bool = TEAM,
-    on_event: Callable[[dict], None] | None = None,
-) -> list[dict]:
-    """Run one story over A2A and return every parsed protocol event (raw, undeduped).
-
-    team=True routes to the native jiuwen_team (real leader + teammate agents) via request
-    metadata mode=team; the leader streams our protocol while genuinely delegating.
-
-    `on_event`, if given, is called synchronously with EVERY event as soon as its line
-    completes in the growing buffer — before the run finishes, before dedup, before the
-    whitespace-corruption in raw deltas is corrected. It's the caller's job to decide which
-    event types are safe to act on early (see stream_story's live-forwarding, which only
-    trusts text-free fields) — this function just reports what it sees, as soon as it sees it.
-    """
-    prompt = build_team_brief(idea, style, panels) if team else build_brief(idea, style, panels)
-    context_id = f"inkwell_{uuid.uuid4().hex[:12]}"
-    # Team runs are slower (multi-agent rounds) — give them room.
-    timeout = 900.0 if team else 600.0
-    hx = httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10.0))
-    client = None
-    events: list[dict] = []
-    try:
-        client = await create_client(A2A_URL, ClientConfig(streaming=True, httpx_client=hx))
-        msg = new_text_message(prompt, context_id=context_id, role=1)  # 1 = ROLE_USER
-        req = SendMessageRequest(message=msg)
-        meta = {"source": "inkwell-studio"}          # MUST be non-empty (framework guard)
-        if team:
-            meta["mode"] = "team"                      # route to the real jiuwen_team
-        req.metadata.update(meta)
-        buf = ""
-        scanned = 0
-        async for resp in client.send_message(req):
-            if resp.WhichOneof("payload") != "artifact_update":
-                continue
-            text = get_stream_response_text(resp) or ""
-            if text:
-                buf += text
-                if on_event is not None:
-                    lines, scanned = _new_complete_lines(buf, scanned)
-                    for line in lines:
-                        for ev in _parse_line(line):
-                            try:
-                                on_event(ev)
-                            except Exception:  # noqa: BLE001 — a live-forwarding hiccup must never break the run
-                                log.exception("on_event callback failed")
-        # Parse once over the full buffer, line-scoped (robust to team tool-noise). This is
-        # the authoritative pass — it re-sees everything on_event already reported (plus the
-        # final consolidated/correctly-spaced copy), which is why on_event alone is never
-        # treated as the source of truth downstream.
-        events = parse_events(buf)
-    finally:
-        if client is not None:
-            try:
-                await client.close()
-            except Exception:  # noqa: BLE001
-                pass
-        await hx.aclose()
-    return events
+        relay.close()
 
 
 async def _collect_fill(
@@ -347,31 +178,11 @@ async def _collect_fill(
     patch instead of re-running the whole story. Short timeout: this is 1-2 panels of prose,
     not a full crew run."""
     prompt = build_fill_brief(idea, style, total, prior, missing)
-    context_id = f"inkwell_fill_{uuid.uuid4().hex[:12]}"
-    hx = httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=10.0))
-    client = None
-    events: list[dict] = []
-    try:
-        client = await create_client(A2A_URL, ClientConfig(streaming=True, httpx_client=hx))
-        msg = new_text_message(prompt, context_id=context_id, role=1)  # 1 = ROLE_USER
-        req = SendMessageRequest(message=msg)
-        req.metadata.update({"source": "inkwell-studio-fill"})  # MUST be non-empty
-        buf = ""
-        async for resp in client.send_message(req):
-            if resp.WhichOneof("payload") != "artifact_update":
-                continue
-            text = get_stream_response_text(resp) or ""
-            if text:
-                buf += text
-        events = parse_events(buf)
-    finally:
-        if client is not None:
-            try:
-                await client.close()
-            except Exception:  # noqa: BLE001
-                pass
-        await hx.aclose()
-    return events
+    return await run_agent(
+        A2A_URL, prompt,
+        known_events=KNOWN_EVENTS, metadata={"source": "inkwell-studio-fill"},
+        context_prefix="inkwell_fill", timeout=180.0,
+    )
 
 
 _PANEL_SCOPED_EVENTS = {"panel.status", "panel.art", "panel.caption", "panel.image", "panel.note"}
@@ -461,42 +272,39 @@ async def _render_panel_resilient(
 ) -> tuple[str | None, str | None]:
     """Render one panel's picture, retrying real-backend failures up to IMAGE_PANEL_RETRIES
     times (each attempt also gets imagegen._post_retrying's own internal 429/5xx retries),
-    then falling back to the local stub placeholder so a panel always shows *something*.
+    then falling back to the local stub placeholder so a panel always shows *something*
+    (a2a_embed.call_resilient).
 
     Shared by the initial run (render_one, below) and /restyle — /restyle used to skip this
     retry loop entirely and call imagegen.render() exactly once, so a single transient
     failure (a 429, or any non-retried 4xx like a 422) cost a panel with zero chance to
     recover, unlike the initial run's panels.
     """
-    src: str | None = None
-    err: str | None = None
-    for attempt in range(1, IMAGE_PANEL_RETRIES + 1):
-        try:
-            async with sem:
-                src, err, _seed = await imagegen.render(prompt, style)
-        except Exception as exc:  # noqa: BLE001 — imagegen.render() shouldn't raise, but don't trust that blindly
-            log.exception("panel %s: unexpected image render error", panel_n)
-            src, err = None, f"{type(exc).__name__}: {exc}"
-        if src:
-            return src, None
-        if attempt < IMAGE_PANEL_RETRIES:
-            delay = min(6 * attempt, 20)
-            log.info("panel %s: render failed (%s) — retry %d/%d in %.0fs",
-                      panel_n, err, attempt, IMAGE_PANEL_RETRIES, delay)
-            await asyncio.sleep(delay)
-    log.warning("panel %s: no image after %d attempts (%s) — falling back to placeholder",
-                panel_n, IMAGE_PANEL_RETRIES, err)
-    try:
-        src = await imagegen.stub(prompt, style)
-        return src, None
-    except Exception:  # noqa: BLE001
-        log.exception("panel %s: placeholder fallback failed too", panel_n)
-        return None, err
+    async def _call() -> tuple[str | None, str | None]:
+        async with sem:
+            src, err, _seed = await imagegen.render(prompt, style)
+        return src, err
+
+    def _on_retry(attempt: int, err: str | None) -> None:
+        log.info("panel %s: render failed (%s) — retry %d/%d",
+                  panel_n, err, attempt, IMAGE_PANEL_RETRIES)
+
+    src, err = await call_resilient(
+        _call, lambda: imagegen.stub(prompt, style),
+        retries=IMAGE_PANEL_RETRIES, on_retry=_on_retry,
+    )
+    if not src:
+        log.warning("panel %s: no image after %d attempts (%s)", panel_n, IMAGE_PANEL_RETRIES, err)
+    return src, (None if src else err)
 
 
-async def stream_story(idea: str, style: str, panels: int):
+async def stream_story(idea: str = "", style: str = "", panels: int = 5):
     """Async-generate normalized events: instant opener, paced narrative, and images that
-    render concurrently and pop in as they finish (progressive reveal)."""
+    render concurrently and pop in as they finish (progressive reveal).
+
+    Defaults mirror the /events route's previous FastAPI-level defaults — the generic SSE
+    route (a2a_embed.server.sse_route) forwards raw query-string values, so this function
+    now owns its own defaults instead of relying on route parameter declarations."""
     total = max(3, min(int(panels or 5), 6))
     idea = (idea or "").strip() or "A sleepy bear tries to stay awake to see the first snow."
     style = (style or "").strip() or "Warm storybook · Painterly"
@@ -509,19 +317,16 @@ async def stream_story(idea: str, style: str, panels: int):
     for aid in ("critic", "artDirector", "imageGen", "editor"):
         yield {"t": "agent", "id": aid, "status": "idle", "say": "Standing by."}
 
-    # live_q/seen_live carry text-safe events out of the crew's single big A2A call AS IT
-    # WRITES, so the Crew panel and panel statuses animate in real time instead of the UI
-    # sitting frozen on "Contacting the crew…" for the whole call. See _collect_swarm_live.
-    live_q: asyncio.Queue = asyncio.Queue()
-    seen_live: set[str] = set()
+    # relay carries text-safe events out of the crew's single big A2A call AS IT WRITES, so
+    # the Crew panel and panel statuses animate in real time instead of the UI sitting frozen
+    # on "Contacting the crew…" for the whole call. See _run_story / _live_view above.
+    relay = LiveRelay(lambda ev: _live_view(ev, total))
     try:
-        collect_task = asyncio.create_task(
-            _collect_swarm_live(idea, style, total, team=TEAM, live_q=live_q, seen_live=seen_live)
-        )
-        async for live_ev in _drain_live(live_q):
+        collect_task = asyncio.create_task(_run_story(idea, style, total, team=TEAM, relay=relay))
+        async for live_ev in relay.drain():
             yield live_ev
         raw = await collect_task
-        events = _best_variants(raw)
+        events = best_variants(raw)
         if TEAM and len(events) < 5:
             # The team leader emitted ~no usable protocol at all — nothing worth patching,
             # so this is the one case that pays for a full single-agent redo. That redo is a
@@ -529,9 +334,10 @@ async def stream_story(idea: str, style: str, panels: int):
             # abandoned team attempt no longer describes it — clear it so the redo's own
             # panel statuses replay properly instead of being wrongly suppressed below.
             log.warning("team run produced ~no usable protocol — falling back to single-agent")
-            seen_live.clear()
-            raw = await _collect_swarm(idea, style, total, team=False)
-            events = _best_variants(raw)
+            relay.seen.clear()
+            fallback_relay = LiveRelay(lambda ev: None)
+            raw = await _run_story(idea, style, total, team=False, relay=fallback_relay)
+            events = best_variants(raw)
         elif TEAM and _incomplete_panels(events, total):
             # The team otherwise wrote a good story but silently skipped panel(s) — team mode
             # is deliberately capped at a lean panel count (see build_team_brief) to avoid the
@@ -551,7 +357,7 @@ async def stream_story(idea: str, style: str, panels: int):
                 )
                 fill_raw = await _collect_fill(idea, style, total, prior, missing)
                 fill_events = [
-                    ev for ev in _best_variants(fill_raw)
+                    ev for ev in best_variants(fill_raw)
                     if ev.get("t") in ("panel.art", "panel.caption") and ev.get("panel") in missing
                 ]
                 filled = {ev["panel"] for ev in fill_events if ev.get("t") == "panel.caption"} & \
@@ -569,16 +375,17 @@ async def stream_story(idea: str, style: str, panels: int):
                 # whatever was live-shown so far).
                 log.warning("fill still missing panel(s) %s after %d attempts — falling back to full single-agent run",
                             missing, FILL_RETRIES)
-                seen_live.clear()
-                raw = await _collect_swarm(idea, style, total, team=False)
-                events = _best_variants(raw)
+                relay.seen.clear()
+                fallback_relay = LiveRelay(lambda ev: None)
+                raw = await _run_story(idea, style, total, team=False, relay=fallback_relay)
+                events = best_variants(raw)
         events = _valid_panel_events(events, total)
         events = await _moderate_events(events)
-        if seen_live:
+        if relay.seen:
             # Don't replay-with-pacing what the viewer already watched happen live.
             events = [
                 ev for ev in events
-                if not (ev.get("t") in _LIVE_SAFE_TYPES and _identity(ev) in seen_live)
+                if not (ev.get("t") in _LIVE_SAFE_TYPES and identity(ev) in relay.seen)
             ]
     except Exception as exc:  # noqa: BLE001
         yield {"t": "error", "message": f"bridge/swarm error: {exc}"}
@@ -645,9 +452,7 @@ async def stream_story(idea: str, style: str, panels: int):
 
 # ----------------------------------- routes -------------------------------------
 
-@app.get("/health")
-async def health():
-    return JSONResponse({"ok": True, "a2a_url": A2A_URL})
+embed_server.add_health(app, extra=lambda: {"a2a_url": A2A_URL})
 
 
 def _decode_panels(data: dict) -> list[dict]:
@@ -759,30 +564,19 @@ async def regenerate_panel(request: Request):
     return JSONResponse({"src": src, "error": err})
 
 
-@app.get("/events")
-async def events(request: Request, idea: str = "", style: str = "", panels: int = 5):
-    async def sse():
-        try:
-            async for ev in stream_story(idea, style, panels):
-                if await request.is_disconnected():
-                    break
-                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
-        except asyncio.CancelledError:  # client went away
-            raise
-    return StreamingResponse(
-        sse(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+embed_server.sse_route(app, "/events", stream_story, guard=RUN_GUARD, token_env_var=API_TOKEN_ENV_VAR)
 
 
 # Static front-end at the root (added AFTER routes so /events and /health win).
-app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+embed_server.add_static(app, STATIC_DIR)
 
 
 if __name__ == "__main__":
+    import uvicorn
     print(f"[bridge] A2A_URL={A2A_URL}  static={STATIC_DIR}")
     print(f"[bridge] engine: {'native jiuwen_team (mode=team)' if TEAM else 'single-agent guided'}")
     print(f"[bridge] images: {imagegen.describe()}  (concurrency={IMAGE_CONCURRENCY})")
+    print(f"[bridge] auth: {'token required' if os.getenv(API_TOKEN_ENV_VAR) else 'open (no ' + API_TOKEN_ENV_VAR + ' set)'}"
+          f"  concurrency cap: {RUN_GUARD.max_concurrent or 'none'}")
     print(f"[bridge] open http://{BRIDGE_HOST}:{BRIDGE_PORT}/")
     uvicorn.run(app, host=BRIDGE_HOST, port=BRIDGE_PORT, log_level="info")

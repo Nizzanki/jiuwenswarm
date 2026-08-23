@@ -15,7 +15,9 @@ itself from the swarm's JSON.
 ## One engine
 
 The front-end renders entirely from a `state` model mutated by a single `apply(event)`
-reducer. Events come from `A2AEventSource`, which subscribes to the bridge's SSE stream — the
+reducer. Events come from `AgentEmbedSource` (`embed/agent-embed.js` — the one piece of this
+front-end that's generic enough to reuse in another app; see
+`docs/productization-architecture.md`), which subscribes to the bridge's SSE stream — the
 bridge runs a **real JiuwenSwarm story over A2A** and forwards normalized events that the
 reducer/renderers turn into panels, crew status, and the revision log.
 

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a2a-embed"
+version = "0.1.0"
+description = "Reusable transport/relay layer for bridging a browser front-end to a JiuwenSwarm agent or team over A2A"
+requires-python = ">=3.11,<3.14"
+license = { text = "Apache-2.0" }
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "a2a-sdk[http-server]==1.0.0",
+    "fastapi>=0.115",
+    "httpx>=0.27",
+    "starlette>=0.37",
+]
+
+[tool.setuptools]
+py-modules = []
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["a2a_embed*"]
+namespaces = false

@@ -96,6 +96,7 @@ harmony = [
     "json-repair>=0.30.0",
 ]
 a2a = ["a2a-sdk[http-server]==1.0.0"]
+a2a-embed = ["a2a-embed"]
 ssh = ["asyncssh>=2.14.0,<2.24"]
 desktop = ["pywebview>=5.4"]
 dev = ["pyinstaller>=6.0.0", "pywebview>=5.4"]
@@ -177,6 +178,7 @@ default-groups = ['dev']
 
 [tool.uv.sources]
 jiuwenswarm-tui = { path = "./packages/jiuwenswarm-tui" }
+a2a-embed = { path = "./packages/a2a-embed" }
 openjiuwen = { git = "https://gitcode.com/openJiuwen/agent-core.git", branch = "develop" }
 
 [dependency-groups]
