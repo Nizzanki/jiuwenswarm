@@ -123,6 +123,25 @@ Inbound A2A `message.parts` are mapped into internal `Message.params.query` and 
 
 **Separating reasoning from the answer**: reasoning content never enters the `response` artifact. By default (`A2A_SERVER_EXPOSE_REASONING` enabled) it is emitted as working-state `TaskStatusUpdateEvent`s whose `status.message.parts[].metadata` carries `{"jiuwen_thought": true}` (mirroring Google ADK's `adk_thought` convention), so callers can structurally render or ignore it. Set to `false`/`0`/`no`/`off` to drop it.
 
+### 6.3 Metadata: empty is safe, `mode` routes to team
+
+- Request-level `Message.metadata` is always normalized to `{}` (never `None`) before it
+  reaches internal routing, whether the caller sends no metadata at all or an explicit empty
+  object — see `A2AChannel.dispatch_a2a_request` and `_A2AAgentExecutor.execute` in
+  `a2a_connect.py`. Sending non-empty metadata (e.g. `{"source": "my-app"}`) is still good
+  practice for observability on the gateway side, but it's no longer required to avoid a
+  crash.
+- A `mode` key in that metadata (e.g. `{"mode": "team"}`) is copied into the internal
+  request's `params.mode`, routing to JiuwenSwarm's native team mode (a real leader that
+  spawns teammates) instead of a single default agent — see `dispatch_a2a_request`. Omit it
+  (or send anything else) to get the single-agent default.
+- Team-mode runs have a generic per-agent ceiling (`max_iterations=200`,
+  `completion_timeout=600s` by default — `jiuwenswarm/agents/harness/team/config_loader.py`),
+  channel-agnostic and not currently overridable per A2A request. An unconstrained team brief
+  can still take a long time even within that bound; keep briefs lean if your caller needs
+  fast turnaround (see `demos/inkwell-studio/server/prompt.py`'s `build_team_brief` for a
+  worked example of deliberately capping scope to avoid this).
+
 ---
 
 ## 7. Outbound A2A (Agent Side)
@@ -133,11 +152,21 @@ Inbound A2A `message.parts` are mapped into internal `Message.params.query` and 
 
 ## 8. Local Verification (Examples)
 
+**The `A2A-Version` header is required.** The installed a2a-sdk (1.0) validates a
+`A2A-Version` request header (`a2a.utils.constants.VERSION_HEADER`) against
+`PROTOCOL_VERSION_1_0` (`"1.0"`); if the header is missing, the request is treated as
+protocol `"0.3"` and rejected with `VersionNotSupportedError` (see
+`a2a.utils.version_validator.validate_version`, applied to the streaming handler). This is
+easy to miss — the method names and body shape below are otherwise correct as written, and
+a request built without this header fails with a version error that doesn't obviously point
+at "add a header."
+
 Non-streaming:
 
 ```bash
 curl -sS -X POST "http://127.0.0.1:${A2A_SERVER_PORT:-19100}${A2A_SERVER_PATH:-/a2a}" \
   -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
   -d '{"jsonrpc":"2.0","id":"t1","method":"SendMessage","params":{"message":{"messageId":"m1","contextId":"c1","role":"ROLE_USER","parts":[{"text":"ping"}]}}}'
 ```
 
@@ -146,14 +175,33 @@ Streaming:
 ```bash
 curl -sS -N -X POST "http://127.0.0.1:${A2A_SERVER_PORT:-19100}${A2A_SERVER_PATH:-/a2a}" \
   -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
   -d '{"jsonrpc":"2.0","id":"t2","method":"SendStreamingMessage","params":{"message":{"messageId":"m2","contextId":"c2","role":"ROLE_USER","parts":[{"text":"ping"}]}}}'
 ```
 
 Start both AgentServer and Gateway, and ensure `A2A_SERVER_ENABLED=true`.
 
+**Python client (what a real integration should use):** the `a2a-sdk` Python client sets
+this header itself, so it's the tested, verified path rather than hand-built JSON-RPC — see
+`packages/a2a-embed/a2a_embed/client.py`'s `run_agent` (used by
+`demos/inkwell-studio/server/bridge.py`) for a complete, working example:
+
+```python
+from a2a.client import ClientConfig, create_client
+from a2a.helpers import new_text_message
+from a2a.types import SendMessageRequest
+
+client = await create_client(a2a_url, ClientConfig(streaming=True, httpx_client=hx))
+msg = new_text_message("ping", context_id="c1", role=1)   # 1 = ROLE_USER
+req = SendMessageRequest(message=msg)
+req.metadata.update({"source": "my-app"})                 # see 6.3 -- empty is safe, but be a good citizen
+async for resp in client.send_message(req):
+    ...
+```
+
 ---
 
 ## 9. Known Extension Points
 
-- Authentication, rate limit, timeout, and observability metrics are better enforced by gateway or upstream proxy, while keeping `A2AChannel` focused on protocol/message mapping.
+- Authentication, rate limit, timeout, and observability metrics are better enforced by gateway or upstream proxy, while keeping `A2AChannel` focused on protocol/message mapping. `packages/a2a-embed/` is a ready-made bridge-layer implementation of this (Bearer-token auth, CORS, a concurrency guard) for a browser-facing bridge sitting in front of `A2AChannel` — see its README and `demos/inkwell-studio/server/bridge.py` for a working example, rather than building this from scratch per integration.
 - If `jiuwenswarm/resources/.env.template` does not include A2A/ACP keys, append them manually in local `.env` (consistent with section 2).

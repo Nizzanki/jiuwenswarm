@@ -1,8 +1,12 @@
 // Inkwell Studio controller.
 //
 // The UI renders entirely from `state`, which is mutated by apply(event). Events arrive
-// from an event source with a start(onEvent)/stop() interface: A2AEventSource (SSE from the
-// bridge, which runs a real JiuwenSwarm story over A2A).
+// from an event source with a start(onEvent)/stop() interface: AgentEmbedSource (SSE from
+// the bridge, which runs a real JiuwenSwarm story over A2A) -- see embed/agent-embed.js for
+// why that class lives in its own file (it's the one genuinely reusable piece of this app's
+// front-end; everything below is Inkwell-specific).
+
+import { AgentEmbedSource } from './embed/agent-embed.js';
 
 const AGENT_LABELS = { imageGen: 'tool' };
 
@@ -72,40 +76,6 @@ function narrateStop() {
   if (SPEECH_SUPPORTED) speechSynthesis.cancel();
 }
 
-/* ------------------------------- event source -------------------------------- */
-// Interface: start(onEvent) begins emitting; stop() cancels.
-// Subscribes to the bridge's SSE endpoint, which streams normalized events parsed from a
-// real swarm run over A2A.
-class A2AEventSource {
-  constructor(brief, { onFatal } = {}) {
-    this.brief = brief; this.onFatal = onFatal; this.es = null; this.got = 0; this.done = false;
-  }
-  start(onEvent) {
-    const q = new URLSearchParams({
-      idea: this.brief.idea, style: this.brief.style, panels: String(this.brief.total),
-    });
-    let es;
-    try { es = new EventSource(`/events?${q.toString()}`); }
-    catch { this.onFatal && this.onFatal('Could not open a live connection.'); return; }
-    this.es = es;
-    es.onmessage = (e) => {
-      let ev; try { ev = JSON.parse(e.data); } catch { return; }
-      this.got += 1;
-      if (ev.t === 'error') { onEvent({ t: 'agent', id: 'editor', status: 'reject', say: ev.message }); return; }
-      if (ev.t === 'run.done') this.done = true;
-      onEvent(ev);
-      if (this.done) this.stop();
-    };
-    es.onerror = () => {
-      if (this.done) { this.stop(); return; }              // normal close after run.done
-      this.stop();
-      if (this.got === 0) this.onFatal && this.onFatal('Live bridge not reachable — is server/bridge.py running?');
-      else onEvent({ t: 'run.done' });                     // mid-stream drop: end the run cleanly
-    };
-  }
-  stop() { if (this.es) { this.es.close(); this.es = null; } }
-}
-
 /* --------------------------------- the state -------------------------------- */
 
 const AGENT_ORDER = ['writer', 'critic', 'artDirector', 'imageGen', 'editor'];
@@ -153,6 +123,13 @@ const typers = {};         // panel n -> { cancelled } token for the caption typ
 
 function apply(ev) {
   switch (ev.t) {
+    // A bridge/swarm-side failure (see server/bridge.py's stream_story). Surfaced as the
+    // Editor rejecting, rather than a generic toast, so it reads as part of the crew's own
+    // story instead of a bolted-on error banner.
+    case 'error':
+      apply({ t: 'agent', id: 'editor', status: 'reject', say: ev.message });
+      return;
+
     case 'brief':
       state.brief = { idea: ev.idea, style: ev.style, total: ev.total };
       renderBrief();
@@ -542,7 +519,15 @@ function startRun() {
   const go = $('go');
   go.textContent = 'Running…'; go.classList.add('running'); go.classList.remove('again'); go.disabled = true;
 
-  source = new A2AEventSource(state.brief, { onFatal: abortRun });
+  // EMBED_TOKEN: opt-in, read once from ?token= on this page's own URL (see the bottom of
+  // this file). Only useful once the bridge is started with INKWELL_API_TOKEN set -- unset
+  // by default, so this demo keeps working with zero config. A real embed of a token-gated
+  // bridge on someone else's page would have its own way to obtain a scoped token; a query
+  // param on Inkwell's own URL is just the simplest thing that lets this be tested end-to-end.
+  source = new AgentEmbedSource(
+    { idea, style, panels: String(total) },
+    { onFatal: abortRun, token: EMBED_TOKEN },
+  );
   source.start(apply);
 }
 
@@ -1070,6 +1055,8 @@ if (!SPEECH_SUPPORTED) {
 }
 
 const params = new URLSearchParams(location.search);
+// See startRun()'s EMBED_TOKEN comment: only meaningful once the bridge requires one.
+const EMBED_TOKEN = params.get('token') || null;
 renderAll();   // show the idle crew / progress on load
 
 // dev/demo aid: open with ?autorun=1 to start a run immediately on load

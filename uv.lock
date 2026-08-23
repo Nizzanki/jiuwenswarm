@@ -14,6 +14,25 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "a2a-embed"
+version = "0.1.0"
+source = { directory = "packages/a2a-embed" }
+dependencies = [
+    { name = "a2a-sdk", extra = ["http-server"] },
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "starlette" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "a2a-sdk", extras = ["http-server"], specifier = "==1.0.0" },
+    { name = "fastapi", specifier = ">=0.115" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "starlette", specifier = ">=0.37" },
+]
+
+[[package]]
 name = "a2a-sdk"
 version = "1.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -5903,6 +5922,9 @@ dependencies = [
 a2a = [
     { name = "a2a-sdk", extra = ["http-server"] },
 ]
+a2a-embed = [
+    { name = "a2a-embed" },
+]
 claude = [
     { name = "openjiuwen", extra = ["claude"] },
 ]
@@ -6012,6 +6034,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
+    { name = "a2a-embed", marker = "extra == 'a2a-embed'", directory = "packages/a2a-embed" },
     { name = "a2a-sdk", extras = ["http-server"], marker = "extra == 'a2a'", specifier = "==1.0.0" },
     { name = "a2a-sdk", extras = ["http-server"], marker = "extra == 'test'", specifier = "==1.0.0" },
     { name = "a2ui-agent-sdk", specifier = "==0.2.1" },
@@ -6121,7 +6144,7 @@ requires-dist = [
     { name = "wecom-aibot-sdk", marker = "extra == 'harmony'", specifier = ">=1.0.5" },
     { name = "workswarm-tui", marker = "extra == 'tui'", directory = "packages/jiuwenswarm-tui" },
 ]
-provides-extras = ["harmony", "a2a", "ssh", "desktop", "dev", "tui", "distribute", "claude", "codex", "shell-ast", "test"]
+provides-extras = ["harmony", "a2a", "a2a-embed", "ssh", "desktop", "dev", "tui", "distribute", "claude", "codex", "shell-ast", "test"]
 
 [package.metadata.requires-dev]
 dev = [
