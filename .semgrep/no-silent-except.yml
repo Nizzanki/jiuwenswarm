@@ -56,4 +56,4 @@ rules:
         - jiuwenswarm/agents/harness/common/auto_harness/scheduler.py
         # Telemetry helper must never propagate.
         - jiuwenswarm/common/errors.py
-        - tests/*
+        - tests/**
