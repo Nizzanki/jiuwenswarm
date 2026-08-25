@@ -479,7 +479,8 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
             raise RuntimeError("sys_operation is not available, maybe task is not running")
         self._sys_operation = sys_operation
 
-        configured_subagents, _should_add_general = self._build_configured_subagents(model, config, config_base)
+        configured_subagents, should_add_general_agent = self._build_configured_subagents(model, config, config_base)
+        should_enable_general_agent = should_add_general_agent and sub_mode == "team"
         configured_subagents = configured_subagents or []
 
         workspace = Workspace(
@@ -499,6 +500,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
             system_prompt=build_code_system_prompt(),
             tools=tool_cards if tool_cards else [],
             subagents=configured_subagents,
+            add_general_purpose_agent=should_enable_general_agent,
             rails=rails_list if rails_list else [],
             enable_task_loop=config.get("enable_task_loop", True),
             max_iterations=config.get("max_iterations", 15),
@@ -933,6 +935,11 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
         resolved_language = self._resolve_runtime_language()
         workspace = self._workspace_dir or "./"
         subagents: list[Any] = []
+        should_add_general_purpose = False
+        if isinstance(subagents_cfg, dict):
+            general_agent_cfg = subagents_cfg.get("general_agent")
+            if self._is_subagent_enabled(general_agent_cfg):
+                should_add_general_purpose = True
 
         # ── 固定挂载：explore_agent（Code 模式核心子代理，始终启用）──
         if not self._subagent_list_has_name(subagents, "explore_agent"):
@@ -1048,7 +1055,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
         # 不走 SubagentRail 的 task_tool 路径。
         # （agent.plan / agent.fast 模式仍由 interface_deep.py 的 _load_custom_subagents 管理）
 
-        return subagents or None, False
+        return subagents or None, should_add_general_purpose
 
     # ─── Rail 生命周期(mode切换) ───────────────────
 
