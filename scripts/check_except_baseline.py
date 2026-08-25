@@ -59,12 +59,20 @@ EXCLUDED_DIR_NAMES = {
     ".semgrep",
 }
 
+# Test code is exempt from the broad-except ratchet, mirroring the semgrep
+# rule's `paths.exclude: tests/**` (.semgrep/no-silent-except.yml). Only the
+# top-level `tests/` directory is excluded here.
+EXCLUDED_TOP_LEVEL_DIRS = {"tests"}
+
 
 def count_broad_excepts() -> tuple[int, dict[str, int]]:
     total = 0
     per_file: dict[str, int] = {}
     for path in REPO_ROOT.rglob("*.py"):
         if any(part in EXCLUDED_DIR_NAMES for part in path.parts):
+            continue
+        rel = path.relative_to(REPO_ROOT)
+        if rel.parts[0] in EXCLUDED_TOP_LEVEL_DIRS:
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
@@ -73,7 +81,7 @@ def count_broad_excepts() -> tuple[int, dict[str, int]]:
         n = len(PATTERN.findall(text))
         if n:
             total += n
-            per_file[str(path.relative_to(REPO_ROOT))] = n
+            per_file[str(rel)] = n
     return total, per_file
 
 
