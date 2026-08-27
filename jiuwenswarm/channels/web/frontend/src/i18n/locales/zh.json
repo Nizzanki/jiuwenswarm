@@ -567,7 +567,12 @@
       "aggregated": "聚合",
       "expanded": "展开",
       "runs": "次运行",
-      "failed": "（失败）"
+      "failed": "（失败）",
+      "zoomIn": "放大",
+      "zoomOut": "缩小",
+      "fit": "适应",
+      "fitTooltip": "缩放图谱以适应面板宽度",
+      "actualSize": "原始大小（1:1）"
     },
     "highlights": {
       "title": "亮点",

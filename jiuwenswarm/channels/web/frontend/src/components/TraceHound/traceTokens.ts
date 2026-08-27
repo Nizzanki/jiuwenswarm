@@ -16,6 +16,7 @@ export const C = {
   teal: 'var(--color-trace-teal)',
   surface: 'var(--color-trace-surface)',
   surfaceMuted: 'var(--color-trace-surface-muted)',
+  panel: 'var(--color-surface-panel)',
   border: 'var(--color-trace-border)',
   borderStrong: 'var(--color-trace-border-strong)',
   text: 'var(--color-trace-text)',

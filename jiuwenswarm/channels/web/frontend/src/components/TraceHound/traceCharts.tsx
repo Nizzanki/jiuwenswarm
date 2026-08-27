@@ -1,6 +1,7 @@
 import { useTranslation } from 'react-i18next';
 import type { HistoryRecord, TurnSummary } from '../../stores/traceHoundStore';
 import { C, cat } from './traceTokens';
+import { useElementWidth } from './useElementWidth';
 
 export const EVENT_COLORS: Record<string, string> = {
   user: C.info,
@@ -13,10 +14,12 @@ export const EVENT_COLORS: Record<string, string> = {
   'chat.error': C.danger,
 };
 
-/** Horizontal wall-clock strip of one turn's records (SVG, token-colored). */
+/** Horizontal wall-clock strip of one turn's records (SVG, token-colored).
+ *  The viewBox width tracks the container's measured pixel width so one SVG
+ *  unit stays one CSS px at any pane size (no shrink-to-fit miniaturization). */
 export function TimelineBand({
   records,
-  height = 44,
+  height = 48,
   onClickRecord,
 }: {
   records: HistoryRecord[];
@@ -24,37 +27,37 @@ export function TimelineBand({
   onClickRecord?: (r: HistoryRecord) => void;
 }) {
   const { t } = useTranslation();
+  const [wrapRef, wrapW] = useElementWidth<HTMLDivElement>();
   const pts = records.filter(r => (r.timestamp ?? 0) > 0);
   if (pts.length === 0) return null;
   const t0 = Math.min(...pts.map(r => r.timestamp!));
   const t1 = Math.max(...pts.map(r => r.timestamp!));
   const span = Math.max(t1 - t0, 0.001);
-  const W = 600;
+  // Floor so ultra-narrow panes don't squeeze dots together (scrolls instead).
+  const W = Math.max(Math.round(wrapW), 320);
   const cy = height / 2;
   return (
-    <svg viewBox={`0 0 ${W} ${height}`} style={{ width: '100%', height }} role="img">
-      <line x1={0} y1={cy} x2={W} y2={cy} stroke={C.border} strokeWidth={1} />
-      {pts.map((r, i) => {
-        const x = ((r.timestamp! - t0) / span) * (W - 8) + 4;
-        const et = r.role === 'user' ? 'user' : (r.event_type ?? '');
-        const color = EVENT_COLORS[et] ?? C.textFaint;
-        const failed = r.event_type === 'chat.tool_result' && (r.result ?? '').includes('success=False');
-        return (
-          <circle
-            key={i}
-            cx={x}
-            cy={cy}
-            r={failed ? 5 : 3.5}
-            fill={failed ? C.danger : color}
-            opacity={0.9}
-            style={{ cursor: onClickRecord ? 'pointer' : 'default' }}
-            onClick={() => onClickRecord?.(r)}
-          >
-            <title>{`${et} @ +${(r.timestamp! - t0).toFixed(1)}s${failed ? ` ${t('traceHound.graph.failed')}` : ''}`}</title>
-          </circle>
-        );
-      })}
-    </svg>
+    <div ref={wrapRef}>
+      <svg viewBox={`0 0 ${W} ${height}`} width="100%" height={height} role="img">
+        <line x1={0} y1={cy} x2={W} y2={cy} stroke={C.border} strokeWidth={1} />
+        {pts.map((r, i) => {
+          const x = ((r.timestamp! - t0) / span) * (W - 12) + 6;
+          const et = r.role === 'user' ? 'user' : (r.event_type ?? '');
+          const color = EVENT_COLORS[et] ?? C.textFaint;
+          const failed = r.event_type === 'chat.tool_result' && (r.result ?? '').includes('success=False');
+          const title = `${et} @ +${(r.timestamp! - t0).toFixed(1)}s${failed ? ` ${t('traceHound.graph.failed')}` : ''}`;
+          return (
+            <g key={i} style={{ cursor: onClickRecord ? 'pointer' : 'default' }} onClick={() => onClickRecord?.(r)}>
+              {/* generous invisible hit target keeps dots clickable */}
+              <circle cx={x} cy={cy} r={9} fill="transparent">
+                <title>{title}</title>
+              </circle>
+              <circle cx={x} cy={cy} r={failed ? 6 : 5} fill={failed ? C.danger : color} opacity={0.9} pointerEvents="none" />
+            </g>
+          );
+        })}
+      </svg>
+    </div>
   );
 }
 

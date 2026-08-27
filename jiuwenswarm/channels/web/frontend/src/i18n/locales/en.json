@@ -582,7 +582,12 @@
       "aggregated": "Aggregated",
       "expanded": "Expanded",
       "runs": "runs",
-      "failed": "(failed)"
+      "failed": "(failed)",
+      "zoomIn": "Zoom in",
+      "zoomOut": "Zoom out",
+      "fit": "Fit",
+      "fitTooltip": "Scale graph to fit the pane width",
+      "actualSize": "Actual size (1:1)"
     },
     "highlights": {
       "title": "Highlights",

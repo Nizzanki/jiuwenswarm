@@ -48,3 +48,23 @@ test('aggregated: same-name tools collapse with counter + cycle', () => {
   assert.equal(tools[0].count, 2);
   assert.ok(g.edges.some(e => e.kind === 'cycle'));
 });
+
+test('aggregated: nodes keep first-appearance order (no rank-0 pile on cycles)', () => {
+  // user→final→grep→final→grep→final: seq edges contain a final⇄grep cycle.
+  // The graph must still emit every node distinctly, in record order — the
+  // renderer derives columns from node order, so duplicates here would stack.
+  const cyclic = [
+    rec({ id: 'u1', role: 'user', content: 'go', timestamp: 1 }),
+    rec({ id: 'f1', event_type: 'chat.final', role: 'assistant', content: 'a', timestamp: 2 }),
+    rec({ id: 't1', event_type: 'chat.tool_call', timestamp: 3, tool_name: 'grep', tool_call: { id: 'tc1', name: 'grep', arguments: '{}' } }),
+    rec({ id: 'f2', event_type: 'chat.final', role: 'assistant', content: 'b', timestamp: 4 }),
+    rec({ id: 't2', event_type: 'chat.tool_call', timestamp: 5, tool_name: 'grep', tool_call: { id: 'tc2', name: 'grep', arguments: '{}' } }),
+    rec({ id: 'f3', event_type: 'chat.final', role: 'assistant', content: 'c', timestamp: 6 }),
+  ];
+  const g = buildGraph(cyclic, 'aggregated');
+  // one collapsed node per (kind,label): user, final, grep — nothing merged away
+  assert.deepEqual(g.nodes.map(n => n.label), ['user', 'final', 'grep']);
+  // counts preserved on the collapsed nodes
+  assert.equal(g.nodes.find(n => n.label === 'final')?.count, 3);
+  assert.equal(g.nodes.find(n => n.label === 'grep')?.count, 2);
+});

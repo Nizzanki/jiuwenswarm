@@ -1782,6 +1782,7 @@ function RecordCard({ rec, displayDelta, endDelta, allRecords, expandAll = false
   const collapsible = !isUser;
   const [local, setLocal] = useState<boolean | null>(null);
   const shown = local ?? (expandAll ? true : false);
+  const [userFull, setUserFull] = useState(false);
 
   // displayDelta is computed by TurnDetailView and tracks time within the current attempt,
   // resetting to 0 at the start of each attempt (after a gap separator). This avoids showing
@@ -1823,12 +1824,29 @@ function RecordCard({ rec, displayDelta, endDelta, allRecords, expandAll = false
         {rec.id && <span style={{ fontSize: 9, color: C.borderStrong, fontFamily: 'monospace', flexShrink: 0 }} title={t('traceHound.records.recordId', { id: rec.id })}>{rec.id.replace(/:(assistant|user)$/, '').slice(-12)}</span>}
       </div>
 
-      {/* User message — always visible */}
-      {key === 'user' && bodyText && (
-        <div style={{ padding: '8px 12px', fontSize: 13, color: C.text, whiteSpace: 'pre-wrap', wordBreak: 'break-word', borderTop: `1px solid ${subtle}` }}>
-          {bodyText}
-        </div>
-      )}
+      {/* User message — visible but clamped (~6 lines) so a huge IDE-context
+       *  payload doesn't bury the whole records list; toggle shows the full text */}
+      {key === 'user' && bodyText && (() => {
+        const long = bodyText.length > 300 || bodyText.split('\n').length > 6;
+        return (
+          <>
+            <div style={{
+              padding: '8px 12px', fontSize: 13, color: C.text, whiteSpace: 'pre-wrap', wordBreak: 'break-word', borderTop: `1px solid ${subtle}`,
+              ...(long && !userFull ? { maxHeight: 108, overflow: 'hidden', WebkitMaskImage: 'linear-gradient(180deg, #000 70%, transparent)', maskImage: 'linear-gradient(180deg, #000 70%, transparent)' } : {}),
+            }}>
+              {bodyText}
+            </div>
+            {long && (
+              <button
+                onClick={() => setUserFull(x => !x)}
+                style={{ margin: '0 12px 8px', padding: '2px 10px', fontSize: 11, borderRadius: 6, border: `1px solid ${C.border}`, background: C.surfaceMuted, color: C.textMuted, cursor: 'pointer' }}
+              >
+                {userFull ? t('traceHound.records.collapse') : t('traceHound.records.showFull')}
+              </button>
+            )}
+          </>
+        );
+      })()}
       {/* Final response — collapsed by default, expand on click */}
       {key === 'chat.final' && shown && bodyText && (
         <div style={{ padding: '8px 12px', fontSize: 13, color: C.text, whiteSpace: 'pre-wrap', wordBreak: 'break-word', borderTop: `1px solid ${subtle}` }}>
@@ -2232,28 +2250,54 @@ export function TurnDetailView() {
   };
 
   return (
-    <div style={panelStyle} ref={panelRef} onScroll={e => setShowTop((e.target as HTMLDivElement).scrollTop > 400)}>
-      <div style={headerStyle}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
-          <button style={btnStyle} onClick={back}>{t('traceHound.back')}</button>
-          <div style={{ minWidth: 0 }}>
-            <h2 style={{ ...titleStyle, marginBottom: 0, fontSize: 15 }}>
-              {t('traceHound.turnDetail.title', { index: (turn?.turn_index ?? 0) + 1 })}
-              {selectedSession?.title && <span style={{ fontWeight: 400, color: C.textMuted, fontSize: 13, marginLeft: 8 }}>— {selectedSession.title}</span>}
-            </h2>
-            {turn?.timestamp && (
-              <div style={{ fontSize: 11, color: C.textFaint, marginTop: 2 }}>
-                {fmtDateTime(turn.timestamp)}
-                {/* Don't show total wall-time duration for retried turns — it includes idle gaps between retries */}
-                {turn.duration_seconds > 0 && turn.retry_count <= 1 && (
-                  <span style={{ marginLeft: 8 }}>· {fmtDuration(turn.duration_seconds)}</span>
-                )}
-              </div>
-            )}
-          </div>
+    <div style={{ height: '100%', width: '100%', flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, fontFamily: 'var(--font-family, sans-serif)' }}>
+      {/* Action bar — pinned above the scroll area so Expand/downloads stay
+       *  reachable at any pane width (they used to drown in wrapped stat chips). */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', padding: '12px 24px 10px', borderBottom: `1px solid ${C.border}`, background: C.panel, flexShrink: 0 }}>
+        <button style={btnStyle} onClick={back}>{t('traceHound.back')}</button>
+        <div style={{ minWidth: 0, flex: '1 1 200px' }}>
+          <h2 style={{ ...titleStyle, marginBottom: 0, fontSize: 15, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {t('traceHound.turnDetail.title', { index: (turn?.turn_index ?? 0) + 1 })}
+            {selectedSession?.title && <span style={{ fontWeight: 400, color: C.textMuted, fontSize: 13, marginLeft: 8 }}>{selectedSession.title}</span>}
+          </h2>
+          {turn?.timestamp && (
+            <div style={{ fontSize: 11, color: C.textFaint, marginTop: 2 }}>
+              {fmtDateTime(turn.timestamp)}
+              {/* Don't show total wall-time duration for retried turns — it includes idle gaps between retries */}
+              {turn.duration_seconds > 0 && turn.retry_count <= 1 && (
+                <span style={{ marginLeft: 8 }}>· {fmtDuration(turn.duration_seconds)}</span>
+              )}
+            </div>
+          )}
         </div>
-        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', flexShrink: 0 }}>
-          {turn && <OutcomeBadge outcome={turn.outcome} issues={turn.issues} t={t} />}
+        {turn && <OutcomeBadge outcome={turn.outcome} issues={turn.issues} t={t} />}
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexShrink: 0 }}>
+          <button style={{ ...btnStyle, fontSize: 12 }} title={expandAll ? t('traceHound.turnDetail.collapseAllTooltip') : t('traceHound.turnDetail.expandAllTooltip')}
+            onClick={() => setExpandAll(x => !x)}
+            disabled={turnRecords.length === 0}>
+            {expandAll ? t('traceHound.turnDetail.collapseAll') : t('traceHound.turnDetail.expandAll')}
+          </button>
+          <button style={{ ...btnStyle, fontSize: 12 }} title={t('traceHound.turnDetail.downloadJsonTooltip')}
+            onClick={() => downloadJson(turnRecords, `turn-${selectedTurnId?.slice(0, 8) ?? 'export'}.json`)}
+            disabled={turnRecords.length === 0}>
+            {t('traceHound.turnDetail.downloadJson')}
+          </button>
+          <button style={{ ...btnStyle, fontSize: 12 }} title={t('traceHound.turnDetail.downloadPageTooltip')}
+            onClick={downloadPage}
+            disabled={turnRecords.length === 0}>
+            {t('traceHound.turnDetail.downloadPage')}
+          </button>
+          <button style={{ ...btnStyle, fontSize: 12 }} title={t('traceHound.turnDetail.downloadMdTooltip')}
+            onClick={downloadMd}
+            disabled={turnRecords.length === 0}>
+            {t('traceHound.turnDetail.downloadMd')}
+          </button>
+        </div>
+      </div>
+
+      <div style={{ ...panelStyle, minHeight: 0, paddingTop: 12 }} ref={panelRef} onScroll={e => setShowTop((e.target as HTMLDivElement).scrollTop > 400)}>
+        {/* Turn stat chips — wrap freely, never force the pane wide */}
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', minWidth: 0, marginBottom: 10 }}>
           {turn && turn.total_tokens > 0 && <span style={chipStyle}>{t('traceHound.messages.tokens', { count: turn.total_tokens.toLocaleString() })}</span>}
           {turn && turn.llm_call_count > 0 && <span style={chipStyle}>{t('traceHound.messages.llmCalls', { count: turn.llm_call_count })}</span>}
           {turn && turn.tool_names.length > 0 && <span style={{ ...chipStyle, color: C.warn, background: C.warnSubtle, border: `1px solid ${C.warnSubtle}` }}>{t('traceHound.turnDetail.tools', { count: turn.tool_names.length })}</span>}
@@ -2281,28 +2325,7 @@ export function TurnDetailView() {
               </span>
             </Tooltip>
           )}
-          <button style={{ ...btnStyle, fontSize: 12 }} title={expandAll ? t('traceHound.turnDetail.collapseAllTooltip') : t('traceHound.turnDetail.expandAllTooltip')}
-            onClick={() => setExpandAll(x => !x)}
-            disabled={turnRecords.length === 0}>
-            {expandAll ? t('traceHound.turnDetail.collapseAll') : t('traceHound.turnDetail.expandAll')}
-          </button>
-          <button style={{ ...btnStyle, fontSize: 12 }} title={t('traceHound.turnDetail.downloadJsonTooltip')}
-            onClick={() => downloadJson(turnRecords, `turn-${selectedTurnId?.slice(0, 8) ?? 'export'}.json`)}
-            disabled={turnRecords.length === 0}>
-            {t('traceHound.turnDetail.downloadJson')}
-          </button>
-          <button style={{ ...btnStyle, fontSize: 12 }} title={t('traceHound.turnDetail.downloadPageTooltip')}
-            onClick={downloadPage}
-            disabled={turnRecords.length === 0}>
-            {t('traceHound.turnDetail.downloadPage')}
-          </button>
-          <button style={{ ...btnStyle, fontSize: 12 }} title={t('traceHound.turnDetail.downloadMdTooltip')}
-            onClick={downloadMd}
-            disabled={turnRecords.length === 0}>
-            {t('traceHound.turnDetail.downloadMd')}
-          </button>
         </div>
-      </div>
 
       {/* Wall-clock strip of this turn's records — click a dot to jump to its card */}
       <TimelineBand
@@ -2364,6 +2387,7 @@ export function TurnDetailView() {
           ↑
         </button>
       )}
+      </div>
     </div>
   );
 }
