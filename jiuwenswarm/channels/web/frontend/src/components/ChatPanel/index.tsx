@@ -35,6 +35,7 @@ import { isTeamLeaderMember, type TeamMemberIdentity } from '../../utils/teamMem
 import { TeamMemberAvatar } from '../TeamMemberAvatar';
 import beeBanner from '../../assets/蜜蜂.svg';
 import './ChatPanel.css';
+import TracehoundIcon from '../../assets/sidebar/tracehound.svg?react';
 import { CodeChangesCard } from '../../features/code-mode/CodeChangesCard';
 import { useCodeTurnDiffHistory } from '../../features/code-mode/useCodeTurnDiffHistory';
 import { turnDiffKey } from '../../features/code-mode/turnChangeState';
@@ -104,6 +105,8 @@ interface ChatPanelProps {
   onToggleTeamArea?: (expanded: boolean | null) => void;
   /** 打开右侧面板并切换到代码审核 Tab */
   onOpenCodeReview?: (target: CodeReviewTarget) => void;
+  /** 在右侧面板打开当前会话的 TraceHound Trajectory */
+  onOpenTrace?: () => void;
   permissionsEnabled: boolean;
   /** 心跳面板展开状态：由 App.tsx 统一管理，跟团队/代码审核面板一样占用右侧工作区一栏 */
   heartbeatPanelOpen?: boolean;
@@ -764,6 +767,7 @@ export function ChatPanel({
   onOpenCodeReview,
   heartbeatPanelOpen = false,
   onToggleHeartbeatPanel,
+  onOpenTrace,
   permissionsEnabled,
   onSavePermission,
   onSetGoal,
@@ -836,6 +840,7 @@ export function ChatPanel({
   const shareExportTitle = getShareExportTitle(t, isExportingShare, canExportShare);
   const shouldShowShareExport = Boolean(onExportShare);
   const shouldShowHumanShare = mode === 'team' && teamHumanShareCommands.length > 0;
+  const shouldShowTrace = Boolean(onOpenTrace) && Boolean(activeSessionId) && activeSessionId !== NEW_CONVERSATION_ID;
   const [humanShareOpen, setHumanShareOpen] = React.useState(false);
   // 新会话占位符 'new' 还没有真实 session_id，隐藏心跳入口，见接口规格说明 §16.2
   const heartbeatAvailable = Boolean(activeSessionId && activeSessionId !== NEW_CONVERSATION_ID);
@@ -1317,6 +1322,17 @@ export function ChatPanel({
                 title={t('heartbeat.panel.title')}
               >
                 <Activity size={14} strokeWidth={2} />
+              </button>
+            )}
+            {shouldShowTrace && (
+              <button
+                type="button"
+                className="chat-header-icon-btn"
+                data-testid="chat-panel-trace-trigger"
+                onClick={() => onOpenTrace?.()}
+                title={t('traceHound.trajectoryPanel')}
+              >
+                <TracehoundIcon width={14} height={14} style={{ display: 'block' }} aria-hidden />
               </button>
             )}
             <button

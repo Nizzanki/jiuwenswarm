@@ -42,6 +42,8 @@ export interface Session {
   user_id?: string;            // 创建人ID
   last_message_at?: number;    // 最近对话时间(Unix时间戳)
   last_user_message_at?: number; // 最后一条用户消息时间(Unix时间戳)
+  round_id?: number;           // LLM 轮次/回合数
+  total_tokens?: number;       // 累计 token 消耗
 }
 
 export type AgentMode =

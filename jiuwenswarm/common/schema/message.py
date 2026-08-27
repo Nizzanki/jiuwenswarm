@@ -378,6 +378,12 @@ class ReqMethod(Enum):
     ISSUE_DELETE = "issue.delete"
     ISSUE_MATRIX = "issue.matrix"
 
+    # TraceHound — Session Trajectory Viewer
+    TRACEHOUND_TURNS_LIST = "tracehound.turns.list"
+    TRACEHOUND_TURN_GET = "tracehound.turn.get"
+    TRACEHOUND_SESSION_MTIME = "tracehound.session.mtime"
+    TRACEHOUND_ANALYZE = "tracehound.analyze"
+
 
 class EventType(Enum):
     CONNECTION_ACK = "connection.ack"

@@ -909,6 +909,10 @@ def register_cli_handlers(bind: CliHandlersBindParams) -> None:
             payload["auto_recap_enabled"] = (
                 "true" if auto_recap_cfg.get("enabled", True) else "false"
             )
+            _trace_cfg = raw.get("tracehound") or {}
+            payload["tracehound_live_updates_enabled"] = (
+                "true" if _trace_cfg.get("live_updates_enabled", False) else "false"
+            )
             # swarmflow toggle lives at modes.team.jiuwen_team.enable_swarmflow
             _team_cfg = (raw.get("modes") or {}).get("team") or {}
             _jiuwen_team_cfg = _team_cfg.get("jiuwen_team") or {}
@@ -984,7 +988,8 @@ def register_cli_handlers(bind: CliHandlersBindParams) -> None:
             payload.setdefault("memory_forbidden_enabled", "false")
             payload.setdefault("preferred_language", "zh")
             payload.setdefault("skill_evolution", "false")
-        
+            payload.setdefault("tracehound_live_updates_enabled", "false")
+
         # Auto-Harness config values (from ~/.jiuwenswarm/auto-harness/config.yaml)
         # 合并显示：用户名、邮箱、Access Token 三项
         try:

@@ -1510,6 +1510,115 @@ def _enrich_teammate_event(parsed: dict[str, Any], chunk: Any) -> dict[str, Any]
     return parsed
 
 
+def _team_llm_usage_metadata_payload(
+    chunk: Any,
+    *,
+    session_id: str,
+    is_leader: bool,
+    is_teammate: bool,
+) -> dict[str, Any]:
+    """Normalize a team ``llm_usage`` frame into a ``chat.usage_metadata`` event.
+
+    The generic stream parser has no ``llm_usage`` case, so team usage frames
+    would otherwise surface as a bare ``chat.llm_usage``. This mirrors the
+    single-agent emitter's payload shape (``metadata`` = the raw llm_usage
+    payload) and stamps role/member_name so the record is attributed to the
+    producing member in the godview history.
+    """
+    llm_usage_payload = (
+        chunk.payload if isinstance(getattr(chunk, "payload", None), dict) else {}
+    )
+    parsed: dict[str, Any] = {
+        "event_type": "chat.usage_metadata",
+        "metadata": llm_usage_payload,
+        "session_id": session_id,
+    }
+    if is_teammate:
+        return _enrich_teammate_event(parsed, chunk)
+    if is_leader:
+        parsed["role"] = TeamRole.LEADER.value
+    return parsed
+
+
+def _accumulate_team_usage(
+    accumulator: dict[str, dict[str, Any]],
+    parsed: dict[str, Any],
+) -> None:
+    """Fold one team ``llm_usage`` frame into a per-member usage accumulator.
+
+    Keyed by ``member_name`` (teammates) or ``""`` (leader). Mirrors the
+    token/cost fields the single-agent summary emitter accumulates so the
+    closing ``chat.usage_summary`` carries the same shape.
+    """
+    metadata = parsed.get("metadata")
+    um = metadata.get("usage_metadata") if isinstance(metadata, dict) else None
+    if not isinstance(um, dict):
+        return
+    member = str(parsed.get("member_name") or "").strip()
+    acc = accumulator.setdefault(
+        member,
+        {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cache_tokens": 0,
+            "input_cost": 0.0,
+            "output_cost": 0.0,
+            "total_cost": 0.0,
+            "model_name": "",
+        },
+    )
+    for token_key in ("input_tokens", "output_tokens", "total_tokens", "cache_tokens"):
+        acc[token_key] += um.get(token_key, 0) or 0
+    for cost_key in ("input_cost", "output_cost", "total_cost"):
+        acc[cost_key] += um.get(cost_key, 0.0) or 0.0
+    if not acc["model_name"]:
+        acc["model_name"] = str(um.get("model_name") or "")
+
+
+def _build_team_usage_summary_payload(
+    member: str,
+    acc: dict[str, Any],
+    *,
+    session_id: str,
+) -> dict[str, Any] | None:
+    """Build a ``chat.usage_summary`` event for one member's accumulated usage.
+
+    Returns None when the member produced no usable token counts so no empty
+    summary is emitted. Teammates are stamped with ``member_name`` + role
+    ``teammate``; the leader carries role ``leader`` without a member_name,
+    matching the replay's ``_replay_agent_of`` resolution.
+    """
+    if not acc.get("total_tokens"):
+        return None
+    summary: dict[str, Any] = {
+        "input_tokens": acc["input_tokens"],
+        "output_tokens": acc["output_tokens"],
+        "total_tokens": acc["total_tokens"],
+    }
+    if acc["cache_tokens"] > 0:
+        summary["cache_tokens"] = acc["cache_tokens"]
+    if acc["input_cost"] > 0:
+        summary["input_cost"] = round(acc["input_cost"], 6)
+    if acc["output_cost"] > 0:
+        summary["output_cost"] = round(acc["output_cost"], 6)
+    if acc["total_cost"] > 0:
+        summary["total_cost"] = round(acc["total_cost"], 6)
+    payload: dict[str, Any] = {
+        "event_type": "chat.usage_summary",
+        "session_id": session_id,
+        "usage": summary,
+    }
+    if acc.get("model_name"):
+        payload["model"] = acc["model_name"]
+    if member:
+        payload["member_name"] = member
+        payload["role"] = TeamRole.TEAMMATE.value
+    else:
+        payload["role"] = TeamRole.LEADER.value
+    return payload
+
+
 _TEAM_TOOL_RESULT_TEXT_LIMIT = 512
 
 
@@ -2634,6 +2743,9 @@ async def _consume_stream_with_query(
     first_model_output_at: float | None = None
     emitted_ask_user_request_ids: set[str] = set()
     terminal_broadcasted = False
+    # Per-member LLM usage accumulation so each member gets a closing
+    # chat.usage_summary (leader keyed by "").
+    team_usage_accumulator: dict[str, dict[str, Any]] = {}
     # Members already announced to clients on this stream, so a roster refresh
     # only emits what is new. See _announce_team_roster.
     announced_members: set[str] = set()
@@ -2732,6 +2844,30 @@ async def _consume_stream_with_query(
                 continue
             parsed = parse_stream_chunk(chunk)
             if parsed is not None:
+                # llm_usage frames carry per-call token/cost metrics but have
+                # no case in stream_utils.parse_stream_chunk, so they arrive
+                # here as a bare "chat.llm_usage". Normalize them to the
+                # canonical chat.usage_metadata event (same shape the
+                # single-agent path emits) and stamp member_name/role so
+                # per-member LLM usage is mirrored into the godview history.
+                if getattr(chunk, "type", None) == "llm_usage":
+                    try:
+                        parsed = _team_llm_usage_metadata_payload(
+                            chunk,
+                            session_id=session_id,
+                            is_leader=is_leader,
+                            is_teammate=is_teammate,
+                        )
+                        parsed["rid"] = round_id
+                        _accumulate_team_usage(team_usage_accumulator, parsed)
+                        await _broadcast_event(channel_id, session_id, parsed)
+                    except Exception:
+                        logger.debug(
+                            "[TeamHelpers] team llm_usage mirror failed: session_id=%s",
+                            session_id,
+                            exc_info=True,
+                        )
+                    continue
                 # Time to first token: the first frame actually produced by a
                 # model (reasoning counts — on a thinking model it comes first).
                 if first_model_output_at is None and parsed.get("event_type") in _MODEL_OUTPUT_EVENT_TYPES:
@@ -2969,6 +3105,23 @@ async def _consume_stream_with_query(
                     await _broadcast_event(channel_id, session_id, parsed)
                     continue
                 await _broadcast_event(channel_id, session_id, parsed)
+
+        # Emit one chat.usage_summary per member that produced LLM usage so
+        # the godview history carries cumulative token totals (TraceHound
+        # replay reads them back). Never allowed to break the streaming path.
+        for _member, _acc in team_usage_accumulator.items():
+            try:
+                _summary = _build_team_usage_summary_payload(
+                    _member, _acc, session_id=session_id
+                )
+                if _summary is not None:
+                    await _broadcast_event(channel_id, session_id, _summary)
+            except Exception:
+                logger.debug(
+                    "[TeamHelpers] team usage summary mirror failed: session_id=%s",
+                    session_id,
+                    exc_info=True,
+                )
 
         # If stream ended without any chunks, broadcast an error event
         if received_chunks == 0:

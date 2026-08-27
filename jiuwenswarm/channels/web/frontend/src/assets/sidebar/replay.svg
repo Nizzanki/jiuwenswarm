@@ -1,0 +1,4 @@
+<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none">
+  <!-- Play triangle -->
+  <polygon points="3,2 13,8 3,14" fill="rgb(25,25,25)" opacity="0.85"/>
+</svg>

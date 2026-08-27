@@ -197,6 +197,8 @@ interface SessionItem {
   last_message_at?: number;
   created_at?: number;
   message_count?: number;
+  round_id?: number;
+  total_tokens?: number;
   mode?: string;
 }
 
@@ -222,6 +224,8 @@ function toSessionItems(raw: unknown[]): SessionItem[] {
           last_message_at: typeof rec.last_message_at === 'number' ? rec.last_message_at : undefined,
           created_at: typeof rec.created_at === 'number' ? rec.created_at : undefined,
           message_count: typeof rec.message_count === 'number' ? rec.message_count : undefined,
+          round_id: typeof rec.round_id === 'number' ? rec.round_id : undefined,
+          total_tokens: typeof rec.total_tokens === 'number' ? rec.total_tokens : undefined,
           mode: typeof rec.mode === 'string' ? rec.mode : undefined,
         } as SessionItem;
       }
@@ -274,6 +278,14 @@ export function SessionsPanel({
   const [filesError, setFilesError] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<SessionFileItem | null>(null);
   const [filePreviewReloadNonce, setFilePreviewReloadNonce] = useState(0);
+  const [showEmpty, setShowEmpty] = useState(false);
+
+  const visibleSessions = useMemo(() => {
+    if (showEmpty) return sessions;
+    return sessions.filter(s => (s.message_count ?? 0) > 0);
+  }, [sessions, showEmpty]);
+
+  const emptyCount = sessions.filter(s => (s.message_count ?? 0) === 0).length;
 
   const selectedFileRef = useRef<SessionFileItem | null>(null);
   selectedFileRef.current = selectedFile;
@@ -511,7 +523,7 @@ export function SessionsPanel({
                 <div>
                   <h3 className="text-sm font-medium text-text" data-testid="sessions-panel-history-title">{t('sessions.history')}</h3>
                   <p className="text-xs text-text-muted mt-1 mono" data-testid="sessions-panel-history-count">
-                    {t('sessions.count', { count: sessions.length })}
+                    {t('sessions.count', { count: visibleSessions.length })}
                   </p>
                 </div>
                 <button
@@ -520,7 +532,7 @@ export function SessionsPanel({
                   disabled={!canRestoreSelectedSession}
                   onClick={() => {
                     if (!selectedSessionId || !canRestoreSelectedSession) return;
-                    const selectedSession = sessions.find(s => s.session_id === selectedSessionId);
+                    const selectedSession = visibleSessions.find(s => s.session_id === selectedSessionId);
                     void onRestoreSession(selectedSessionId, selectedSession?.mode);
                   }}
                   className="btn !px-3 !py-1.5 shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
@@ -529,12 +541,22 @@ export function SessionsPanel({
                   {t('sessions.restore')}
                 </button>
               </div>
+              <label className="mt-2 flex items-center gap-1.5 text-xs text-text-muted cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={showEmpty}
+                  onChange={(e) => setShowEmpty(e.target.checked)}
+                  className="cursor-pointer"
+                />
+                {t('sessions.showEmpty') ?? 'Show empty sessions'}
+                {!showEmpty && emptyCount > 0 ? ` (${emptyCount} hidden)` : ''}
+              </label>
             </div>
             <div className="flex-1 overflow-auto p-2 space-y-1" data-testid="sessions-panel-history-list">
-              {!loadingSessions && sessions.length === 0 ? (
+              {!loadingSessions && visibleSessions.length === 0 ? (
                 <div className="h-full flex items-center justify-center text-sm text-text-muted" data-testid="sessions-panel-history-empty">{t('sessions.empty')}</div>
               ) : (
-                sessions.map((session) => (
+                visibleSessions.map((session) => (
                   <div key={session.session_id} className="group grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2" data-testid="sessions-panel-session-row" data-variant={session.session_id}>
                     <button
                       type="button"
@@ -555,8 +577,12 @@ export function SessionsPanel({
                         <span className="truncate block flex-1" data-testid="sessions-panel-session-item-title">{toDisplaySessionTitle(session.title || '') || parseSessionDisplayLabel(session.session_id, t)}</span>
                         <SessionErrorIndicator sessionId={session.session_id} />
                       </span>
+                      <span className="mt-0.5 block truncate text-[11px] text-text-muted/80">
+                        {(session.round_id ?? 0)} msg, {(session.message_count ?? 0)} ev
+                        {session.total_tokens != null && session.total_tokens > 0 && `, ${session.total_tokens.toLocaleString()} tok`}
+                      </span>
                       {session.mode === 'team' && session.team_name ? (
-                        <span className="mt-1 block truncate text-[11px] text-text-muted" data-testid="sessions-panel-session-item-team-label">
+                        <span className="mt-0.5 block truncate text-[11px] text-text-muted" data-testid="sessions-panel-session-item-team-label">
                           {t('sessions.teamLabel', { team: session.team_name })}
                         </span>
                       ) : null}

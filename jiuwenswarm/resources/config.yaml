@@ -496,6 +496,10 @@ agent_observability:
   traces_dir: ""                    # file exporter 输出目录，默认 ~/.jiuwenswarm/.trace
   file_retention_days: 7            # file exporter 文件保留天数
 
+tracehound:
+  # Live trajectory auto-refresh in the web chat panel (mtime-gated polling).
+  live_updates_enabled: false
+
 # ============================================================
 # Agent / Code 调试链路追踪（Debug Trace）配置
 # ============================================================

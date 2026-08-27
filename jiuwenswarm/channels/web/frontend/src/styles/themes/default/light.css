@@ -96,6 +96,32 @@
   --color-feedback-danger-toast: #fce9e9;
   --color-feedback-success-indicator: #1a991d;
 
+  /* TraceHound — trajectory observer palette (role-named, observability light) */
+  --color-trace-ok: #10b981;
+  --color-trace-ok-subtle: rgba(16, 185, 129, 0.1);
+  --color-trace-warn: #d97706;
+  --color-trace-warn-subtle: rgba(217, 119, 6, 0.12);
+  --color-trace-danger: #dc2626;
+  --color-trace-danger-subtle: rgba(220, 38, 38, 0.1);
+  --color-trace-violet: #7c3aed;
+  --color-trace-violet-subtle: rgba(124, 58, 237, 0.1);
+  --color-trace-info: #2563eb;
+  --color-trace-info-subtle: rgba(37, 99, 235, 0.1);
+  --color-trace-teal: #0d9488;
+  --color-trace-cat-1: #2563eb;
+  --color-trace-cat-2: #7c3aed;
+  --color-trace-cat-3: #d97706;
+  --color-trace-cat-4: #0d9488;
+  --color-trace-cat-5: #db2777;
+  --color-trace-cat-6: #4f46e5;
+  --color-trace-surface: #ffffff;
+  --color-trace-surface-muted: #f7f8fa;
+  --color-trace-border: #e4e7ec;
+  --color-trace-border-strong: #cbd5e1;
+  --color-trace-text: #101828;
+  --color-trace-text-muted: #667085;
+  --color-trace-text-faint: #98a2b3;
+
   /* Feature accents whose identity is stable across color modes */
   --color-chat-accent: #1476ff;
   --color-chat-accent-subtle: #deecff;

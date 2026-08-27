@@ -63,7 +63,7 @@ from jiuwenswarm.agents.harness.common.rails.permissions.permissions_persist imp
 from jiuwenswarm.extensions.hooks_context import AgentServerChatHookContext
 from jiuwenswarm.server.runtime.agent_manager import AgentManager, ACP_DEFAULT_CAPABILITIES
 from jiuwenswarm.server.runtime.agent_warm_pool import WarmClaim
-from jiuwenswarm.server.runtime.session.session_metadata import get_all_sessions_metadata, remove_session_metadata_cache
+from jiuwenswarm.server.runtime.session.session_metadata import get_all_sessions_metadata, remove_session_metadata_cache, update_session_metadata
 from jiuwenswarm.server.runtime.session.session_history import (
     append_compact_history_records,
     history_exists,
@@ -2105,6 +2105,18 @@ class AgentWebSocketServer:
                 return
             if request.req_method == ReqMethod.ISSUE_MATRIX:
                 await self._handle_schedule_request(ws, request, send_lock, "issue_matrix")
+                return
+            if request.req_method == ReqMethod.TRACEHOUND_TURNS_LIST:
+                await self._handle_replay_request(ws, request, send_lock, "turns_list")
+                return
+            if request.req_method == ReqMethod.TRACEHOUND_TURN_GET:
+                await self._handle_replay_request(ws, request, send_lock, "turn_get")
+                return
+            if request.req_method == ReqMethod.TRACEHOUND_SESSION_MTIME:
+                await self._handle_replay_request(ws, request, send_lock, "session_mtime")
+                return
+            if request.req_method == ReqMethod.TRACEHOUND_ANALYZE:
+                await self._handle_tracehound_analyze(ws, request, send_lock)
                 return
             if request.req_method == ReqMethod.AGENTS_LIST:
                 await self._handle_agents_list(ws, request, send_lock)
@@ -10923,3 +10935,903 @@ class AgentWebSocketServer:
         )
         async with send_lock:
             await send_wire_payload(ws, wire)
+
+    # ── TraceHound helpers ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _tracehound_session_mtime(session_id: str) -> float | None:
+        from jiuwenswarm.server.runtime.session.session_history import get_history_mtime
+        try:
+            return get_history_mtime(session_id)
+        except Exception:
+            return None
+
+    _REPLAY_NOISE_EVENTS: frozenset = frozenset({
+        "chat.processing_status",
+        "chat.processing_status_deferred",
+    })
+
+    _REPLAY_ERROR_PATTERNS: list = [
+        ("api_auth",   ["401", "403", "authentication", "unauthorized", "token", "insufficient balance", "invalid_api_key"]),
+        ("timeout",    ["timeout", "timed out", "deadline"]),
+        ("filesystem", ["no such file", "permission denied", "filenotfound", "isdirectory", "isadirectory"]),
+        ("network",    ["connection refused", "network", "dns", "socket", "connection reset"]),
+        ("syntax",     ["syntaxerror", "invalid syntax"]),
+        ("import",     ["modulenotfounderror", "importerror", "no module"]),
+        ("model",      ["context length", "max tokens", "model_not_found", "model not found"]),
+        ("execution",  ["returncode", "exit code", "subprocess", "nonzeroexitcode"]),
+    ]
+
+    _REPLAY_QUERY_TYPES: list = [
+        ("debug",    ["error", "bug", "fix", "broken", "doesn't work", "not working", "failed", "exception", "crash", "issue"]),
+        ("file_op",  ["file", "folder", "directory", "read", "write", "save", "load", "open", "upload", "download"]),
+        ("coding",   ["code", "function", "class", "script", "python", "javascript", "implement", "write a", "create a", "program"]),
+        ("analysis", ["analyze", "analysis", "explain", "what is", "why does", "how does", "describe", "summarize"]),
+        ("question", ["what", "how", "when", "where", "who", "which", "?"]),
+    ]
+
+    def _replay_classify_error(self, text: str) -> str:
+        low = text.lower()
+        for category, keywords in self._REPLAY_ERROR_PATTERNS:
+            if any(k in low for k in keywords):
+                return category
+        return "other"
+
+    def _replay_classify_query(self, text: str) -> str:
+        low = text.lower()
+        for qtype, keywords in self._REPLAY_QUERY_TYPES:
+            if any(k in low for k in keywords):
+                return qtype
+        return "general"
+
+    @staticmethod
+    def _replay_agent_of(rec: dict) -> tuple[str, str]:
+        """Resolve (agent_name, agent_role) for a team-mode event record.
+
+        Teammate events carry ``member_name`` (e.g. ``prague-foodie``); leader
+        events have ``role == "leader"`` and no member_name. Single-agent
+        (non-team) events resolve to ``("", "")`` so attribution stays empty.
+        """
+        role = rec.get("role", "") or ""
+        if role == "user":
+            return "", ""
+        member = (rec.get("member_name") or "").strip()
+        if member:
+            return member, "member"
+        if role == "leader":
+            return "leader", "leader"
+        return "", ""
+
+    @staticmethod
+    def _tool_result_failed(rec: dict) -> bool:
+        """Return True when a chat.tool_result record represents a failed tool call.
+
+        Failure signals: a top-level ``error_type`` field (solo-mode run-level
+        failures) or a ``result`` repr string containing ``success=False``
+        (team-mode tool errors are serialized into the result string without
+        structured error fields).
+        """
+        if rec.get("error_type"):
+            return True
+        result = rec.get("result")
+        return isinstance(result, str) and "success=False" in result
+
+    @staticmethod
+    def _tool_result_error_text(rec: dict) -> str:
+        """Best-effort extraction of the error message from a chat.tool_result record.
+
+        Team-mode tool failures serialize ``result`` as a Python-repr string such as
+        ``success=False data=None error="Tool execution error: ..."`` with no
+        top-level ``error``/``error_type`` fields. This helper recovers the error
+        text from the repr so TraceHound can surface it.
+        """
+        for field in ("error", "error_detail"):
+            val = rec.get(field)
+            if val is None:
+                continue
+            s = str(val)
+            if s:
+                return s
+        result = rec.get("result")
+        if isinstance(result, str):
+            import ast
+            import re
+            match = re.search(r"\berror\s*=\s*", result)
+            if match:
+                tail = result[match.end():]
+                try:
+                    val = ast.literal_eval(tail)
+                except (SyntaxError, ValueError):
+                    val = None
+                if isinstance(val, str):
+                    return val
+                if val is not None:
+                    return str(val)
+                # Truncated / malformed repr: try to strip a quoted value.
+                if tail[:1] in ("'", '"'):
+                    q = tail[0]
+                    close = tail[1:].rfind(q)
+                    if close >= 0:
+                        return tail[1 : 1 + close]
+        return ""
+
+    def _replay_build_turns(self, records: list[dict]) -> list[dict]:
+        """Group history records into turn summaries (TraceHound turns_list).
+
+        Turns are keyed by ``request_id``; each turn aggregates tool calls,
+        failures, errors, usage and final responses. Failed team-mode tool
+        results (``result`` string containing ``success=False``) increment
+        ``tool_failures`` and set ``error_category``; ``chat.tracer_agent``
+        error events enrich ``error_category`` without double-counting.
+        """
+        turns: dict[str, dict] = {}
+        for rec in records:
+            rid: str = rec.get("request_id") or rec.get("id", "")
+            if not rid:
+                continue
+            # Skip pure noise records from creating their own turn slot
+            et = rec.get("event_type", "")
+            if et in self._REPLAY_NOISE_EVENTS and rid not in turns:
+                continue
+            if rid not in turns:
+                turns[rid] = {
+                    "turn_id": rid,
+                    "turn_index": 0,
+                    "user_content": "",
+                    "user_message_full": "",
+                    "timestamp": rec.get("timestamp", 0),
+                    "tool_names": [],
+                    "skill_names": [],
+                    "has_final": False,
+                    "has_error": False,
+                    "error_category": None,
+                    "total_tokens": 0,
+                    "tool_failures": 0,
+                    "file_count": 0,
+                    "final_length": 0,
+                    "duration_seconds": 0.0,
+                    "retry_count": 0,
+                    "was_deferred": False,
+                    "query_type": "general",
+                    "mode": rec.get("mode"),
+                    "llm_call_count": 0,
+                    "event_count": 0,
+                    "llm_calls_detail": [],
+                    "tool_calls_detail": [],
+                    "tool_updates_detail": [],
+                    "tool_results_detail": [],
+                    "assistant_responses": [],
+                    "context_usage_percent": 0.0,
+                    "context_window_tokens": 0,
+                    "cache_tokens": 0,
+                    "input_cost": 0.0,
+                    "output_cost": 0.0,
+                    "total_cost": 0.0,
+                    "total_latency_ms": 0.0,
+                    "ttft_ms": 0.0,
+                    "tpot_ms": 0.0,
+                    "models_used": set(),
+                    "agents": [],
+                    "_agent_activity": {},
+                    "_first_ts": None,
+                    "_last_ts": None,
+                }
+            role = rec.get("role", "")
+            ts: float = rec.get("timestamp") or 0.0
+
+            def _record_agent(
+                turn: dict,
+                name: str,
+                agent_role: str,
+                *,
+                tool_call: bool = False,
+                tool_result: bool = False,
+                tool_fail: bool = False,
+                response: bool = False,
+                llm: bool = False,
+                llm_tokens: int = 0,
+                llm_cost: float = 0.0,
+            ) -> None:
+                if not name:
+                    return
+                acts = turn["_agent_activity"]
+                entry = acts.get(name)
+                if entry is None:
+                    entry = acts[name] = {
+                        "name": name,
+                        "role": agent_role,
+                        "tool_calls": 0,
+                        "tool_results": 0,
+                        "tool_failures": 0,
+                        "responses": 0,
+                        "llm_calls": 0,
+                        "tokens": 0,
+                        "cost": 0.0,
+                    }
+                if tool_call:
+                    entry["tool_calls"] += 1
+                if tool_result:
+                    entry["tool_results"] += 1
+                if tool_fail:
+                    entry["tool_failures"] += 1
+                if response:
+                    entry["responses"] += 1
+                if llm:
+                    entry["llm_calls"] += 1
+                    entry["tokens"] += llm_tokens
+                    entry["cost"] += llm_cost
+
+            # Duration tracking + event counting (ignore noise events)
+            if et not in self._REPLAY_NOISE_EVENTS:
+                turns[rid]["event_count"] += 1
+                if ts:
+                    if turns[rid]["_first_ts"] is None or ts < turns[rid]["_first_ts"]:
+                        turns[rid]["_first_ts"] = ts
+                    if turns[rid]["_last_ts"] is None or ts > turns[rid]["_last_ts"]:
+                        turns[rid]["_last_ts"] = ts
+
+            if role == "user":
+                raw_q = (rec.get("content") or "")
+                if not turns[rid]["user_content"]:
+                    turns[rid]["user_content"] = raw_q[:120]
+                    turns[rid]["query_type"] = self._replay_classify_query(raw_q)
+                if not turns[rid]["user_message_full"]:
+                    turns[rid]["user_message_full"] = raw_q
+            elif et == "chat.processing_status_deferred":
+                turns[rid]["was_deferred"] = True
+            elif et == "chat.tool_call":
+                tc = rec.get("tool_call") or {}
+                tn = rec.get("tool_name") or tc.get("name", "")
+                if tn:
+                    turns[rid]["tool_names"].append(tn)
+                agent_name, agent_role = self._replay_agent_of(rec)
+                turns[rid]["tool_calls_detail"].append({
+                    "name": tc.get("name", ""),
+                    "arguments": tc.get("arguments", ""),
+                    "tool_call_id": tc.get("tool_call_id", "") or tc.get("id", ""),
+                    "agent": agent_name or None,
+                })
+                _record_agent(turns[rid], agent_name, agent_role, tool_call=True)
+            elif et == "chat.tool_update":
+                agent_name, agent_role = self._replay_agent_of(rec)
+                turns[rid]["tool_updates_detail"].append({
+                    "tool_name": rec.get("tool_name", ""),
+                    "tool_call_id": rec.get("tool_call_id", ""),
+                    "arguments": rec.get("arguments", ""),
+                    "status": rec.get("status", ""),
+                    "agent": agent_name or None,
+                })
+            elif et == "chat.tool_result":
+                failed = self._tool_result_failed(rec)
+                if failed:
+                    turns[rid]["tool_failures"] += 1
+                    if not turns[rid]["error_category"]:
+                        err_text = self._tool_result_error_text(rec)
+                        if err_text:
+                            turns[rid]["error_category"] = self._replay_classify_error(err_text)
+                tname = rec.get("tool_name", "")
+                if tname == "recommend_skill":
+                    result_str = rec.get("result") or ""
+                    for sk in self._extract_skill_names_from_result(result_str):
+                        if sk not in turns[rid]["skill_names"]:
+                            turns[rid]["skill_names"].append(sk)
+                parsed_error = self._tool_result_error_text(rec)
+                agent_name, agent_role = self._replay_agent_of(rec)
+                turns[rid]["tool_results_detail"].append({
+                    "tool_name": tname,
+                    "tool_call_id": rec.get("tool_call_id", ""),
+                    "result": rec.get("result", ""),
+                    "failed": failed,
+                    "error_type": rec.get("error_type"),
+                    "error_detail": rec.get("error_detail") or (parsed_error or None),
+                    "error": rec.get("error"),
+                    "agent": agent_name or None,
+                })
+                _record_agent(
+                    turns[rid], agent_name, agent_role,
+                    tool_result=True, tool_fail=failed,
+                )
+            elif et == "chat.tracer_agent":
+                # Structured agent-trace events mirror the surrounding tool_result;
+                # only use them to enrich error_category, never to double-count
+                # tool_failures or escalate the turn to a hard error.
+                if rec.get("status") == "error" and not turns[rid]["error_category"]:
+                    err = rec.get("error")
+                    if isinstance(err, dict):
+                        err_text = err.get("message") or err.get("error") or json.dumps(err)
+                    elif err is not None:
+                        err_text = str(err)
+                    else:
+                        err_text = ""
+                    if err_text:
+                        turns[rid]["error_category"] = self._replay_classify_error(err_text)
+            elif et == "chat.final":
+                turns[rid]["retry_count"] = turns[rid].get("retry_count", 0) + 1
+                content = rec.get("content") or ""
+                content_len = len(content)
+                if content_len > 0:
+                    turns[rid]["has_final"] = True
+                    turns[rid]["final_length"] = content_len
+                    turns[rid]["assistant_responses"].append(content)
+                agent_name, agent_role = self._replay_agent_of(rec)
+                _record_agent(turns[rid], agent_name, agent_role, response=content_len > 0)
+            elif et == "chat.usage_metadata":
+                turns[rid]["llm_call_count"] += 1
+                md = rec.get("metadata", {}) or {}
+                um = md.get("usage_metadata", {}) or {}
+                turns[rid]["llm_calls_detail"].append({
+                    "model_name": um.get("model_name", ""),
+                    "input_tokens": um.get("input_tokens", 0),
+                    "output_tokens": um.get("output_tokens", 0),
+                    "total_tokens": um.get("total_tokens", 0),
+                    "cache_tokens": um.get("cache_tokens", 0),
+                    "input_cost": um.get("input_cost", 0.0),
+                    "output_cost": um.get("output_cost", 0.0),
+                    "total_cost": um.get("total_cost", 0.0),
+                    "total_latency_ms": md.get("total_latency_ms", 0.0),
+                    "ttft_ms": md.get("ttft_ms", 0.0),
+                    "tpot_ms": md.get("tpot_ms", 0.0),
+                    "result_type": md.get("result_type", ""),
+                    "code": um.get("code", 0),
+                    "err_msg": um.get("err_msg", ""),
+                })
+                turns[rid]["cache_tokens"] += um.get("cache_tokens", 0) or 0
+                turns[rid]["input_cost"] += um.get("input_cost", 0.0) or 0.0
+                turns[rid]["output_cost"] += um.get("output_cost", 0.0) or 0.0
+                turns[rid]["total_cost"] += um.get("total_cost", 0.0) or 0.0
+                turns[rid]["total_latency_ms"] += md.get("total_latency_ms", 0.0) or 0.0
+                turns[rid]["ttft_ms"] += md.get("ttft_ms", 0.0) or 0.0
+                turns[rid]["tpot_ms"] += md.get("tpot_ms", 0.0) or 0.0
+                model = um.get("model_name")
+                if model:
+                    turns[rid]["models_used"].add(model)
+                agent_name, agent_role = self._replay_agent_of(rec)
+                _record_agent(
+                    turns[rid], agent_name, agent_role,
+                    llm=True,
+                    llm_tokens=um.get("total_tokens", 0) or 0,
+                    llm_cost=um.get("total_cost", 0.0) or 0.0,
+                )
+            elif et == "chat.usage_summary":
+                usage = rec.get("usage") or {}
+                tokens = rec.get("total_tokens") or usage.get("total_tokens") or 0
+                turns[rid]["total_tokens"] += tokens
+                turns[rid]["context_usage_percent"] = rec.get("usage_percent", 0.0) or 0.0
+                turns[rid]["context_window_tokens"] = rec.get("context_window_tokens", 0) or 0
+                agent_name, agent_role = self._replay_agent_of(rec)
+                if agent_name and tokens:
+                    acts = turns[rid]["_agent_activity"]
+                    entry = acts.get(agent_name)
+                    if entry is not None:
+                        # usage_summary is cumulative-ish per call; credit deltas are
+                        # not reliably derivable — attribute to tokens total once per
+                        # summary only when no metadata-based credit happened.
+                        if entry["llm_calls"] == 0:
+                            entry["tokens"] += tokens
+            elif et == "chat.file":
+                turns[rid]["file_count"] += 1
+            elif et == "chat.error" or (role == "assistant" and rec.get("error")):
+                if not turns[rid]["has_error"]:
+                    error_text = (
+                        rec.get("error")
+                        or rec.get("error_detail")
+                        or rec.get("content")
+                        or ""
+                    )
+                    turns[rid]["has_error"] = True
+                    turns[rid]["error_category"] = self._replay_classify_error(error_text)
+
+        # Filter ghost turns (no user message, no error, no content — pure noise)
+        def _is_real_turn(t: dict) -> bool:
+            return bool(
+                t.get("user_content")
+                or t.get("has_error")
+                or t.get("has_final")
+                or t.get("tool_names")
+            )
+
+        real_turns = [t for t in turns.values() if _is_real_turn(t)]
+
+        # Post-process: assign sequential index, compute duration + outcome, strip temp keys
+        for idx, turn in enumerate(real_turns):
+            turn["turn_index"] = idx
+            first = turn.pop("_first_ts", None)
+            last = turn.pop("_last_ts", None)
+            if first and last and last > first:
+                turn["duration_seconds"] = round(last - first, 1)
+            turn["outcome"] = self._replay_outcome(turn)
+            turn["issues"] = self._replay_issues(turn)
+            # Convert per-agent activity dict to an ordered list (leader first,
+            # then members by tool-call count). Single-agent sessions yield [].
+            acts = turn.pop("_agent_activity", {})
+            agent_list = sorted(
+                acts.values(),
+                key=lambda a: (a["role"] != "leader", -a["tool_calls"]),
+            )
+            turn["agents"] = [a["name"] for a in agent_list]
+            turn["agent_activity"] = agent_list
+            # Convert sets to lists for JSON serialization
+            turn["models_used"] = sorted(turn.get("models_used", set()))
+            # Compute average latencies per turn
+            llm_count = turn.get("llm_call_count", 0)
+            if llm_count > 0:
+                turn["avg_total_latency_ms"] = round(turn.get("total_latency_ms", 0.0) / llm_count, 1)
+                turn["avg_ttft_ms"] = round(turn.get("ttft_ms", 0.0) / llm_count, 1)
+                turn["avg_tpot_ms"] = round(turn.get("tpot_ms", 0.0) / llm_count, 1)
+            else:
+                turn["avg_total_latency_ms"] = 0.0
+                turn["avg_ttft_ms"] = 0.0
+                turn["avg_tpot_ms"] = 0.0
+            # Backward-compat: keep quality_* if any downstream code references it,
+            # but they are no longer the primary fields.
+            turn.pop("quality_score", None)
+            turn.pop("quality_label", None)
+            turn.pop("quality_breakdown", None)
+
+        return real_turns
+
+    @staticmethod
+    def _replay_outcome(turn: dict) -> str:
+        """Return an explicit, human-readable outcome for this turn.
+
+        Outcomes:
+            completed              — agent produced a final response
+            completed_with_issues  — responded, but had tool failures / retries / was slow
+            no_response            — no final output (model failure / timeout / crash)
+            error                  — a hard error occurred (API failure, exception, etc.)
+            deferred               — message queued but never processed
+        """
+        if turn.get("was_deferred"):
+            return "deferred"
+        if turn.get("has_error"):
+            return "error"
+        if not turn.get("has_final"):
+            return "no_response"
+        # Has a response — check if there were accompanying issues
+        if turn.get("tool_failures", 0) > 0 or turn.get("retry_count", 1) > 1:
+            return "completed_with_issues"
+        return "completed"
+
+    @staticmethod
+    def _replay_issues(turn: dict) -> list[str]:
+        """Return a list of human-readable issue descriptions for this turn."""
+        issues: list[str] = []
+        if not turn.get("has_final") and not turn.get("was_deferred"):
+            issues.append("No response from agent")
+        n_fail: int = turn.get("tool_failures", 0)
+        if n_fail > 0:
+            issues.append(f"{n_fail} tool call{'s' if n_fail != 1 else ''} failed")
+        dur: float = turn.get("duration_seconds", 0.0)
+        if dur > 60:
+            issues.append(f"Very slow ({dur:.0f}s)")
+        elif dur > 30:
+            issues.append(f"Slow ({dur:.0f}s)")
+        retries: int = turn.get("retry_count", 0)
+        if retries > 1:
+            issues.append(f"Needed {retries} attempts")
+        return issues
+
+    @staticmethod
+    def _extract_skill_names_from_result(result: str) -> list[str]:
+        """Parse skill names from a recommend_skill tool result string.
+
+        The result format is a Python-ish repr like:
+        ``success=True data={'skills': [{'name': 'dogfood', ...}, ...]} error=None``
+        We use a simple regex to extract the 'name' values from the skills list.
+        """
+        import re
+        names: list[str] = []
+        if not result or ("recommend_skill" not in result and "skills" not in result):
+            return names
+        # Match single-quoted names inside dict-like structures in the result
+        for m in re.finditer(r"'name'\s*:\s*'([^']+)'", result):
+            n = m.group(1)
+            if n and n not in names:
+                names.append(n)
+        return names
+
+    async def _handle_replay_request(
+        self,
+        ws: Any,
+        request: "AgentRequest",
+        send_lock: asyncio.Lock,
+        action: str,
+    ) -> None:
+        """Handle TraceHound — Session Trajectory Viewer requests."""
+        from jiuwenswarm.server.runtime.session.session_history import (
+            read_session_history_records,
+            get_read_history_path,
+        )
+        from datetime import datetime, timezone
+
+        params = request.params or {}
+        session_id: str = params.get("session_id", "")
+
+        try:
+            if action == "turns_list":
+                records = read_session_history_records(session_id)
+                real_turns = self._replay_build_turns(records)
+
+                # Session-level aggregate stats
+                all_tokens = sum(t.get("total_tokens", 0) for t in real_turns)
+                error_count = sum(1 for t in real_turns if t.get("has_error"))
+                total_llm_calls = sum(t.get("llm_call_count", 0) for t in real_turns)
+                total_events = sum(t.get("event_count", 0) for t in real_turns)
+                total_cache_tokens = sum(t.get("cache_tokens", 0) for t in real_turns)
+                total_input_cost = sum(t.get("input_cost", 0.0) for t in real_turns)
+                total_output_cost = sum(t.get("output_cost", 0.0) for t in real_turns)
+                total_cost = sum(t.get("total_cost", 0.0) for t in real_turns)
+                all_models: set[str] = set()
+                latencies: list[float] = []
+                ttfts: list[float] = []
+                tpots: list[float] = []
+                max_context_usage = 0.0
+                channel_id = ""
+                for t in real_turns:
+                    all_models.update(t.get("models_used", []))
+                    if t.get("llm_call_count", 0) > 0:
+                        latencies.append(t.get("avg_total_latency_ms", 0.0))
+                        ttfts.append(t.get("avg_ttft_ms", 0.0))
+                        tpots.append(t.get("avg_tpot_ms", 0.0))
+                    cup = t.get("context_usage_percent", 0.0)
+                    if cup > max_context_usage:
+                        max_context_usage = cup
+                    if not channel_id:
+                        channel_id = t.get("channel_id", "") or ""
+
+                avg_total_latency_ms = round(sum(latencies) / len(latencies), 1) if latencies else 0.0
+                avg_ttft_ms = round(sum(ttfts) / len(ttfts), 1) if ttfts else 0.0
+                avg_tpot_ms = round(sum(tpots) / len(tpots), 1) if tpots else 0.0
+
+                # Cache total_tokens and round_id in session metadata so session.list can return them
+                try:
+                    current_meta = get_session_metadata(session_id)
+                    cached_tokens = int(current_meta.get("total_tokens", 0))
+                    if all_tokens > cached_tokens:
+                        update_session_metadata(session_id=session_id, add_tokens=all_tokens - cached_tokens)
+                    cached_rounds = int(current_meta.get("round_id", 0))
+                    real_turn_count = len(real_turns)
+                    if real_turn_count > cached_rounds:
+                        update_session_metadata(session_id=session_id, set_round_id=real_turn_count)
+                    extra_meta: dict[str, Any] = {
+                        "llm_calls": total_llm_calls,
+                        "total_events": total_events,
+                        "total_cache_tokens": total_cache_tokens,
+                        "total_input_cost": round(total_input_cost, 6),
+                        "total_output_cost": round(total_output_cost, 6),
+                        "total_cost": round(total_cost, 6),
+                        "models_used": sorted(all_models),
+                        "avg_total_latency_ms": avg_total_latency_ms,
+                        "avg_ttft_ms": avg_ttft_ms,
+                        "avg_tpot_ms": avg_tpot_ms,
+                        "max_context_usage_percent": round(max_context_usage, 2),
+                        "channel_id": channel_id,
+                    }
+                    # Strip None/empty values to keep metadata clean
+                    extra_meta = {k: v for k, v in extra_meta.items() if v is not None and v != "" and v != []}
+                    update_session_metadata(session_id=session_id, extra_metadata=extra_meta)
+                except Exception:
+                    pass
+
+                timestamps = [t["timestamp"] for t in real_turns if t.get("timestamp")]
+                date_range = ""
+                if timestamps:
+                    lo = datetime.fromtimestamp(min(timestamps), tz=timezone.utc).strftime("%Y-%m-%d")
+                    hi = datetime.fromtimestamp(max(timestamps), tz=timezone.utc).strftime("%Y-%m-%d")
+                    date_range = lo if lo == hi else f"{lo} \u2192 {hi}"
+
+                history_file_path = str(get_read_history_path(session_id))
+
+                if params.get("stats_only"):
+                    payload = {
+                        "ok": True,
+                        "stats_cached": True,
+                        "session_id": session_id,
+                        "total_llm_calls": total_llm_calls,
+                        "total_events": total_events,
+                        "total_tokens": all_tokens,
+                        "total_turns": len(real_turns),
+                        "total_cache_tokens": total_cache_tokens,
+                        "total_input_cost": round(total_input_cost, 6),
+                        "total_output_cost": round(total_output_cost, 6),
+                        "total_cost": round(total_cost, 6),
+                        "models_used": sorted(all_models),
+                        "avg_total_latency_ms": avg_total_latency_ms,
+                        "avg_ttft_ms": avg_ttft_ms,
+                        "avg_tpot_ms": avg_tpot_ms,
+                        "max_context_usage_percent": round(max_context_usage, 2),
+                        "channel_id": channel_id,
+                    }
+                else:
+                    payload = {
+                        "ok": True,
+                        "turns": real_turns,
+                        "session_stats": {
+                            "total_turns": len(real_turns),
+                            "error_count": error_count,
+                            "total_tokens": all_tokens,
+                            "total_llm_calls": total_llm_calls,
+                            "total_events": total_events,
+                            "total_cache_tokens": total_cache_tokens,
+                            "total_input_cost": round(total_input_cost, 6),
+                            "total_output_cost": round(total_output_cost, 6),
+                            "total_cost": round(total_cost, 6),
+                            "models_used": sorted(all_models),
+                            "avg_total_latency_ms": avg_total_latency_ms,
+                            "avg_ttft_ms": avg_ttft_ms,
+                            "avg_tpot_ms": avg_tpot_ms,
+                            "max_context_usage_percent": round(max_context_usage, 2),
+                            "channel_id": channel_id,
+                            "date_range": date_range,
+                            "history_file_path": history_file_path,
+                            "session_fingerprint": self._session_fingerprint(history_file_path),
+                        },
+                    }
+
+            elif action == "turn_get":
+                turn_id: str = params.get("turn_id", "")
+                records = read_session_history_records(session_id)
+                raw_turn_records = [
+                    r for r in records
+                    if (r.get("request_id") or r.get("id", "")) == turn_id
+                ]
+                turn_records = []
+                for r in raw_turn_records:
+                    et_r = r.get("event_type", "")
+                    # Drop pure noise events
+                    if et_r in self._REPLAY_NOISE_EVENTS:
+                        continue
+                    # Drop empty finals (error caused no response to be generated)
+                    if et_r == "chat.final" and not (r.get("content") or "").strip():
+                        continue
+                    # Enrich usage_summary with LLM timing from raw_output if present
+                    if et_r == "chat.usage_summary":
+                        ro = r.get("raw_output")
+                        if isinstance(ro, dict):
+                            for timing_key in ("ttft_ms", "tpot_ms", "total_latency_ms"):
+                                if timing_key in ro and timing_key not in r:
+                                    r[timing_key] = ro[timing_key]
+                    turn_records.append(r)
+
+                # Sort by timestamp and add per-event delta timing
+                turn_records.sort(key=lambda r: r.get("timestamp", 0))
+                t0: float = turn_records[0]["timestamp"] if turn_records else 0.0
+                prev_ts: float = t0
+                for r in turn_records:
+                    ts_r: float = r.get("timestamp") or 0.0
+                    r["delta_from_prev_s"] = round(ts_r - prev_ts, 1) if prev_ts and ts_r else 0.0
+                    r["elapsed_from_start_s"] = round(ts_r - t0, 1) if t0 and ts_r else 0.0
+                    prev_ts = ts_r
+
+                payload = {"ok": True, "records": turn_records}
+
+            elif action == "session_mtime":
+                mtime = self._tracehound_session_mtime(session_id)
+                payload = {"ok": True, "mtime": mtime}
+
+            else:
+                payload = {"ok": False, "error": f"unknown replay action: {action}"}
+
+            resp = AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=True,
+                payload=payload,
+            )
+        except Exception as exc:
+            logger.exception("[AgentServer] replay.%s failed: %s", action, exc)
+            resp = AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=False,
+                payload={"error": str(exc)},
+            )
+
+        wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
+        async with send_lock:
+            await ws.send(json.dumps(wire, ensure_ascii=False))
+
+    # ── TraceHound: LLM Deep Analysis ─────────────────────────────────────────
+
+    @staticmethod
+    def _session_fingerprint(path: str) -> str:
+        """Cheap fingerprint (size:mtime) for staleness detection."""
+        try:
+            st = Path(path).stat()
+            return f"{st.st_size}:{int(st.st_mtime)}"
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _build_analysis_summary(records: list) -> str:
+        """Compact, LLM-readable summary of session history records."""
+        import datetime as _dt_local
+
+        turns: dict[str, dict] = {}
+        for rec in records:
+            rid = rec.get("request_id", "")
+            if not rid:
+                continue
+            et = rec.get("event_type", "")
+            role = rec.get("role", "")
+            ts = rec.get("timestamp") or 0.0
+            dt_str = _dt_local.datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "?"
+
+            if rid not in turns:
+                turns[rid] = {"ts": dt_str, "user": "", "errors": [], "tools": [],
+                               "has_final": False, "tokens": 0, "final_len": 0}
+            t = turns[rid]
+
+            if role == "user" and not t["user"]:
+                t["user"] = (rec.get("content") or "")[:200]
+                t["ts"] = dt_str
+            elif et == "chat.error":
+                err = (rec.get("error") or rec.get("content") or "")[:300]
+                if err:
+                    t["errors"].append(err)
+            elif et == "chat.tool_result" and AgentWebSocketServer._tool_result_failed(rec):
+                who = (
+                    rec.get("member_name")
+                    or ("team_leader" if rec.get("role") == "leader" else rec.get("role") or "agent")
+                )
+                err = AgentWebSocketServer._tool_result_error_text(rec) or "(tool failed)"
+                t["errors"].append(f"[{who}] {rec.get('tool_name') or 'tool'} failed: {err}"[:300])
+            elif et == "chat.tool_call":
+                tool = rec.get("tool_name") or ""
+                if tool:
+                    t["tools"].append(tool)
+            elif et == "chat.usage_summary":
+                raw = rec.get("raw_output") or {}
+                if isinstance(raw, dict):
+                    t["tokens"] += int(raw.get("total_tokens") or 0)
+            elif et == "chat.final":
+                content = rec.get("content") or ""
+                if content:
+                    t["has_final"] = True
+                    t["final_len"] = len(content)
+
+        if not turns:
+            return "(empty session — no records)"
+
+        total_errors = sum(1 for t in turns.values() if t["errors"])
+        total_tokens = sum(t["tokens"] for t in turns.values())
+        lines: list[str] = [
+            f"Turns: {len(turns)}  |  Turns with errors: {total_errors}  |  Total tokens: {total_tokens}",
+            "",
+        ]
+        for i, (_, t) in enumerate(turns.items(), 1):
+            user_msg = t["user"] or "(no user message)"
+            if t["errors"]:
+                status = "ERROR"
+            elif not t["has_final"]:
+                status = "NO_RESPONSE"
+            else:
+                status = "OK"
+            lines.append(f"Turn {i} [{t['ts']}] [{status}] User: {user_msg}")
+            if t["tools"]:
+                lines.append(f"  Tools: {', '.join(dict.fromkeys(t['tools']))}")
+            if t["has_final"]:
+                lines.append(f"  Response length: {t['final_len']} chars")
+            for err in t["errors"]:
+                lines.append(f"  ERROR: {err}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    async def _handle_tracehound_analyze(
+        self,
+        ws: Any,
+        request: "AgentRequest",
+        send_lock: asyncio.Lock,
+    ) -> None:
+        """LLM-powered deep diagnostic analysis of a session trajectory."""
+        import re as _re
+        import time as _time
+        from openjiuwen.core.foundation.llm.schema.message import UserMessage
+        from jiuwenswarm.server.runtime.session.session_history import (
+            read_session_history_records,
+            get_read_history_path,
+        )
+
+        params: dict = request.params or {}
+        session_id: str = params.get("session_id", "")
+
+        async def _send(payload: dict) -> None:
+            wire = encode_agent_response_for_wire(
+                AgentResponse(
+                    request_id=request.request_id,
+                    channel_id=request.channel_id,
+                    ok=payload.get("ok", True),
+                    payload=payload,
+                ),
+                response_id=request.request_id,
+            )
+            async with send_lock:
+                await ws.send(json.dumps(wire, ensure_ascii=False))
+
+        if not session_id:
+            await _send({"ok": False, "error": "session_id required"})
+            return
+
+        history_path = str(get_read_history_path(session_id))
+        fingerprint = self._session_fingerprint(history_path)
+
+        try:
+            records = read_session_history_records(session_id)
+        except Exception:
+            logger.exception("[tracehound.analyze] failed to read session %s", session_id)
+            await _send({"ok": False, "error": "Failed to read session history"})
+            return
+
+        summary = self._build_analysis_summary(records)
+
+        model = self._resolve_model(None)
+        if model is None:
+            await _send({"ok": False, "error": "No LLM model configured"})
+            return
+
+        prompt = (
+            "You are an expert AI system diagnostician analyzing an agent session log "
+            "from JiuwenSwarm, an AI agent platform.\n\n"
+            "Analyze the following session and identify all notable issues, problems, "
+            "anomalies, or improvement opportunities.\n\n"
+            f"SESSION LOG SUMMARY:\n{summary}\n\n"
+            "For each issue provide a structured analysis. Return a JSON array sorted by "
+            "priority (most critical first). Each element must have exactly these keys:\n"
+            "  priority        - integer 1-5 (1=Critical 2=High 3=Medium 4=Low 5=Info)\n"
+            "  title           - concise issue title, max 70 chars\n"
+            "  description     - clear explanation of the problem\n"
+            "  evidence        - specific facts: timestamps, error messages, counts\n"
+            "  impact          - effect on user or system reliability\n"
+            "  root_cause      - most likely underlying cause\n"
+            "  recommendation  - specific actionable steps to fix or mitigate\n\n"
+            "Return ONLY a valid JSON array. No markdown fences, no extra text. "
+            "If no issues found, return []."
+        )
+
+        try:
+            result = await model.invoke(
+                [UserMessage(content=prompt)],
+                max_tokens=4000,
+                temperature=0.2,
+            )
+            text = (getattr(result, "content", None) or str(result)).strip()
+        except Exception:
+            logger.exception("[tracehound.analyze] LLM call failed for session %s", session_id)
+            await _send({"ok": False, "error": "LLM analysis failed — check model configuration"})
+            return
+
+        # Parse JSON array from response
+        issues: list = []
+        try:
+            issues = json.loads(text)
+        except json.JSONDecodeError:
+            match = _re.search(r"\[[\s\S]*\]", text)
+            if match:
+                try:
+                    issues = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    logger.warning("[tracehound.analyze] JSON parse failed: %s", text[:400])
+
+        # Validate and normalise
+        clean: list[dict] = []
+        for item in (issues if isinstance(issues, list) else []):
+            if not isinstance(item, dict):
+                continue
+            clean.append({
+                "priority": max(1, min(5, int(item.get("priority") or 3))),
+                "title": str(item.get("title") or "Unnamed issue")[:100],
+                "description": str(item.get("description") or ""),
+                "evidence": str(item.get("evidence") or ""),
+                "impact": str(item.get("impact") or ""),
+                "root_cause": str(item.get("root_cause") or ""),
+                "recommendation": str(item.get("recommendation") or ""),
+            })
+        clean.sort(key=lambda x: x["priority"])
+
+        await _send({
+            "ok": True,
+            "issues": clean,
+            "fingerprint": fingerprint,
+            "analyzed_at": _time.time(),
+        })
