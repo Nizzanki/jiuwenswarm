@@ -565,7 +565,8 @@
       "noRecords": "No records found for this turn.",
       "retriesTooltip": "This request was attempted {{count}} times. Each retry was triggered when a new message arrived while the original was still pending. Idle time between attempts is shown as grey separators in the timeline below.",
       "tools": "{{count}} tool(s)",
-      "skills": "🎯 {{count}} skill(s)"
+      "skills": "🎯 {{count}} skill(s)",
+      "turnIdTooltip": "Turn ID: {{id}}"
     },
     "perAgent": {
       "title": "Per-agent activity",
@@ -575,6 +576,10 @@
       "noUsage": "—",
       "llmTokens": "{{llm}} llm · {{tokens}} tok",
       "leader": "leader"
+    },
+    "timeline": {
+      "user": "You",
+      "agent": "Agent"
     },
     "graph": {
       "records": "Records",

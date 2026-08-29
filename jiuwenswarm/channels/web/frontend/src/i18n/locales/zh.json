@@ -550,7 +550,8 @@
       "noRecords": "未找到该轮次的记录。",
       "retriesTooltip": "该请求被尝试了 {{count}} 次。每次重试都是在有新消息到达而原请求仍待处理时触发的。尝试之间的空闲时间以灰色分隔符显示在下方时间线中。",
       "tools": "{{count}} 个工具",
-      "skills": "🎯 {{count}} 个技能"
+      "skills": "🎯 {{count}} 个技能",
+      "turnIdTooltip": "轮次 ID：{{id}}"
     },
     "perAgent": {
       "title": "各 agent 活动",
@@ -560,6 +561,10 @@
       "noUsage": "—",
       "llmTokens": "{{llm}} 次 LLM · {{tokens}} tok",
       "leader": "领导者"
+    },
+    "timeline": {
+      "user": "用户",
+      "agent": "Agent"
     },
     "graph": {
       "records": "记录",

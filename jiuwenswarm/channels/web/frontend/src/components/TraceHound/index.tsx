@@ -3,7 +3,6 @@
  */
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { useTraceHoundStore, type HistoryRecord, type TurnSummary, type AnalysisIssue, type AgentActivity } from '../../stores/traceHoundStore';
@@ -13,6 +12,8 @@ import { shouldRefetch, POLL_INTERVAL_MS } from './traceLive';
 import { buildHighlights } from './highlights';
 import { TimelineBand, PerAgentCard } from './traceCharts';
 import { TraceGraph } from './TraceGraph';
+import { Tooltip } from './Tooltip';
+import { EVENT_META, agentColor, isFailedToolResult, recordAgent, recordHeaderLabel } from './recordMeta';
 
 // ── Shared styles ─────────────────────────────────────────────────────────────
 
@@ -88,22 +89,6 @@ function modeBadge(mode: string | null | undefined): React.ReactNode {
 
 // ── Team agent attribution ───────────────────────────────────────────────────
 
-const AGENT_PALETTE = [C.info, C.warn, C.violet, C.danger, C.teal, C.ok];
-
-function agentColor(name: string): string {
-  if (name === 'leader') return C.textMuted;
-  let h = 0;
-  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
-  return AGENT_PALETTE[h % AGENT_PALETTE.length];
-}
-
-/** Resolve the acting agent (member_name, else 'leader') for a team record. */
-function recordAgent(rec: HistoryRecord): string {
-  if (rec.member_name) return rec.member_name;
-  if (rec.role === 'leader') return 'leader';
-  return '';
-}
-
 /** Small colored tag for a team agent (leader gets a neutral slate tag). */
 function agentTag(name: string, t: TFunction, withDot = true): React.ReactNode {
   const color = agentColor(name);
@@ -115,67 +100,6 @@ function agentTag(name: string, t: TFunction, withDot = true): React.ReactNode {
 }
 
 // ── Custom tooltip (browser title= is unreliable/slow) ────────────────────────
-
-function Tooltip({ text, children }: { text: string; children: React.ReactNode }) {
-  const [show, setShow] = useState(false);
-  const [pos, setPos] = useState({ x: 0, y: 0 });
-
-  const handleEnter = (e: React.MouseEvent<HTMLElement>) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    setPos({ x: rect.left + rect.width / 2, y: rect.top });
-    setShow(true);
-  };
-
-  // If child is a React element, attach handlers directly — no wrapper.
-  // This lets the child remain a direct flex item in its parent row.
-  if (React.isValidElement(children)) {
-    return (
-      <>
-        {React.cloneElement(children, {
-          onMouseEnter: handleEnter,
-          onMouseLeave: () => setShow(false),
-        } as any)}
-        {show && text && createPortal(
-          <div style={{
-            position: 'fixed', top: pos.y - 8, left: pos.x, transform: 'translate(-50%, -100%)',
-            background: C.text, color: C.surface, fontSize: 11, padding: '8px 10px',
-            borderRadius: 6, whiteSpace: 'pre-wrap', zIndex: 2147483647, minWidth: 180, maxWidth: 300,
-            boxShadow: '0 4px 16px rgba(0,0,0,0.35)', pointerEvents: 'none', lineHeight: 1.5,
-          }}>
-            {text}
-            <div style={{ position: 'absolute', bottom: -5, left: '50%', transform: 'translateX(-50%)', width: 0, height: 0, borderLeft: '5px solid transparent', borderRight: '5px solid transparent', borderTop: `5px solid ${C.text}` }} />
-          </div>,
-          document.body
-        )}
-      </>
-    );
-  }
-
-  // For text / fragment children, fall back to a span wrapper
-  return (
-    <>
-      <span
-        style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}
-        onMouseEnter={handleEnter}
-        onMouseLeave={() => setShow(false)}
-      >
-        {children}
-      </span>
-      {show && text && createPortal(
-        <div style={{
-          position: 'fixed', top: pos.y - 8, left: pos.x, transform: 'translate(-50%, -100%)',
-          background: C.text, color: C.surface, fontSize: 11, padding: '8px 10px',
-          borderRadius: 6, whiteSpace: 'pre-wrap', zIndex: 2147483647, minWidth: 180, maxWidth: 300,
-          boxShadow: '0 4px 16px rgba(0,0,0,0.35)', pointerEvents: 'none', lineHeight: 1.5,
-        }}>
-          {text}
-          <div style={{ position: 'absolute', bottom: -5, left: '50%', transform: 'translateX(-50%)', width: 0, height: 0, borderLeft: '5px solid transparent', borderRight: '5px solid transparent', borderTop: `5px solid ${C.text}` }} />
-        </div>,
-        document.body
-      )}
-    </>
-  );
-}
 
 /** Color for each outcome type — used in charts, badges, timeline bars */
 const OUTCOME_COLORS: Record<string, string> = {
@@ -274,30 +198,6 @@ function downloadText(content: string, filename: string) {
   const a = document.createElement('a');
   a.href = url; a.download = filename; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-function isFailedToolResult(rec: HistoryRecord): boolean {
-  if (rec.error_type) return true;
-  // Team-mode tool errors serialize into the result string with no structured
-  // error fields (e.g. `success=False data=None error='...'`).
-  return typeof rec.result === 'string' && rec.result.includes('success=False');
-}
-
-function recordHeaderLabel(rec: HistoryRecord, t: TFunction): string {
-  const key = rec.role === 'user' ? 'user' : (rec.event_type ?? '');
-  const meta = EVENT_META[key];
-  const label = meta
-    ? t(`traceHound.records.events.${meta.labelKey}`)
-    : (rec.event_type ?? rec.role);
-  const subLabel = rec.subagent_type ? t('traceHound.records.subagent', { type: rec.subagent_type }) : '';
-  const agentName = recordAgent(rec);
-  const agentLabel = agentName ? t('traceHound.records.byAgent', { name: agentName }) : '';
-  const toolName = rec.tool_name ?? (rec.tool_call as Record<string, unknown>)?.name ?? '';
-  if (key === 'chat.tool_call') return `${t('traceHound.records.labeled', { label, name: toolName })}${subLabel}${agentLabel}`;
-  if (key === 'chat.tool_result') return `${t('traceHound.records.labeled', { label, name: rec.tool_name ?? '' })}${subLabel}${agentLabel}`;
-  if (key === 'chat.tool_update') return `${t('traceHound.records.labeled', { label, name: rec.tool_name ?? '' })}${subLabel}${agentLabel}`;
-  if (key === 'chat.usage_metadata') return `${t('traceHound.records.labeled', { label, name: rec.metadata?.usage_metadata?.model_name ?? '' })}${subLabel}${agentLabel}`;
-  return `${label}${subLabel}${agentLabel}`;
 }
 
 // Serialize a history record as plain text, mirroring exactly what its on-screen
@@ -1731,20 +1631,7 @@ export function TurnListView({ isConnected, embedded = false }: { isConnected: b
 
 // ── View 3: Turn Detail ───────────────────────────────────────────────────────
 
-const EVENT_META: Record<string, { icon: string; labelKey: string; color: string; subtle: string }> = {
-  user:                 { icon: '🧑', labelKey: 'user',             color: C.info,    subtle: C.infoSubtle },
-  'chat.reasoning':     { icon: '🤔', labelKey: 'reasoning',        color: C.violet,  subtle: C.violetSubtle },
-  'chat.tool_call':     { icon: '🔧', labelKey: 'toolCall',         color: C.warn,    subtle: C.warnSubtle },
-  'chat.tool_update':   { icon: '⏳', labelKey: 'toolUpdate',       color: C.warn,    subtle: C.warnSubtle },
-  'chat.tool_result':   { icon: '',   labelKey: 'toolResult',       color: C.ok,      subtle: C.okSubtle },
-  'chat.final':         { icon: '💬', labelKey: 'response',         color: C.violet,  subtle: C.violetSubtle },
-  'chat.file':          { icon: '📄', labelKey: 'file',             color: C.teal,    subtle: C.infoSubtle },
-  'chat.usage_metadata':{ icon: '⚡', labelKey: 'llmCall',          color: C.violet,  subtle: C.violetSubtle },
-  'chat.usage_summary': { icon: '📊', labelKey: 'usageSummary',     color: C.textMuted, subtle: C.surfaceMuted },
-  'chat.error':         { icon: '🚨', labelKey: 'error',            color: C.danger,  subtle: C.dangerSubtle },
-};
-
-function RecordCard({ rec, displayDelta, endDelta, allRecords, expandAll = false }: { rec: HistoryRecord; displayDelta: number | null; endDelta?: number | null; allRecords?: HistoryRecord[]; expandAll?: boolean }) {
+function RecordCard({ rec, index, displayDelta, endDelta, allRecords, expandAll = false }: { rec: HistoryRecord; index: number; displayDelta: number | null; endDelta?: number | null; allRecords?: HistoryRecord[]; expandAll?: boolean }) {
   const { t } = useTranslation();
   const key = rec.role === 'user' ? 'user' : (rec.event_type ?? '');
   const meta = EVENT_META[key];
@@ -1789,14 +1676,16 @@ function RecordCard({ rec, displayDelta, endDelta, allRecords, expandAll = false
   // "+56s" when the actual attempt took ~1s (the 56s was idle time between retries).
 
   return (
-    <div id={`rec-${rec.id}`} data-event-type={rec.event_type} data-tool-call-id={rec.tool_call_id} style={{ border: `1px solid ${subtle}`, borderLeft: `3px solid ${danger ? C.danger : color}`, borderRadius: 6, marginBottom: 8, background: C.surface, overflow: 'hidden' }}>
+    <div id={`rec-${index}`} data-event-type={rec.event_type} data-tool-call-id={rec.tool_call_id} style={{ border: `1px solid ${subtle}`, borderLeft: `3px solid ${danger ? C.danger : color}`, borderRadius: 6, marginBottom: 8, background: C.surface, overflow: 'hidden' }}>
       {/* Header */}
       <div
         style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: collapsible ? 'pointer' : 'default', background: danger ? C.dangerSubtle : subtle }}
         onClick={() => collapsible && setLocal(!shown)}
       >
         <span style={{ fontSize: 14 }}>{icon}</span>
-        <span style={{ fontWeight: 600, fontSize: 13, color, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{headerLabel}</span>
+        <Tooltip text={headerLabel}>
+          <span style={{ fontWeight: 600, fontSize: 13, color, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{headerLabel}</span>
+        </Tooltip>
         {recordAgent(rec) && agentTag(recordAgent(rec), t)}
         {rec.mode && <span style={{ fontSize: 10, padding: '1px 5px', borderRadius: 3, background: C.surfaceMuted, color: C.textMuted, flexShrink: 0 }}>{rec.mode}</span>}
         {(key === 'chat.tool_call' || key === 'chat.tool_update' || key === 'chat.tool_result') && rec.tool_call_id && (
@@ -1821,7 +1710,6 @@ function RecordCard({ rec, displayDelta, endDelta, allRecords, expandAll = false
           )}
         </span>
         {collapsible && <span style={{ fontSize: 12, color: C.textFaint }}>{shown ? '▲' : '▼'}</span>}
-        {rec.id && <span style={{ fontSize: 9, color: C.borderStrong, fontFamily: 'monospace', flexShrink: 0 }} title={t('traceHound.records.recordId', { id: rec.id })}>{rec.id.replace(/:(assistant|user)$/, '').slice(-12)}</span>}
       </div>
 
       {/* User message — visible but clamped (~6 lines) so a huge IDE-context
@@ -2114,19 +2002,21 @@ export function TurnDetailView() {
 
   // Records | Graph switch (Langfuse-style per-turn graph view).
   const [tab, setTab] = useState<'records' | 'graph'>('records');
-  const scrollToRecord = (recordId: string) =>
-    document.getElementById(`rec-${recordId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  // Record cards are keyed by their index in `turnRecords` (rec.id is the shared
+  // turn request_id, not unique), so scroll targets use `rec-<index>`.
+  const scrollToRecord = (recordIndex: number) =>
+    document.getElementById(`rec-${recordIndex}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
 
   // A graph node click switches to the Records tab, but the records list only
   // mounts once that tab renders. Stash the target and scroll from an effect
   // keyed on the tab so the record is revealed after mount.
-  const [pendingRecordId, setPendingRecordId] = useState<string | null>(null);
+  const [pendingRecordIndex, setPendingRecordIndex] = useState<number | null>(null);
   useEffect(() => {
-    if (tab === 'records' && pendingRecordId) {
-      scrollToRecord(pendingRecordId);
-      setPendingRecordId(null);
+    if (tab === 'records' && pendingRecordIndex != null) {
+      scrollToRecord(pendingRecordIndex);
+      setPendingRecordIndex(null);
     }
-  }, [tab, pendingRecordId]);
+  }, [tab, pendingRecordIndex]);
 
   // Floating "back to top" button — the panel div is the scroll container.
   const panelRef = useRef<HTMLDivElement>(null);
@@ -2139,7 +2029,7 @@ export function TurnDetailView() {
   // show time elapsed within that attempt — never the misleading idle gap duration.
   const displayItems = useMemo(() => {
     type Item =
-      | { type: 'record'; rec: HistoryRecord; displayDelta: number | null; endDelta?: number | null }
+      | { type: 'record'; rec: HistoryRecord; index: number; displayDelta: number | null; endDelta?: number | null }
       | { type: 'gap'; seconds: number };
     const items: Item[] = [];
     let attemptStartTs = 0;
@@ -2169,7 +2059,7 @@ export function TurnDetailView() {
           endDelta = d > 0 ? d : null;
         }
       }
-      items.push({ type: 'record', rec, displayDelta, endDelta });
+      items.push({ type: 'record', rec, index: i, displayDelta, endDelta });
     };
 
     turnRecords.forEach((rec, i) => {
@@ -2300,6 +2190,14 @@ export function TurnDetailView() {
         <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', minWidth: 0, marginBottom: 10 }}>
           {turn && turn.total_tokens > 0 && <span style={chipStyle}>{t('traceHound.messages.tokens', { count: turn.total_tokens.toLocaleString() })}</span>}
           {turn && turn.llm_call_count > 0 && <span style={chipStyle}>{t('traceHound.messages.llmCalls', { count: turn.llm_call_count })}</span>}
+          {turn && turn.turn_id && (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+              <Tooltip text={t('traceHound.turnDetail.turnIdTooltip', { id: turn.turn_id })}>
+                <span style={{ ...chipStyle, fontFamily: 'monospace', cursor: 'help' }}>#{turn.turn_id.slice(-12)}</span>
+              </Tooltip>
+              <CopyButton text={turn.turn_id} />
+            </span>
+          )}
           {turn && turn.tool_names.length > 0 && <span style={{ ...chipStyle, color: C.warn, background: C.warnSubtle, border: `1px solid ${C.warnSubtle}` }}>{t('traceHound.turnDetail.tools', { count: turn.tool_names.length })}</span>}
           {turn && turn.skill_names.length > 0 && <span style={{ ...chipStyle, color: C.violet, background: C.violetSubtle, border: `1px solid ${C.violetSubtle}` }}>{t('traceHound.turnDetail.skills', { count: turn.skill_names.length })}</span>}
           {turn && turn.tool_failures > 0 && <span style={{ ...chipStyle, color: C.danger, background: C.dangerSubtle, border: `1px solid ${C.dangerSubtle}` }}>{turn.tool_failures} {t('traceHound.messages.failed')}</span>}
@@ -2330,7 +2228,7 @@ export function TurnDetailView() {
       {/* Wall-clock strip of this turn's records — click a dot to jump to its card */}
       <TimelineBand
         records={turnRecords}
-        onClickRecord={r => document.getElementById(`rec-${r.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })}
+        onClickRecord={(_r, index) => scrollToRecord(index)}
       />
 
       {error && <ErrorBanner message={error} onClose={clearError} />}
@@ -2363,13 +2261,13 @@ export function TurnDetailView() {
                 );
               }
               const rec = item.rec;
-              return <RecordCard key={`${expandAll}:${rec.id ?? `${rec.event_type}-${i}`}`} rec={rec} displayDelta={item.displayDelta} endDelta={item.endDelta} allRecords={turnRecords} expandAll={expandAll} />;
+              return <RecordCard key={`${expandAll}:${item.index}`} rec={rec} index={item.index} displayDelta={item.displayDelta} endDelta={item.endDelta} allRecords={turnRecords} expandAll={expandAll} />;
             })
           ) : (
             <TraceGraph
               records={turnRecords}
-              onSelectRecord={id => {
-                setPendingRecordId(id);
+              onSelectRecord={index => {
+                setPendingRecordIndex(index);
                 setTab('records');
               }}
             />

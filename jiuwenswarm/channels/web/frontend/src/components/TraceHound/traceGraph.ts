@@ -6,7 +6,8 @@ export type GraphNode = {
   kind: 'user' | 'agent' | 'tool' | 'llm' | 'final';
   count: number;
   agent?: string;
-  recordIds: string[];
+  /** Indices (into the source `records` array) of the records this node stands for. */
+  recordIndexes: number[];
 };
 export type GraphEdge = { from: string; to: string; kind: 'seq' | 'pair' | 'spawn' | 'cycle' };
 export type GraphMode = 'aggregated' | 'expanded';
@@ -27,36 +28,36 @@ export function buildGraph(records: HistoryRecord[], mode: GraphMode): { nodes: 
 
   const agentOf = (r: HistoryRecord) => (r.member_name ?? '').trim() || undefined;
 
-  const emit = (r: HistoryRecord, kind: GraphNode['kind'], label: string) => {
+  const emit = (r: HistoryRecord, idx: number, kind: GraphNode['kind'], label: string) => {
     const agent = agentOf(r);
     const id = mode === 'aggregated' ? `${kind}:${agent ?? ''}:${label}` : `${kind}:${agent ?? ''}:${label}:${seq.length}`;
     const ex = nodes.get(id);
     if (ex) {
       ex.count += 1;
-      ex.recordIds.push(r.id);
+      ex.recordIndexes.push(idx);
     } else {
-      nodes.set(id, { id, label, kind, count: 1, agent, recordIds: [r.id] });
+      nodes.set(id, { id, label, kind, count: 1, agent, recordIndexes: [idx] });
     }
     seq.push(id);
     nodeKeyByRecordId.set(r.id, id);
     return id;
   };
 
-  for (const r of records) {
+  records.forEach((r, idx) => {
     const et = r.event_type ?? (r.role === 'user' ? 'user' : '');
     if (et === 'user') {
-      emit(r, 'user', 'user');
+      emit(r, idx, 'user', 'user');
     } else if (et === 'chat.tool_call') {
-      const id = emit(r, 'tool', r.tool_call?.name || r.tool_name || 'tool');
+      const id = emit(r, idx, 'tool', r.tool_call?.name || r.tool_name || 'tool');
       if (r.tool_call?.id) callKeyById.set(r.tool_call.id, id);
     } else if (et === 'chat.usage_metadata') {
-      emit(r, 'llm', 'llm');
+      emit(r, idx, 'llm', 'llm');
     } else if (et === 'chat.final') {
-      if ((r.content ?? '').trim()) emit(r, 'final', 'final');
+      if ((r.content ?? '').trim()) emit(r, idx, 'final', 'final');
     }
     // chat.tool_result / chat.tool_update / chat.reasoning / chat.error are not
     // nodes; tool_result participates via pairing below.
-  }
+  });
 
   // Sequential edges along record order. In aggregated mode a repeated edge
   // (same pair of collapsed nodes) is emitted once as a cycle arc instead.

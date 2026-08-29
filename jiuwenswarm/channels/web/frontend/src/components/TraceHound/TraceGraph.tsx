@@ -22,7 +22,7 @@ const KIND_STROKE: Record<GraphNode['kind'], string> = {
  *  of the collapsed/expanded nodes, rows group them into member lanes, and
  *  each tool call is paired with the node following its result.
  *  Wide graphs scale down to fit the pane (zoom controls for detail). */
-export function TraceGraph({ records, onSelectRecord }: { records: HistoryRecord[]; onSelectRecord: (recordId: string) => void }) {
+export function TraceGraph({ records, onSelectRecord }: { records: HistoryRecord[]; onSelectRecord: (recordIndex: number) => void }) {
   const { t } = useTranslation();
   const [mode, setMode] = useState<GraphMode>(() =>
     typeof localStorage !== 'undefined' && localStorage.getItem(LS_MODE) === 'expanded' ? 'expanded' : 'aggregated',
@@ -175,7 +175,7 @@ export function TraceGraph({ records, onSelectRecord }: { records: HistoryRecord
             const y = cy(n) - NODE_H / 2;
             const stroke = n.agent ? laneColor.get(n.id) : KIND_STROKE[n.kind];
             return (
-              <g key={n.id} style={{ cursor: 'pointer' }} onClick={() => n.recordIds[0] && onSelectRecord(n.recordIds[0])}>
+              <g key={n.id} style={{ cursor: 'pointer' }} onClick={() => n.recordIndexes.length > 0 && onSelectRecord(n.recordIndexes[0])}>
                 <rect x={x} y={y} width={NODE_W} height={NODE_H} rx={6} fill={C.surface} stroke={stroke} strokeWidth={1.5} />
                 <text x={cx(n)} y={cy(n) + 1} textAnchor="middle" fontSize={9} fill={C.text} style={{ pointerEvents: 'none' }}>
                   {n.label}
