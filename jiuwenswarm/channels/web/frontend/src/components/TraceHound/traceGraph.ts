@@ -12,6 +12,94 @@ export type GraphNode = {
 export type GraphEdge = { from: string; to: string; kind: 'seq' | 'pair' | 'spawn' | 'cycle' };
 export type GraphMode = 'aggregated' | 'expanded';
 
+// ── Vertical layout ───────────────────────────────────────────────────────────
+
+export const GRID = { nodeW: 48, nodeH: 28, colW: 120, rowH: 64 } as const;
+
+export type GraphLayout = {
+  nodeW: number;
+  nodeH: number;
+  colW: number;
+  rowH: number;
+  /** Center x per node id (column = agent lane). */
+  xOf: Map<string, number>;
+  /** Center y per node id (row = first-appearance order, top→bottom). */
+  yOf: Map<string, number>;
+  /** Lane (column) index per node id; 0 = user/non-member, 1+ = agent. */
+  laneOf: Map<string, number>;
+  laneCount: number;
+  W: number;
+  H: number;
+};
+
+/** Vertical layout: first-appearance order runs top→bottom (rows) and each
+ *  agent gets a column (lane). Wide graphs no longer sprawl horizontally —
+ *  they grow tall and scroll down. */
+export function layoutGraph(nodes: GraphNode[]): GraphLayout {
+  const { nodeW, nodeH, colW, rowH } = GRID;
+  const agentIndex = new Map<string, number>();
+  for (const n of nodes) if (n.agent && !agentIndex.has(n.agent)) agentIndex.set(n.agent, agentIndex.size);
+  const xOf = new Map<string, number>();
+  const yOf = new Map<string, number>();
+  const laneOf = new Map<string, number>();
+  nodes.forEach((n, i) => {
+    const lane = n.agent ? 1 + agentIndex.get(n.agent)! : 0;
+    laneOf.set(n.id, lane);
+    xOf.set(n.id, lane * colW + colW / 2);
+    yOf.set(n.id, i * rowH + rowH / 2);
+  });
+  const laneCount = agentIndex.size + 1;
+  const W = Math.max(laneCount, 1) * colW;
+  const H = Math.max(nodes.length, 1) * rowH;
+  return { nodeW, nodeH, colW, rowH, xOf, yOf, laneOf, laneCount, W, H };
+}
+
+// ── Node tooltip ──────────────────────────────────────────────────────────────
+
+function truncate(s: string, n: number): string {
+  const t = s.trim();
+  return t.length > n ? `${t.slice(0, n)}…` : t;
+}
+
+/** Concise hover summary for a graph node (input/output previews). `t` is the
+ *  i18n translate fn; `records` is the source record array the node indexes into. */
+export function graphNodeTooltip(
+  node: GraphNode,
+  records: HistoryRecord[],
+  t: (key: string, opts?: Record<string, unknown>) => string,
+): string {
+  const recs = node.recordIndexes.map(i => records[i]).filter(Boolean);
+  const lines: string[] = [`${node.label}${node.count > 1 ? ` ×${node.count}` : ''}`];
+  if (node.agent) lines.push(t('traceHound.records.byAgent', { name: node.agent }));
+
+  const preview = (r: HistoryRecord): string => {
+    if (r.role === 'user') return truncate(r.content ?? '', 120);
+    const et = r.event_type ?? '';
+    if (et === 'chat.tool_call') {
+      const args = (r.tool_call as Record<string, unknown> | undefined)?.arguments ?? r.content ?? '';
+      let s = '';
+      try { s = JSON.stringify(typeof args === 'string' ? JSON.parse(args) : args); } catch { s = String(args); }
+      return truncate(s, 100);
+    }
+    if (et === 'chat.tool_result') return truncate(r.result ?? r.content ?? '', 100);
+    if (et === 'chat.usage_metadata') {
+      const um = r.metadata?.usage_metadata;
+      const parts: string[] = [];
+      if (um?.model_name) parts.push(um.model_name);
+      if (um?.input_tokens != null) parts.push(`${um.input_tokens}→${um.output_tokens ?? '?'} tok`);
+      if (um?.total_latency != null) parts.push(`${um.total_latency}s`);
+      return parts.join(' · ');
+    }
+    if (et === 'chat.final') return truncate(r.content ?? '', 120);
+    return truncate(r.content ?? '', 100);
+  };
+
+  const shown = recs.slice(0, 3);
+  for (const r of shown) lines.push(preview(r));
+  if (recs.length > shown.length) lines.push(`… +${recs.length - shown.length}`);
+  return lines.filter(l => l && l.trim()).join('\n');
+}
+
 /** Build the agent-workflow graph for one turn from its history records.
  *  Edges are inferred: temporal sequence, tool_call_id pairing, spawn links.
  *  In aggregated mode, records collapse per (agent, kind, label) with a count

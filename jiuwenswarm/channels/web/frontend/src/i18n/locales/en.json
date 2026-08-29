@@ -592,7 +592,9 @@
       "zoomOut": "Zoom out",
       "fit": "Fit",
       "fitTooltip": "Scale graph to fit the pane width",
-      "actualSize": "Actual size (1:1)"
+      "actualSize": "Actual size (1:1)",
+      "fullscreen": "Full screen",
+      "exitFullscreen": "Exit full screen"
     },
     "highlights": {
       "title": "Highlights",
