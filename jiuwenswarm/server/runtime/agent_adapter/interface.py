@@ -4105,8 +4105,6 @@ class JiuWenSwarm:
         logger.info("[JiuWenSwarm] cleanup: 清理资源")
         await self._session_manager.close_all_sessions()
 
-        await self._session_manager.close_all_sessions()
-
         if self._adapter is not None:
             try:
                 if hasattr(self._adapter, "cleanup"):
