@@ -1515,7 +1515,6 @@ class GatewayServer(BaseWebChannel):
                 params=params,
                 timestamp=time.time(),
                 ok=True,
-                user_id=self._connection_user_id(ws),
                 req_method=req_method,
                 mode=mode,
                 metadata=metadata,
