@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Magnifying glass representing search/hound tracking -->
+  <circle cx="10" cy="10" r="6"/>
+  <line x1="14.5" y1="14.5" x2="20" y2="20"/>
+  <!-- Paw print inside the lens -->
+  <ellipse cx="10" cy="11.5" rx="1.8" ry="1.4"/>
+  <circle cx="7.8" cy="8.8" r="0.9"/>
+  <circle cx="10" cy="7.8" r="0.9"/>
+  <circle cx="12.2" cy="8.8" r="0.9"/>
+</svg>

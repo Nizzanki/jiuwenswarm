@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from jiuwenswarm.common.e2a.models import E2AEnvelope
+from jiuwenswarm.extensions.agentos.agentos_router.logutil import format_agentos, log_agentos
 from jiuwenswarm.extensions.agentos.agentos_router.models import AgentInfo, AgentStatus
+
+logger = logging.getLogger(__name__)
 
 
 AgentCreator = Callable[[AgentInfo], Awaitable[AgentInfo | None]]
@@ -323,6 +327,7 @@ class AgentManager:
             else max(0.1, float(timeout_seconds))
         )
         key_desc = AgentRuntime.format_key(key, self._key_fields)
+        session_id = str((key_values or {}).get("session_id") or (metadata or {}).get("session_id") or "")
 
         while True:
             owner = False
@@ -366,9 +371,27 @@ class AgentManager:
                     acquire=acquire,
                 )
 
+            log_agentos(
+                logger,
+                logging.DEBUG,
+                "sandbox.create.wait",
+                user_id=key_user_id,
+                session_id=session_id,
+                agent_type=key_agent_type,
+                key=key_desc,
+            )
             try:
                 await runtime.wait_until_settled(wait_timeout)
             except asyncio.TimeoutError as exc:
+                log_agentos(
+                    logger,
+                    logging.WARNING,
+                    "sandbox.create.timeout",
+                    user_id=key_user_id,
+                    session_id=session_id,
+                    agent_type=key_agent_type,
+                    key=key_desc,
+                )
                 raise AgentCreatingTimeout(
                     f"AGENT_CREATING_TIMEOUT: {key_desc}"
                 ) from exc
@@ -383,11 +406,23 @@ class AgentManager:
         agent_type: str,
         *,
         key_values: Mapping[str, Any] | None = None,
+        acquire: bool = False,
     ) -> AgentRuntime | None:
+        """Return a snapshot of an existing runtime, or ``None``.
+
+        With ``acquire=True`` and a READY runtime, increment ``task_count``
+        under the lock (same contract as :meth:`get_or_create_agent`) so the
+        idle reaper cannot reclaim the sandbox between resolve and use.
+        Callers must pair it with :meth:`release`.
+        """
         key = self._make_key(user_id, agent_type, key_values=key_values)
         async with self._runtimes_lock:
             runtime = self._runtimes.get(key)
-            return runtime.snapshot() if runtime is not None else None
+            if runtime is None:
+                return None
+            if acquire and runtime.is_ready():
+                self._acquire_locked(runtime)
+            return runtime.snapshot()
 
     async def delete_agent(
         self,
@@ -403,7 +438,7 @@ class AgentManager:
             runtime.mark_deleted()
 
     async def release(self, key: AgentKey) -> None:
-        """Drop one task holding acquired via ``get_or_create_agent(acquire=True)``.
+        """Drop one task holding acquired via ``get_or_create_agent`` / ``get_agent``.
 
         No-op when the runtime is already gone (e.g. explicitly deleted).
         """
@@ -465,6 +500,23 @@ class AgentManager:
             if self._runtimes.get(key) is not owner_runtime:
                 return
             owner_runtime.mark_failed(exc)
+        session_id = str(owner_runtime.info.metadata.get("session_id") or "")
+        sandbox_id = str(owner_runtime.info.sandbox_id or "")
+        fields = {
+            "user_id": owner_runtime.info.user_id,
+            "session_id": session_id,
+            "sandbox_id": sandbox_id,
+            "agent_type": owner_runtime.info.agent_type,
+            "error": type(exc).__name__,
+            "key": AgentRuntime.format_key(key, self._key_fields),
+        }
+        if isinstance(exc, asyncio.CancelledError):
+            log_agentos(logger, logging.WARNING, "sandbox.create.fail", **fields)
+            return
+        logger.exception(
+            format_agentos("sandbox.create.fail", **fields),
+            extra={k: v for k, v in (("session_id", session_id), ("sandbox_id", sandbox_id)) if v},
+        )
 
     async def _run_creator(
         self,
@@ -476,6 +528,16 @@ class AgentManager:
         acquire: bool = False,
     ) -> AgentRuntime:
         key_desc = AgentRuntime.format_key(key, self._key_fields)
+        session_id = str(agent.metadata.get("session_id") or "")
+        log_agentos(
+            logger,
+            logging.INFO,
+            "sandbox.create.start",
+            user_id=agent.user_id,
+            session_id=session_id,
+            agent_type=agent.agent_type,
+            key=key_desc,
+        )
         try:
             created = await creator(agent.copy()) if creator is not None else agent
             resolved = AgentRuntime.apply_creator_result(created, base=agent)

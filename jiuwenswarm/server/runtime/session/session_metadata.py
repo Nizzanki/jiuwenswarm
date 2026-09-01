@@ -14,7 +14,7 @@ from typing import Any
 from datetime import datetime, timezone
 
 from jiuwenswarm.common.utils import get_agent_sessions_dir
-from jiuwenswarm.common.mode_matrix import is_team_mode
+from jiuwenswarm.common.mode_matrix import deprecate_mode, is_new_canonical_mode, is_team_mode
 from jiuwenswarm.server.runtime.session.work_mode import (
     DEFAULT_WEB_WORK_MODE,
     SUPPORTED_WORK_MODES,
@@ -65,7 +65,7 @@ def _bump_rebind_gen(session_id: str) -> None:
 # 会话标题自动生成的截取长度
 _TITLE_MAX_LEN = 50
 # 心跳任务会话目录前缀，不参与 session.list 等列表展示
-_HEARTBEAT_SESSION_PREFIX = "heartbeat_"
+_EPHEMERAL_PROBE_SESSION_PREFIXES = ("health_check_", "heartbeat_")
 _DELIVERY_KIND_SERVER_PUSH = "server_push"
 # user_id 白名单: 仅允许字母数字及 _-, 拒绝路径遍历字符
 _SAFE_USER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -181,6 +181,7 @@ def _apply_metadata_defaults_with_inference(
     # 常量默认字段:不触发写盘
     metadata.setdefault("project_dir", "")
     metadata.setdefault("project_id", "")
+    metadata.setdefault("persist_session", False)
     metadata.setdefault("model", "")
     metadata.setdefault("cron_id", "")
     metadata.setdefault("pinned", False)
@@ -230,6 +231,27 @@ def _apply_metadata_defaults_with_inference(
         if resolved_wm is not None:
             metadata["work_mode"] = resolved_wm
             changed = True
+
+    # mode 惰性迁移:旧 canonical（agent / agent.plan / code.team / team.plan.* 等）
+    # 静默映射到新三段命名 canonical（agent.work.normal 等）。仅迁移非空且非新
+    # canonical 的 mode 字段；映射后写盘以避免后续读路径重复迁移。
+    existing_mode = metadata.get("mode")
+    if existing_mode and not is_new_canonical_mode(existing_mode):
+        new_mode = deprecate_mode(existing_mode)
+        if new_mode != existing_mode:
+            logger.info(
+                "session_metadata 惰性迁移: session=%s mode '%s' -> '%s'",
+                session_id, existing_mode, new_mode,
+            )
+            metadata["mode"] = new_mode
+            changed = True
+        elif new_mode == existing_mode:
+            # 旧 canonical 但不在 DEPRECATION_MAP（如未识别值），避免静默丢字段
+            logger.warning(
+                "session_metadata mode 迁移未命中: session=%s mode='%s' "
+                "非新 canonical 但未在 DEPRECATION_MAP，原样保留",
+                session_id, existing_mode,
+            )
 
     # project_id: 缺失时尝试按 work_mode 反查唯一真实 Project
     if not str(metadata.get("project_id") or "").strip():
@@ -614,6 +636,7 @@ def init_session_metadata(
     team_template_id: str = "",
     project_dir: str = "",
     project_id: str = "",
+    persist_session: bool = False,
     model: str = "",
     cron_id: str = "",
     work_mode: str = "",
@@ -644,6 +667,7 @@ def init_session_metadata(
         "round_id": 0,
         "project_dir": project_dir,
         "project_id": project_id,
+        "persist_session": bool(persist_session),
         "model": model,
         "cron_id": cron_id,
         "last_user_message_at": _current_timestamp(),
@@ -651,6 +675,7 @@ def init_session_metadata(
         "pin_order": 0,
         "status": "idle",
         "work_mode": resolved_work_mode,
+        "total_tokens": 0,
     }
     if isinstance(channel_metadata, dict) and channel_metadata:
         metadata["channel_metadata"] = channel_metadata
@@ -666,11 +691,16 @@ def update_session_metadata(
     clear_title: bool = False,
     increment_message_count: bool = False,
     set_message_count: int | None = None,
+    set_round_id: int | None = None,
+    set_llm_calls: int | None = None,
+    set_total_events: int | None = None,
+    add_tokens: int = 0,
     user_content: str | None = None,
     channel_metadata: dict[str, Any] | None = None,
     mode: str | None = None,
     team_name: str | None = None,
     team_template_id: str | None = None,
+    agent_group_name: str | None = None,
     accent_color: str | None = None,
     project_dir: str | None = None,
     project_id: str | None = None,
@@ -683,6 +713,7 @@ def update_session_metadata(
     sync: bool = False,
     sync_write: bool = False,
     work_mode: str | None = None,
+    extra_metadata: dict[str, Any] | None = None,
 ) -> None:
     """更新会话元数据(异步写入,不阻塞调用方)
 
@@ -744,9 +775,11 @@ def update_session_metadata(
             "mode": mode if mode is not None else "unknown",
             "team_name": team_name or "",
             "team_template_id": team_template_id or "",
+            "agent_group_name": agent_group_name or "",
             "round_id": 0,
             "project_dir": project_dir or "",
             "project_id": project_id or "",
+            "persist_session": False,
             "model": model or "",
             "cron_id": "",
             "last_user_message_at": last_user_message_at if last_user_message_at is not None else _current_timestamp(),
@@ -754,13 +787,20 @@ def update_session_metadata(
             "pin_order": pin_order if pin_order is not None else 0,
             "status": "idle",
             "work_mode": resolved_work_mode,
+            "total_tokens": 0,
         }
         # 首次创建时写入 channel_metadata
         if channel_metadata:
             metadata["channel_metadata"] = channel_metadata
     else:
         # 更新现有元数据
-        if channel_id is not None:
+        # channel_id：首次锁定——仅当磁盘值为空时写入，后续不覆盖
+        # （与 project_dir/project_id/cron_id/user_id/work_mode 一致语义，
+        # 避免联机共享会话被其他通道消息覆写归属通道）
+        if channel_id and not (
+            isinstance(metadata.get("channel_id"), str)
+            and metadata.get("channel_id", "").strip()
+        ):
             metadata["channel_id"] = channel_id
         if user_id is not None:
             metadata["user_id"] = user_id
@@ -770,6 +810,8 @@ def update_session_metadata(
             metadata["team_name"] = team_name
         if team_template_id is not None:
             metadata["team_template_id"] = team_template_id
+        if agent_group_name is not None:
+            metadata["agent_group_name"] = agent_group_name
         if accent_color is not None:
             metadata["accent_color"] = accent_color
         # model：覆盖式——每次请求更新为本次模型
@@ -805,6 +847,18 @@ def update_session_metadata(
             metadata["message_count"] = metadata.get("message_count", 0) + 1
         if set_message_count is not None:
             metadata["message_count"] = set_message_count
+        if set_round_id is not None:
+            metadata["round_id"] = set_round_id
+        if set_llm_calls is not None:
+            metadata["llm_calls"] = set_llm_calls
+        if set_total_events is not None:
+            metadata["total_events"] = set_total_events
+        if extra_metadata:
+            metadata.update(extra_metadata)
+
+        # Accumulate total tokens (from LLM usage events)
+        if add_tokens > 0:
+            metadata["total_tokens"] = metadata.get("total_tokens", 0) + add_tokens
 
         # 自动生成标题: 当 title 为空且提供了用户消息内容时
         if not metadata.get("title") and user_content:
@@ -842,6 +896,7 @@ def sync_session_request_metadata(
     explicit_mode_provided: bool = False,
     explicit_model_provided: bool = False,
     work_mode: str | None = None,
+    persist_session: bool | None = None,
 ) -> str | None:
     """校验请求带来的参数与磁盘 metadata.json 是否需要更新，并按字段语义写入。
 
@@ -865,6 +920,9 @@ def sync_session_request_metadata(
         时才覆盖磁盘值；未显式携带（如只读 RPC 用默认推断值）则保持磁盘原值，不腐蚀
         已锁定的会话 mode（如 team 会话被只读 RPC 默认推断成 agent）。调用方应传入
         canonical mode（"agent.plan"/"team"）。与 append_history_record 联动一致。
+      - persist_session：**初始化后不可变**。新 Session 由 ``session.create`` 显式写入；
+        仅为兼容旧客户端，历史 metadata 缺字段时允许第一条旧式 chat 请求完成一次初始化，
+        此后任何不一致请求只告警、不覆盖。
 
     Args:
         session_id: 会话 ID（空则直接返回 None，不做任何操作）
@@ -915,6 +973,7 @@ def sync_session_request_metadata(
             "round_id": 0,
             "project_dir": project_dir or "",
             "project_id": project_id or "",
+            "persist_session": persist_session if isinstance(persist_session, bool) else False,
             "model": model if (model is not None and explicit_model_provided) else "",
             "cron_id": cron_id or "",
             "last_user_message_at": last_user_message_at if last_user_message_at is not None else now,
@@ -925,6 +984,38 @@ def sync_session_request_metadata(
         }
         effective_project_dir = project_dir or None
     else:
+        # persist_session：Session 创建期锁定。历史 metadata 没有该字段时允许
+        # 旧式 chat.send 的 eternal_conversation_enabled 做一次迁移；字段一旦存在，
+        # 即使值为 False 也表示已经完成初始化，后续请求不得改变。
+        if "persist_session" not in metadata:
+            metadata["persist_session"] = (
+                persist_session if isinstance(persist_session, bool) else False
+            )
+            logger.info(
+                "会话 %s 初始化缺失的 persist_session=%s",
+                session_id,
+                metadata["persist_session"],
+            )
+        else:
+            stored_persist_session = metadata.get("persist_session") is True
+            if not isinstance(metadata.get("persist_session"), bool):
+                logger.warning(
+                    "会话 %s 的 persist_session 非布尔值，按 False 失败关闭",
+                    session_id,
+                )
+                stored_persist_session = False
+                metadata["persist_session"] = False
+            if (
+                isinstance(persist_session, bool)
+                and persist_session != stored_persist_session
+            ):
+                logger.warning(
+                    "会话 %s 的 persist_session 已锁定为 %s，忽略请求带来的不一致值 %s",
+                    session_id,
+                    stored_persist_session,
+                    persist_session,
+                )
+
         # 校验 project_dir：首次锁定 / 不一致告警不覆盖
         locked_project = metadata.get("project_dir")
         if isinstance(locked_project, str) and locked_project.strip():
@@ -965,10 +1056,24 @@ def sync_session_request_metadata(
         if last_user_message_at is not None:
             metadata["last_user_message_at"] = last_user_message_at
         # mode：显式覆盖式——仅当请求方显式携带 mode 才覆盖；
-        # 未显式携带（如只读 RPC 默认推断）则保持磁盘原值，不腐蚀已锁定的会话 mode
+        # 未显式携带（如只读 RPC 默认推断）则保持磁盘原值，不腐蚀已锁定的会话 mode。
+        # 同时经 deprecate_mode 归一为新三段命名 canonical，旧串静默映射。
         if mode is not None and explicit_mode_provided:
-            metadata["mode"] = mode
-        if channel_id is not None:
+            new_mode = deprecate_mode(mode)
+            old_mode = metadata.get("mode")
+            if new_mode != old_mode:
+                logger.info(
+                    "session_metadata 显式更新 mode: session=%s '%s' -> '%s' "
+                    "(raw=%r)",
+                    session_id, old_mode, new_mode, mode,
+                )
+            metadata["mode"] = new_mode
+        # channel_id：首次锁定——仅当磁盘值为空时写入，后续不覆盖
+        # （与 project_dir/project_id/cron_id/user_id/work_mode 一致语义）
+        if channel_id and not (
+            isinstance(metadata.get("channel_id"), str)
+            and metadata.get("channel_id", "").strip()
+        ):
             metadata["channel_id"] = channel_id
         # user_id：首次锁定，已锁定则忽略请求值（与 project_id/cron_id 一致不可改）。
         # 由 envelope.user_id 透传，供 gateway 列表接口按用户隔离会话历史。
@@ -1010,6 +1115,7 @@ def get_session_metadata(
         )
         metadata.setdefault("team_name", "")
         metadata.setdefault("team_template_id", "")
+        metadata.setdefault("agent_group_name", "")
     return metadata
 
 
@@ -1071,7 +1177,7 @@ def set_session_pinned(session_id: str, pinned: bool) -> tuple[bool, int] | None
                 if not session_dir.is_dir():
                     continue
                 sid = session_dir.name
-                if sid.startswith(_HEARTBEAT_SESSION_PREFIX):
+                if sid.startswith(_EPHEMERAL_PROBE_SESSION_PREFIXES):
                     continue
                 m = _read_metadata(sid)
                 if not m:
@@ -1244,7 +1350,14 @@ def set_session_delivery_context(
             "status": "idle",
         }
     else:
-        if normalized_channel_id:
+        # channel_id：首次锁定——会话归属通道稳定，不被联机场景下其他通道的
+        # server_push 覆写；delivery_context.channel_id 仍保持动态更新，
+        # 供 build_server_push_message 路由异步推送（evolution watcher 等）到
+        # 用户最近活动的通道。
+        if normalized_channel_id and not (
+            isinstance(metadata.get("channel_id"), str)
+            and metadata.get("channel_id", "").strip()
+        ):
             metadata["channel_id"] = normalized_channel_id
         metadata["last_message_at"] = _current_timestamp()
 
@@ -1428,7 +1541,7 @@ def get_all_sessions_metadata(
             continue
 
         session_id = session_dir.name
-        if session_id.startswith(_HEARTBEAT_SESSION_PREFIX):
+        if session_id.startswith(_EPHEMERAL_PROBE_SESSION_PREFIXES):
             continue
         metadata = _read_metadata(session_id)
 
@@ -1449,6 +1562,8 @@ def get_all_sessions_metadata(
                 "project_dir": "",
                 "cron_id": "",
                 "work_mode": DEFAULT_WEB_WORK_MODE,
+                "round_id": 0,
+                "total_tokens": 0,
             }
             # 无 metadata.json 的会话不做推断写盘,仅补默认值
             metadata = _apply_metadata_defaults_with_inference(
@@ -1470,6 +1585,21 @@ def get_all_sessions_metadata(
                 id_to_work_mode=id_to_work_mode,
                 enable_writeback=False,
             )
+
+        # 如果 metadata 中的 round_id / total_tokens 为 0，尝试从 history 文件轻量扫描补充
+        if metadata.get("round_id", 0) == 0 or metadata.get("total_tokens", 0) == 0:
+            try:
+                from jiuwenswarm.server.runtime.session.session_history import get_session_history_stats
+                stats = get_session_history_stats(session_id)
+                if metadata.get("round_id", 0) == 0 and stats["turn_count"] > 0:
+                    metadata["round_id"] = stats["turn_count"]
+                if metadata.get("total_tokens", 0) == 0 and stats["total_tokens"] > 0:
+                    metadata["total_tokens"] = stats["total_tokens"]
+                # 同时修正 message_count，因为 message_count 的增量计数可能存在偏差
+                if stats["event_count"] > 0:
+                    metadata["message_count"] = stats["event_count"]
+            except Exception:
+                pass
 
         sessions.append(metadata)
 
@@ -1511,7 +1641,7 @@ def collect_all_sessions_metadata(
         if not session_dir.is_dir():
             continue
         sid = session_dir.name
-        if sid.startswith(_HEARTBEAT_SESSION_PREFIX):
+        if sid.startswith(_EPHEMERAL_PROBE_SESSION_PREFIXES):
             continue
         if user_id:
             # 按用户家目录读时,绕过走全局单例的 _read_metadata,直接读该目录下文件,

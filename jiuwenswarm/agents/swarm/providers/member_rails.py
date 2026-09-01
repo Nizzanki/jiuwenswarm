@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from openjiuwen.agent_teams.harness.manifest import (
@@ -42,11 +43,12 @@ from jiuwenswarm.agents.harness.common.rails.skill_retrieval_prompt_rail import 
 from jiuwenswarm.agents.harness.common.rails.symphony import (
     SymphonyOrchestrationRail,
 )
+from jiuwenswarm.agents.harness.code.rails.heartbeat_rail import HeartbeatRail
 from jiuwenswarm.agents.harness.team.rails.team_skill_storage_policy_rail import (
     TeamSkillStoragePolicyRail,
 )
-from jiuwenswarm.agents.harness.team.rails.team_shared_skill_link_refresh_rail import (
-    TeamSharedSkillLinkRefreshRail,
+from jiuwenswarm.agents.harness.team.rails.team_skill_library_reload_rail import (
+    TeamSkillLibraryReloadRail,
 )
 from jiuwenswarm.agents.harness.team.rails.team_workspace_report_path_rail import (
     TeamWorkspaceReportPathRail,
@@ -60,13 +62,52 @@ logger = logging.getLogger(__name__)
 
 RUNTIME_PROMPT = "swarm.runtime_prompt"
 TEAM_SKILL_STORAGE_POLICY = "swarm.team_skill_storage_policy"
-TEAM_SHARED_SKILL_LINK_REFRESH = "swarm.team_shared_skill_link_refresh"
+# Renamed from ``swarm.team_shared_skill_link_refresh``: the rail behind the
+# name reloads Skill views instead of rebuilding a per-team link farm. Team
+# specs are rebuilt from the config source on every assembly, so no persisted
+# spec carries the old element name.
+TEAM_SKILL_LIBRARY_RELOAD = "swarm.team_skill_library_reload"
 TEAM_WORKSPACE_REPORT_PATH = "swarm.team_workspace_report_path"
 CONTEXT_PROCESSOR = "swarm.context_processor"
 MODEL_ANOMALY_DETECTION = "swarm.model_anomaly_detection"
 PLUGIN_RAILS = "swarm.plugin_rails"
 SKILL_RETRIEVAL_PROMPT = "swarm.skill_retrieval_prompt"
 SYMPHONY_ORCHESTRATION_PROMPT = "swarm.symphony_orchestration_prompt"
+HEARTBEAT = "swarm.heartbeat"
+
+
+@harness_element(
+    kind=ElementKind.RAIL,
+    name=HEARTBEAT,
+    description="AgentServer-owned Heartbeat job tools bound to the Team session.",
+)
+def _build_heartbeat_rail(
+    params: dict[str, Any],
+    context: SwarmBuildContext,
+) -> HeartbeatRail | None:
+    """Mount the new Job Heartbeat Rail for Team members.
+
+    The service remains process-owned by AgentServer.  The provider only binds
+    the member tools to the immutable Team session identity; it never creates a
+    scheduler and never uses the deprecated ``RunKind.HEARTBEAT`` rail.
+    """
+    _ = params
+    service = getattr(context, "heartbeat_job_service", None)
+    session_id = str(getattr(context, "session_id", "") or "").strip()
+    if service is None or not session_id:
+        return None
+    metadata = dict(getattr(context, "request_metadata", None) or {})
+    tool_context = SimpleNamespace(
+        channel_id=str(getattr(context, "channel_id", None) or "web"),
+        session_id=session_id,
+        metadata=metadata,
+        user_id=str(getattr(context, "user_id", None) or ""),
+        mode=str(getattr(context, "mode", None) or "team"),
+        tool_scope=(
+            f"team_member_{getattr(context, 'member_card_id', None) or 'unknown'}"
+        ),
+    )
+    return HeartbeatRail(service=service, context=tool_context)
 
 
 def _workspace_root(ctx: SwarmBuildContext) -> str | None:
@@ -76,7 +117,7 @@ def _workspace_root(ctx: SwarmBuildContext) -> str | None:
 
 
 class SkillRetrievalPromptInput(ConstructionInput):
-    """Construction inputs for the agentic skill retrieval prompt rail."""
+    """Construction inputs for the Skill directory prompt rail."""
 
     global_skills_dir: str | None = context_field(
         attr="global_skills_dir",
@@ -87,7 +128,7 @@ class SkillRetrievalPromptInput(ConstructionInput):
 @harness_element(
     kind=ElementKind.RAIL,
     name=SKILL_RETRIEVAL_PROMPT,
-    description="Lightweight prompt guidance for agentic installed-skill tree retrieval.",
+    description="Prompt guidance and session reminders for Skill directory retrieval.",
     input_model=SkillRetrievalPromptInput,
 )
 def _build_skill_retrieval_prompt_rail(
@@ -98,16 +139,19 @@ def _build_skill_retrieval_prompt_rail(
     from jiuwenswarm.agents.harness.common.tools.skill_retrieval_toolkits import (
         is_skill_retrieval_enabled,
     )
-    from jiuwenswarm.agents.swarm.providers.tools import visible_skill_names_for_list_skill
-    from jiuwenswarm.server.runtime.skill.skill_manager import SkillManager
+    from jiuwenswarm.agents.swarm.providers.tools import (
+        skill_retrieval_toolkit_for_context,
+    )
 
-    if not is_skill_retrieval_enabled():
+    if not is_skill_retrieval_enabled(context.config):
         return None
     SkillRetrievalPromptInput.resolve(params, context)
-    manager = SkillManager()
+    toolkit = skill_retrieval_toolkit_for_context(context)
+    session_scope = toolkit.session_scope
     return SkillRetrievalPromptRail(
-        manager=manager,
-        visible_skill_names=lambda: visible_skill_names_for_list_skill(context),
+        toolkit=toolkit,
+        session_scope=session_scope,
+        config_base=context.config,
     )
 
 
@@ -205,15 +249,16 @@ class TeamSkillStoragePolicyInput(ConstructionInput):
 
     global_skills_dir: str | None = context_field(
         attr="global_skills_dir",
-        description="Global shared skills source directory.",
+        description="The one physical Skill library every member reads.",
     )
     team_ws_root: str | None = context_field(
         attr="team_ws_root",
         description="Team shared workspace root.",
     )
-    team_skills_dir: str | None = context_field(
-        attr="team_skills_dir",
-        description="Team shared skills linked view.",
+    team_skill_visibility_path: str | None = context_field(
+        attr="team_skill_visibility_path",
+        description="Team skills-visibility.json path (declares visibility, "
+        "never a Skill source).",
     )
 
 
@@ -221,22 +266,27 @@ class TeamSkillStoragePolicyInput(ConstructionInput):
     kind=ElementKind.RAIL,
     name=TEAM_SKILL_STORAGE_POLICY,
     description="Team-only policy that stores all skill authoring outputs in "
-    "the global shared skills source directory.",
+    "the single shared Skill library.",
     input_model=TeamSkillStoragePolicyInput,
 )
 def _build_team_skill_storage_policy_rail(
     params: dict[str, Any],
     context: SwarmBuildContext,
 ) -> TeamSkillStoragePolicyRail | None:
-    """Build the team skill storage policy rail when the global skill root exists.
+    """Build the team skill storage policy rail when the Skill library is known.
+
+    No team skills directory is passed any more: a team owns no Skill
+    directory, only a visibility document. Authoring targets the one library,
+    and the visibility file is named so the policy can tell the member it is
+    not a Skill source.
 
     Args:
         params: Spec params (unused; kept for the provider contract).
         context: Per-member build context.
 
     Returns:
-        A ``TeamSkillStoragePolicyRail`` or ``None`` when no global skills
-        directory is available.
+        A ``TeamSkillStoragePolicyRail`` or ``None`` when no Skill library is
+        available.
     """
     inp = TeamSkillStoragePolicyInput.resolve(params, context)
     if not inp.global_skills_dir:
@@ -244,64 +294,50 @@ def _build_team_skill_storage_policy_rail(
     return TeamSkillStoragePolicyRail(
         global_skills_dir=inp.global_skills_dir,
         team_workspace_root=inp.team_ws_root,
-        team_skills_dir=inp.team_skills_dir,
+        team_skill_visibility_file=inp.team_skill_visibility_path,
     )
 
 
-class TeamSharedSkillLinkRefreshInput(ConstructionInput):
-    """Construction inputs for refreshing team shared skill links."""
+class TeamSkillLibraryReloadInput(ConstructionInput):
+    """Construction inputs for the Skill-library reload rail."""
 
     global_skills_dir: str | None = context_field(
         attr="global_skills_dir",
-        description="Global shared skills source directory.",
-    )
-    session_id: str = context_field(
-        attr="session_id",
-        default="",
-        description="Active session id.",
-    )
-    channel: str = context_field(
-        attr="channel",
-        default="default",
-        description="Resolved channel key for the per-channel team manager.",
+        description="The one physical Skill library (gate; skipped when absent).",
     )
 
 
 @harness_element(
     kind=ElementKind.RAIL,
-    name=TEAM_SHARED_SKILL_LINK_REFRESH,
-    description="Refresh team shared skill links after tools write into the "
-    "global shared skills source directory.",
-    input_model=TeamSharedSkillLinkRefreshInput,
+    name=TEAM_SKILL_LIBRARY_RELOAD,
+    description="Reload the member's Skill view after a write into the single "
+    "physical Skill library.",
+    input_model=TeamSkillLibraryReloadInput,
 )
-def _build_team_shared_skill_link_refresh_rail(
+def _build_team_skill_library_reload_rail(
     params: dict[str, Any],
     context: SwarmBuildContext,
-) -> TeamSharedSkillLinkRefreshRail | None:
-    """Build the rail that refreshes team shared skill links after writes.
+) -> TeamSkillLibraryReloadRail | None:
+    """Build the rail that reloads Skill views after a library write.
+
+    Nothing is copied or linked any more, so no session id or team manager is
+    needed: the rail reloads the ``SkillUseRail`` instances mounted on its own
+    agent, which then re-read the library through the member's visibility
+    metadata. No reload hook is injected — the built-in behaviour is exactly
+    what is wanted here.
 
     Args:
         params: Spec params (unused; kept for the provider contract).
         context: Per-member build context.
 
     Returns:
-        A ``TeamSharedSkillLinkRefreshRail`` or ``None`` when required runtime
-        context is missing.
+        A ``TeamSkillLibraryReloadRail`` or ``None`` when no Skill library is
+        configured.
     """
-    inp = TeamSharedSkillLinkRefreshInput.resolve(params, context)
-    if not inp.global_skills_dir or not inp.session_id:
+    inp = TeamSkillLibraryReloadInput.resolve(params, context)
+    if not inp.global_skills_dir:
         return None
-
-    def refresh_links() -> None:
-        """Refresh the current team's shared skill link view."""
-        from jiuwenswarm.agents.harness.team.team_manager import get_team_manager
-
-        get_team_manager(inp.channel).refresh_team_shared_skill_links(inp.session_id)
-
-    return TeamSharedSkillLinkRefreshRail(
-        global_skills_dir=Path(inp.global_skills_dir),
-        refresh_links=refresh_links,
-    )
+    return TeamSkillLibraryReloadRail(global_skills_dir=Path(inp.global_skills_dir))
 
 
 class TeamWorkspaceReportPathInput(ConstructionInput):
@@ -310,6 +346,10 @@ class TeamWorkspaceReportPathInput(ConstructionInput):
     team_ws_root: str | None = context_field(
         attr="team_ws_root",
         description="Team shared workspace root path (gate; skipped when absent).",
+    )
+    project_dir: str | None = context_field(
+        attr="project_dir",
+        description="User project root for final project deliverables.",
     )
     team_id: str = context_field(attr="team_id", default="", description="Team name.")
     language: str = context_field(
@@ -345,6 +385,7 @@ def _build_team_workspace_report_path_rail(
         return None
     rail = TeamWorkspaceReportPathRail(
         root_dir=inp.team_ws_root,
+        project_dir=inp.project_dir,
         team_id=inp.team_id,
         language=inp.language,
     )
@@ -479,13 +520,14 @@ def _build_plugin_rails(
 __all__ = [
     "RUNTIME_PROMPT",
     "TEAM_SKILL_STORAGE_POLICY",
-    "TEAM_SHARED_SKILL_LINK_REFRESH",
+    "TEAM_SKILL_LIBRARY_RELOAD",
     "TEAM_WORKSPACE_REPORT_PATH",
     "CONTEXT_PROCESSOR",
     "MODEL_ANOMALY_DETECTION",
     "PLUGIN_RAILS",
     "SKILL_RETRIEVAL_PROMPT",
     "SYMPHONY_ORCHESTRATION_PROMPT",
+    "HEARTBEAT",
     "TEAM_PERMISSION",
     "TEAM_PERMISSION_POLICY",
 ]
@@ -592,7 +634,11 @@ def _build_team_permission_rail(params: dict[str, Any], context: Any) -> Any | N
     from openjiuwen.agent_teams.security.narrowing import narrow_permissions
 
     override = get_permissions_override(context)
-    narrowed_config = narrow_permissions(inp.permissions_config, override) if override else inp.permissions_config
+    narrowed_config = (
+        narrow_permissions(inp.permissions_config, override)
+        if override
+        else inp.permissions_config
+    )
 
     message_manager = TeamMessageManager(
         backend.team_name,

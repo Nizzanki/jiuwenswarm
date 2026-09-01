@@ -1,4 +1,4 @@
-:root[data-theme="default"][data-color-mode="light"] {
+:root[data-theme='default'][data-color-mode='light'] {
   /* Surfaces */
   --color-surface-page: #f5f7f9;
   --color-surface-page-rgb: 245, 247, 249;
@@ -63,12 +63,20 @@
   --color-action-secondary: #f4f4f5;
   --color-action-secondary-rgb: 244, 244, 245;
   --color-action-secondary-text: #3f3f46;
+  --color-button-border: #595959;
+  --color-button-hover: #fafafa;
   --color-brand-secondary: #0d9488;
+  --color-tool-tab-active-bg: #ededed;
+  --color-tool-tab-hover-bg: #fafafa;
+  --color-artifact-toolbar-icon: #191919;
+  --color-artifact-toolbar-icon-disabled: #c0c0c0;
+  --color-artifact-toolbar-divider: #e5e5e5;
 
   /* Feedback */
   --color-feedback-success: #16a34a;
   --color-feedback-success-rgb: 22, 163, 74;
   --color-feedback-success-subtle: rgba(22, 163, 74, 0.1);
+  --color-feedback-success-text: #01802b;
   --color-feedback-warning: #d97706;
   --color-feedback-warning-rgb: 217, 119, 6;
   --color-feedback-warning-subtle: rgba(217, 119, 6, 0.1);
@@ -80,8 +88,39 @@
   --color-feedback-info: #2563eb;
   --color-feedback-info-rgb: 37, 99, 235;
   --color-feedback-info-subtle: rgba(59, 130, 246, 0.08);
+  --color-tag-info-text: #0f5ed4;
+  --color-tag-info-surface: #deecff;
+  --color-tag-neutral-text: #191919;
+  --color-tag-neutral-surface: #f5f5f5;
   --color-feedback-success-toast: #d5f2dc;
+  --color-feedback-danger-toast: #fce9e9;
   --color-feedback-success-indicator: #1a991d;
+
+  /* TraceHound — trajectory observer palette (role-named, observability light) */
+  --color-trace-ok: #10b981;
+  --color-trace-ok-subtle: rgba(16, 185, 129, 0.1);
+  --color-trace-warn: #d97706;
+  --color-trace-warn-subtle: rgba(217, 119, 6, 0.12);
+  --color-trace-danger: #dc2626;
+  --color-trace-danger-subtle: rgba(220, 38, 38, 0.1);
+  --color-trace-violet: #7c3aed;
+  --color-trace-violet-subtle: rgba(124, 58, 237, 0.1);
+  --color-trace-info: #2563eb;
+  --color-trace-info-subtle: rgba(37, 99, 235, 0.1);
+  --color-trace-teal: #0d9488;
+  --color-trace-cat-1: #2563eb;
+  --color-trace-cat-2: #7c3aed;
+  --color-trace-cat-3: #d97706;
+  --color-trace-cat-4: #0d9488;
+  --color-trace-cat-5: #db2777;
+  --color-trace-cat-6: #4f46e5;
+  --color-trace-surface: #ffffff;
+  --color-trace-surface-muted: #f7f8fa;
+  --color-trace-border: #e4e7ec;
+  --color-trace-border-strong: #cbd5e1;
+  --color-trace-text: #101828;
+  --color-trace-text-muted: #667085;
+  --color-trace-text-faint: #98a2b3;
 
   /* Feature accents whose identity is stable across color modes */
   --color-chat-accent: #1476ff;
@@ -133,14 +172,22 @@
   --color-skill-action-surface: #ffffff;
   --color-skill-action-text: #000000;
   --color-skill-action-hover: #f0f0f0;
+  --color-skill-capsule-active: #0066ff;
   --color-team-event-surface: var(--color-surface-elevated);
   --color-team-event-summary-surface: transparent;
-  --color-sidebar-nav-hover: #f5f5f5;
+  --color-sidebar-nav-hover: #fafafa;
   --color-sidebar-nav-active: #e6e6e6;
   --color-sidebar-nav-active-hover: #dedee0;
   --color-sidebar-action-hover: #e6e6e6;
-  --color-sidebar-more-item-hover: #eaeaeb;
   --color-sidebar-surface: var(--color-surface-shell);
+  --color-settings-nav-surface: #f5f5f5;
+  --color-settings-card-subtle: #fafafa;
+  --color-settings-border: #f0f0f0;
+  --color-settings-text-secondary: #808080;
+  --color-settings-switch-checked: #1476ff;
+  --color-settings-link: #1476ff;
+  --color-settings-status-danger-text: #bf0a1c;
+  --color-settings-status-danger-surface: #fce3e0;
   --color-conversation-active-surface: var(--color-sidebar-nav-active);
   --color-chat-active-group-border: var(--color-chat-group-border);
   --color-chat-active-group-hover: rgba(var(--color-action-secondary-rgb), 0.44);
@@ -208,7 +255,11 @@
   --color-extension-input-border: #cccccc;
   --color-task-index-surface: #f2f2f2;
   --color-task-card-surface: #fafafa;
+  --color-task-progress: #67c57e;
+  --color-task-progress-track: #e0e0e0;
+  --color-task-column-label: #595959;
   --color-team-overflow-surface: #edf1ff;
+  --color-member-card-badge-surface: #e1e8fd;
   --color-team-detail-surface: #f8fafc;
   --color-team-detail-text: #5d6675;
   --color-team-detail-label: #9aa3af;
@@ -237,6 +288,10 @@
   --color-cron-auto-managed-text: #0369a1;
   --color-overlay-cron-dialog: rgba(0, 0, 0, 0.4);
   --color-overlay-cron-drawer: rgba(0, 0, 0, 0.3);
-
+  --color-connector-tag-surface: #f5f5f5;
+  --color-connector-tool-icon-surface: #f3f3f3;
+  --color-connector-tool-icon-border: #dfdfdf;
+  --color-connector-add-hover-surface: rgba(20, 118, 255, 0.06);
+  --color-icon-remove: #c2c2c2;
   color-scheme: light;
 }

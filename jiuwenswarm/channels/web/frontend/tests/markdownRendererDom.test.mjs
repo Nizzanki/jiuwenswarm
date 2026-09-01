@@ -44,7 +44,6 @@ function createI18n() {
             image: 'Image',
             code: 'Code',
             moreActions: 'More diagram actions',
-            downloadSource: 'Download source',
             downloadImage: 'Download as image',
             copyCode: 'Copy code',
             copied: 'Copied',
@@ -199,12 +198,19 @@ test('renders SVG markup only inside a sandboxed iframe and falls back to code f
     await act(async () => {
       root.render(createElement(I18nextProvider, { i18n }, createElement(SvgDiagram, { code: '<div>not an SVG</div>', complete: true, isStreaming: false })));
     });
-    assert.ok(container.querySelector('[data-svg-status="invalid"] .svg-diagram__code-view'));
-    assert.ok(container.querySelector('[data-svg-status="invalid"] .diagram-toolbar-status--warning'));
-    assert.equal(container.querySelector('[data-svg-status="invalid"] .diagram-toolbar-status--error'), null);
+    const invalidDiagram = container.querySelector('[data-svg-status="invalid"]');
+    assert.ok(invalidDiagram?.querySelector('.svg-diagram__code-view'));
+    assert.ok(invalidDiagram?.querySelector('.diagram-toolbar-status--warning'));
+    assert.equal(invalidDiagram?.querySelector('.diagram-toolbar-status--error'), null);
     assert.match(container.textContent, /SVG code contains errors/);
     assert.equal(Array.from(container.querySelectorAll('button')).find(button => button.textContent === 'Image')?.disabled, true);
-    assert.equal(container.querySelector('[data-svg-status="invalid"] iframe'), null);
+    assert.equal(invalidDiagram?.querySelector('iframe'), null);
+
+    await act(async () => {
+      invalidDiagram?.querySelector('[aria-label="More diagram actions"]')?.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+    });
+    assert.equal(invalidDiagram?.querySelector('[data-variant="download-source"]'), null);
+    assert.equal(invalidDiagram?.querySelector('[data-variant="download-image"]')?.disabled, false);
   } finally {
     if (root) await act(async () => root.unmount());
     restore();
@@ -232,13 +238,16 @@ test('renders Mermaid through the shared viewer and preserves the code fallback 
   let root;
   try {
     root = createRoot(container);
-    const renderSvg = async () => '<svg viewBox="0 0 120 60"><rect width="120" height="60" /></svg>';
+    const renderSvg = async () => '<svg width="100%" height="100%" viewBox="0 0 120 60" style="max-width: 120px"><rect width="120" height="60" /></svg>';
     await act(async () => {
       root.render(createElement(I18nextProvider, { i18n }, createElement(MermaidDiagram, { code: 'graph TD; A-->B', renderSvg })));
     });
 
     const diagram = container.querySelector('[data-mermaid-status="rendered"]');
-    assert.ok(diagram?.querySelector('.mermaid-svg-wrapper svg'));
+    const renderedSvg = diagram?.querySelector('.mermaid-svg-wrapper svg');
+    assert.ok(renderedSvg);
+    assert.equal(renderedSvg.style.width, '120px');
+    assert.equal(renderedSvg.style.height, '60px');
     assert.equal(diagram.getAttribute('data-markdown-block'), 'wide');
     assert.equal(diagram.querySelector('[aria-label="More diagram actions"]').getAttribute('aria-haspopup'), 'menu');
 
@@ -565,20 +574,33 @@ test('downloads a blob through a temporary anchor and always revokes its object 
   }
 });
 
-test('saves diagram blobs through the desktop data URL bridge', async () => {
+test('saves diagram blobs through the bounded desktop chunk bridge', async () => {
   const dom = new JSDOM('<!doctype html><html><body></body></html>');
-  const saves = [];
+  const calls = [];
   class FileReaderStub {
-    readAsDataURL() {
+    readAsDataURL(blob) {
+      calls.push(['encode', blob.size]);
       this.result = 'data:image/svg+xml;charset=utf-8;base64,PHN2Zy8+';
       queueMicrotask(() => this.onload());
     }
   }
   dom.window.pywebview = {
     api: {
-      save_data_url: async (...args) => {
-        saves.push(args);
+      begin_blob_save: async (...args) => {
+        calls.push(['begin', ...args]);
+        return { ok: true, cancelled: false, transfer_id: 'transfer-1' };
+      },
+      append_blob_save: async (...args) => {
+        calls.push(['append', ...args]);
+        return true;
+      },
+      finish_blob_save: async (...args) => {
+        calls.push(['finish', ...args]);
         return { ok: true, cancelled: false };
+      },
+      abort_blob_save: async (...args) => {
+        calls.push(['abort', ...args]);
+        return true;
       },
     },
   };
@@ -590,7 +612,12 @@ test('saves diagram blobs through the desktop data URL bridge', async () => {
   try {
     const outcome = await saveBlob(new Blob(['<svg/>'], { type: 'image/svg+xml;charset=utf-8' }), 'diagram.svg');
     assert.equal(outcome, 'saved');
-    assert.deepEqual(saves, [['data:image/svg+xml;charset=utf-8;base64,PHN2Zy8+', 'diagram.svg']]);
+    assert.deepEqual(calls, [
+      ['begin', 'diagram.svg', 'image/svg+xml;charset=utf-8', 6],
+      ['encode', 6],
+      ['append', 'transfer-1', 'PHN2Zy8+'],
+      ['finish', 'transfer-1'],
+    ]);
   } finally {
     restore();
     dom.window.close();

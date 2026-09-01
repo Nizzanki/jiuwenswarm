@@ -12,6 +12,7 @@ import { getWsBase } from '../utils/env';
 import { resolveUserId } from '../utils/userId';
 import i18n from '../i18n';
 import { GoalRecord } from '../types/goal';
+import { createSessionEventGate } from './sessionEventGate';
 
 type EventHandler = (event: WsEvent) => void;
 type TypedEventHandler<TPayload> = (event: WsEvent & { payload: TPayload }) => void;
@@ -87,13 +88,12 @@ class WebClient {
   private connectPromise: Promise<void> | null = null;
   private lastConnectOptions: WebConnectOptions = {};
   private requestSeq = 0;
+  private readonly sessionEventGate = createSessionEventGate((event) => {
+    this.dispatchEventNow(event);
+  });
 
   getState(): WebConnectionState {
     return this.state;
-  }
-
-  getInflightCount(): number {
-    return this.pending.size;
   }
 
   onStateChange(handler: StateHandler): () => void {
@@ -122,6 +122,10 @@ class WebClient {
         this.handlers.delete(eventName);
       }
     };
+  }
+
+  suspendSessionEvents(sessionId: string): () => void {
+    return this.sessionEventGate.suspend(sessionId);
   }
 
   async connect(options: WebConnectOptions = {}): Promise<void> {
@@ -196,6 +200,15 @@ class WebClient {
         );
         if (this.manualClose || closeEvent.code === 1000) {
           this.updateState('closed');
+          return;
+        }
+        // 1008 Policy Violation: gateway 鉴权失败 (token 失效/缺失)。
+        // 重载页面, AppWithAuth 会探测 cookie 失效 -> 回到登录页。
+        if (closeEvent.code === 1008) {
+          this.updateState('closed');
+          if (typeof window !== 'undefined') {
+            window.location.reload();
+          }
           return;
         }
         this.scheduleReconnect();
@@ -453,12 +466,17 @@ class WebClient {
         message.error ?? i18n.t('network.requestFailed'),
         message.code,
         message.id,
-        this.isRetriableCode(message.code)
+        this.isRetriableCode(message.code),
+        message.payload
       )
     );
   }
 
   private dispatchEvent(event: WsEvent): void {
+    this.sessionEventGate.dispatch(event);
+  }
+
+  private dispatchEventNow(event: WsEvent): void {
     const handlers = this.handlers.get(event.event);
     if (!handlers || handlers.size === 0) {
       return;
@@ -538,12 +556,14 @@ class WebClient {
     message: string,
     code?: string,
     requestId?: string,
-    retriable = false
+    retriable = false,
+    payload?: unknown
   ): WebError {
     const error = new Error(message) as WebError;
     error.code = code;
     error.requestId = requestId;
     error.retriable = retriable;
+    error.payload = payload;
     return error;
   }
 
@@ -614,8 +634,9 @@ export async function sendGoalStreamCommand(params: {
   action: 'set' | 'resume';
   objective?: string;
   mode?: string;
+  modelName?: string | null;
 }): Promise<void> {
-  const { sessionId, action, objective, mode } = params;
+  const { sessionId, action, objective, mode, modelName } = params;
   await webClient.sendFireAndForget(
     'command.goal',
     {
@@ -623,6 +644,7 @@ export async function sendGoalStreamCommand(params: {
       action,
       mode: mode ?? 'agent',
       ...(action === 'set' ? { objective, overwrite_confirmed: true } : {}),
+      ...(modelName ? { model_name: modelName } : {}),
     },
     { isStream: true }
   );

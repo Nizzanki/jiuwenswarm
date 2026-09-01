@@ -1,13 +1,17 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Pure configuration rules for Ascend KV cache affinity."""
+"""Canonical configuration and provider rules for KV cache affinity."""
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
+from openjiuwen.core.foundation.kv_cache import KVCacheAffinityConfig
+
 ASCEND_AFFINITY_PROVIDER = "AscendAffinity"
+logger = logging.getLogger(__name__)
 KVC_CONFIG_KEYS = frozenset(
     {
         "kv_cache_affinity_enabled",
@@ -15,6 +19,91 @@ KVC_CONFIG_KEYS = frozenset(
         "model_provider",
     }
 )
+
+
+def _kv_cache_mode(config_like: Any) -> str:
+    """读 model_client_config 的 extensions.kv_cache.mode(归一小写)。
+
+    兼容 dict 与对象：dict 取 ``extensions`` 子键；对象取属性链。
+    新声明下 KV 亲和/释放由 ``extensions.kv_cache.mode`` 表达
+    (release/affinity/none)，不再用 client_provider=AscendAffinity 判别。
+    """
+    try:
+        if isinstance(config_like, dict):
+            kv = (config_like.get("extensions") or {}).get("kv_cache") or {}
+            return str(kv.get("mode") or "").strip().lower()
+        extensions = getattr(config_like, "extensions", None)
+        kv = getattr(extensions, "kv_cache", None)
+        return str(getattr(kv, "mode", "") or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def is_kv_cache_affinity_config(config_like: Any) -> bool:
+    """新式判别：extensions.kv_cache.mode == 'affinity'。"""
+    return _kv_cache_mode(config_like) == "affinity"
+
+
+def is_kv_cache_release_config(config_like: Any) -> bool:
+    """新式判别：extensions.kv_cache.mode == 'release'。"""
+    return _kv_cache_mode(config_like) == "release"
+
+
+def normalize_provider(provider: Any) -> str:
+    """Return one stable provider name from enums, strings or missing values."""
+
+    value = getattr(provider, "value", provider)
+    return str(value or "").strip()
+
+
+def model_provider(model: Any | None) -> str:
+    """Resolve the effective provider from an OpenJiuwen Model or its client."""
+
+    for owner in (model, getattr(model, "_client", None)):
+        model_client_config = getattr(owner, "model_client_config", None)
+        provider = getattr(model_client_config, "client_provider", None)
+        if provider is not None:
+            return normalize_provider(provider)
+    return ""
+
+
+def build_kv_cache_affinity_config(
+    react_config: dict[str, Any] | None,
+    *,
+    provider: str,
+    model_client_config: Any = None,
+) -> KVCacheAffinityConfig:
+    """Build the shared Agent/Team KVC policy and fail closed by mode.
+
+    新声明下 KV 亲和由 ``extensions.kv_cache.mode=affinity`` 表达，不再用
+    client_provider=AscendAffinity 判别。本函数优先认 mode，同时兼容旧
+    provider 名(AscendAffinity)配置。
+    """
+
+    react_config = react_config or {}
+    raw = react_config.get("kv_cache_affinity_config")
+    raw = raw if isinstance(raw, dict) else {}
+    affinity_enabled = bool(raw.get("enable_kv_cache_affinity", False))
+
+    # 新式判别：mcc 带 extensions.kv_cache.mode=affinity 视为具备亲和能力。
+    mode_ok = is_kv_cache_affinity_config(model_client_config) if model_client_config is not None else False
+    # 兼容旧配置：client_provider 仍是 AscendAffinity 别名(core 内部归一)。
+    normalized_provider = normalize_provider(provider)
+    legacy_ok = normalized_provider == ASCEND_AFFINITY_PROVIDER
+    if affinity_enabled and not (mode_ok or legacy_ok):
+        logger.warning(
+            "KV cache affinity failed closed: model provider=%s mode=%s "
+            "requires extensions.kv_cache.mode=affinity (or legacy AscendAffinity)",
+            normalized_provider or "<empty>",
+            _kv_cache_mode(model_client_config) or "<empty>",
+        )
+        affinity_enabled = False
+    return KVCacheAffinityConfig(
+        enable_kv_cache_release=bool(
+            raw.get("enable_kv_cache_release", False)
+        ),
+        enable_kv_cache_affinity=affinity_enabled,
+    )
 
 
 def parse_bool(value: Any) -> bool:

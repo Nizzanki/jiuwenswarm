@@ -18,7 +18,6 @@ from jiuwenswarm.agents.harness.team.team_manager import (
     RuntimeInfo,
     TeamWorkspaceInfo,
     get_team_manager,
-    refresh_team_shared_skill_links_across_managers,
     reset_team_manager,
 )
 
@@ -346,8 +345,9 @@ async def test_initially_disabled_team_context_reenables_role_rails(
         channel="web",
         team_id="disabled-team",
         team_ws_root="/tmp/disabled-team",
-        team_skills_dir="/tmp/disabled-team/skills",
-        trajectory_registry=object(),
+        project_dir="/tmp/user-project",
+        global_skills_dir="/tmp/skill-library",
+        trajectory_span_processor=object(),
         language="cn",
     )
 
@@ -445,28 +445,13 @@ def test_find_team_skill_rail_for_request_uses_pending_governance() -> None:
     assert manager.find_team_skill_rail_for_request("missing") is None
 
 
-def test_refresh_team_shared_skill_links_across_managers_uses_registered_session(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    global_skills_dir = tmp_path / "global-skills"
-    skill_dir = global_skills_dir / "skill-a"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text("---\nname: skill-a\n---\n", encoding="utf-8")
-    team_shared_skills = tmp_path / "team-workspace" / "skills"
+def test_find_team_skill_rail_for_request_uses_core_owned_child_request() -> None:
+    manager = TeamManager()
+    rail = _FakeTeamSkillEvolutionRail()
+    rail.add_pending_approval_snapshot("skill_evolve_review_req1")
+    manager.register_team_skill_rail("sess-1", rail)
 
-    monkeypatch.setattr(
-        "jiuwenswarm.agents.harness.team.team_manager.get_agent_skills_dir",
-        lambda: global_skills_dir,
-    )
-
-    manager = get_team_manager("web")
-    manager.register_team_shared_skill_link_target("sess-1", team_shared_skills)
-
-    assert refresh_team_shared_skill_links_across_managers("sess-1")
-    assert (team_shared_skills / "skill-a").resolve() == skill_dir.resolve()
-
-
+    assert manager.find_team_skill_rail_for_request("skill_evolve_review_req1") is rail
 @pytest.mark.asyncio
 async def test_update_evolution_config_disables_team_skill_create_rail(
     monkeypatch: pytest.MonkeyPatch,
@@ -660,12 +645,6 @@ async def test_team_manager_keeps_single_session_per_channel(monkeypatch: pytest
         return _Spec()
 
     monkeypatch.setattr(TeamManager, "_load_team_spec", staticmethod(fake_load_team_spec))
-    # Mock _initialize_team_shared_skill_links to avoid file operations
-    monkeypatch.setattr(
-        TeamManager,
-        "_initialize_team_shared_skill_links",
-        staticmethod(lambda spec: None),
-    )
     # Provider assembly is covered by the swarm suite; stub it so this
     # session-management test runs on the minimal fake spec.
     monkeypatch.setattr(
@@ -705,12 +684,6 @@ async def test_create_team_does_not_run_global_runtime_cleanup(monkeypatch: pyte
         return _Spec()
 
     monkeypatch.setattr(TeamManager, "_load_team_spec", staticmethod(fake_load_team_spec))
-    # Mock _initialize_team_shared_skill_links to avoid file operations
-    monkeypatch.setattr(
-        TeamManager,
-        "_initialize_team_shared_skill_links",
-        staticmethod(lambda spec: None),
-    )
     # Provider assembly is covered by the swarm suite; stub it so this
     # session-management test runs on the minimal fake spec.
     monkeypatch.setattr(
@@ -742,11 +715,6 @@ async def test_create_team_appends_session_id_to_team_name(monkeypatch: pytest.M
             return SimpleNamespace()
 
     monkeypatch.setattr(TeamManager, "_load_team_spec", staticmethod(lambda _session_id: _Spec()))
-    monkeypatch.setattr(
-        TeamManager,
-        "_initialize_team_shared_skill_links",
-        staticmethod(lambda spec: None),
-    )
     # Provider assembly is covered by the swarm suite; stub it so this
     # session-management test runs on the minimal fake spec.
     monkeypatch.setattr(
@@ -778,11 +746,6 @@ async def test_create_team_appends_session_id_to_web_team_name(monkeypatch: pyte
             return SimpleNamespace()
 
     monkeypatch.setattr(TeamManager, "_load_team_spec", staticmethod(lambda _session_id: _Spec()))
-    monkeypatch.setattr(
-        TeamManager,
-        "_initialize_team_shared_skill_links",
-        staticmethod(lambda spec: None),
-    )
     # Provider assembly is covered by the swarm suite; stub it so this
     # session-management test runs on the minimal fake spec.
     monkeypatch.setattr(
@@ -1076,6 +1039,12 @@ async def test_finalize_runtime_cleanup_releases_session_markers(
     manager.mark_workflow_completed(session_id)
     manager.setdefault_cron_completion(session_id, {"round_id": 1})
     getattr(manager, "_pending_team_evolution_watcher_sessions").add(session_id)
+    release_admission = AsyncMock()
+    manager.begin_round(
+        session_id,
+        "req-terminal-cleanup",
+        release_admission=release_admission,
+    )
 
     async def fake_cleanup(
         _session_id: str,
@@ -1094,6 +1063,8 @@ async def test_finalize_runtime_cleanup_releases_session_markers(
     assert manager.has_seen_team_events(session_id) is False
     assert manager.is_workflow_completed(session_id) is False
     assert manager.get_cron_completion(session_id) is None
+    assert manager.is_round_active(session_id) is False
+    release_admission.assert_awaited_once()
     assert session_id not in getattr(
         manager,
         "_pending_team_evolution_watcher_sessions",
@@ -1138,6 +1109,44 @@ async def test_cancel_all_stream_tasks_uses_per_session_lifecycle_locks(
     assert first_cancelled.is_set() is True
     assert manager.has_stream_task("sess-1") is False
     assert manager.has_stream_task("sess-2") is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_stream_tasks_preserves_heartbeat_owned_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.get_config",
+        lambda: {"team": {"runtime": {"mode": "local"}}},
+    )
+    manager = _TeamManagerHarness()
+    protected_cancelled = asyncio.Event()
+    ordinary_cancelled = asyncio.Event()
+
+    async def wait_until_cancelled(cancelled: asyncio.Event) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    protected_task = asyncio.create_task(wait_until_cancelled(protected_cancelled))
+    ordinary_task = asyncio.create_task(wait_until_cancelled(ordinary_cancelled))
+    await asyncio.sleep(0)
+    manager.register_stream_task("heartbeat-session", protected_task)
+    manager.register_stream_task("user-session", ordinary_task)
+
+    await manager.cancel_all_stream_tasks(
+        exclude_session_ids={"heartbeat-session"},
+    )
+
+    assert ordinary_cancelled.is_set() is True
+    assert protected_cancelled.is_set() is False
+    assert manager.has_stream_task("heartbeat-session") is True
+    assert manager.has_stream_task("user-session") is False
+
+    protected_task.cancel()
+    await asyncio.gather(protected_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

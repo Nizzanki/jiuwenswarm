@@ -2,6 +2,7 @@
 
 """Unit tests for team runtime inheritance helpers."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -84,6 +85,36 @@ def test_filter_inheritable_ability_cards_includes_extended_swarm_tools():
 
 
 @pytest.mark.asyncio
+async def test_build_member_rails_separates_project_and_team_file_destinations(
+    tmp_path: Path,
+) -> None:
+    """Legacy/hot-reload rail construction preserves the user project root."""
+    project_dir = str(tmp_path / "project")
+    team_ws_root = str(tmp_path / "team-workspace")
+    rails = build_member_rails(
+        member_info=MemberInfo(role="leader"),
+        team_workspace=TeamWorkspaceInfo(
+            root_dir=team_ws_root,
+            project_dir=project_dir,
+            team_id="unit-team",
+        ),
+    )
+    rail = next(
+        item for item in rails if item.__class__.__name__ == "TeamWorkspaceReportPathRail"
+    )
+    builder = _FakePromptBuilder()
+    rail.init(SimpleNamespace(system_prompt_builder=builder))
+    await rail.before_model_call(SimpleNamespace())
+
+    section = builder.sections["team_workspace_report_paths"]
+    content = section.render("cn")
+    assert f"User project root: `{project_dir}`" in content
+    assert f"Team collaboration workspace: `{team_ws_root}`" in content
+    assert "Do not place final project files in the team collaboration workspace" in content
+    assert "When worktree isolation is active" in content
+
+
+@pytest.mark.asyncio
 async def test_build_member_rails_syncs_response_prompt_channel_for_a2ui(monkeypatch):
     """Team Web model calls should inherit the runtime channel for A2UI prompts."""
     monkeypatch.setattr(
@@ -131,6 +162,8 @@ def test_build_member_rails_omits_task_planning_for_leader_only():
 
     assert all(type(rail).__name__ != "TaskPlanningRail" for rail in leader_rails)
     assert any(type(rail).__name__ == "TaskPlanningRail" for rail in teammate_rails)
+    assert all(type(rail).__name__ != "HeartbeatRail" for rail in leader_rails)
+    assert all(type(rail).__name__ != "HeartbeatRail" for rail in teammate_rails)
 
 
 # -- resolve_model_config tests --
@@ -237,7 +270,7 @@ def test_build_skill_evolution_rail_returns_none_on_invalid_config(tmp_path):
     assert result is None
 
 
-def test_build_member_rails_wires_team_trajectory_registry_to_evolution_rails(
+def test_build_member_rails_wires_team_trajectory_processor_to_evolution_rails(
     tmp_path,
     monkeypatch,
 ):
@@ -251,20 +284,12 @@ def test_build_member_rails_wires_team_trajectory_registry_to_evolution_rails(
     class _FakeSkillEvolutionRail:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
-            self.bound_sink = None
-            self.bound_team_id = None
-            self.bound_member_role = None
             self._review_runtime = kwargs.get("review_runtime")
             self.experience_manager = SimpleNamespace(
                 experience_submission_service=object()
             )
 
-        def set_trajectory_sink(self, sink, *, team_id, member_role):
-            self.bound_sink = sink
-            self.bound_team_id = team_id
-            self.bound_member_role = member_role
-
-    registry = object()
+    processor = object()
     monkeypatch.setattr(
         "jiuwenswarm.agents.harness.team.team_runtime_inheritance.TeamSkillEvolutionRail",
         _FakeTeamSkillEvolutionRail,
@@ -289,7 +314,7 @@ def test_build_member_rails_wires_team_trajectory_registry_to_evolution_rails(
             root_dir=str(tmp_path / "team-workspace"),
             skills_dir=str(tmp_path / "skills"),
             team_id="demo-team",
-            trajectory_registry=registry,
+            trajectory_span_processor=processor,
             config={"react": {"evolution": {"skill_evolution": True}}},
         ),
     )
@@ -299,7 +324,7 @@ def test_build_member_rails_wires_team_trajectory_registry_to_evolution_rails(
             root_dir=str(tmp_path / "team-workspace"),
             skills_dir=str(tmp_path / "skills"),
             team_id="demo-team",
-            trajectory_registry=registry,
+            trajectory_span_processor=processor,
             config={"react": {"evolution": {"skill_evolution": True}}},
         ),
     )
@@ -311,23 +336,16 @@ def test_build_member_rails_wires_team_trajectory_registry_to_evolution_rails(
         rail for rail in member_rails if isinstance(rail, _FakeSkillEvolutionRail)
     )
 
-    assert leader_rail.kwargs["trajectory_source"] is registry
-    assert leader_rail.kwargs["trajectory_sink"] is registry
+    assert leader_rail.kwargs["trajectory_span_processor"] is processor
     assert leader_rail.kwargs["member_role"] == "leader"
     assert leader_rail.kwargs["signal_trigger"] is False
     assert leader_rail.kwargs["review_trigger"] is True
-    assert leader_rail.kwargs["skills_dir"] == [
-        str(tmp_path / "skills"),
-        str(global_skills_dir),
-    ]
-    assert member_rail.bound_sink is registry
-    assert member_rail.bound_team_id == "demo-team"
-    assert member_rail.bound_member_role == "teammate"
+    # Skills live in exactly one physical library; the team workspace no longer
+    # contributes a second root.
+    assert leader_rail.kwargs["skills_dir"] == str(global_skills_dir)
+    assert member_rail.kwargs["trajectory_span_processor"] is processor
     assert member_rail.kwargs["signal_trigger"] is True
-    assert member_rail.kwargs["skills_dir"] == [
-        str(tmp_path / "skills"),
-        str(global_skills_dir),
-    ]
+    assert member_rail.kwargs["skills_dir"] == str(global_skills_dir)
 
 
 def test_build_member_rails_creates_leader_team_skill_evolution_rail_with_canonical_switch(

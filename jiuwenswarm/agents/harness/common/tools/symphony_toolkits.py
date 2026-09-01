@@ -19,6 +19,9 @@ from jiuwenswarm.symphony.service import (
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_SERVICE_TIMEOUT_S = 1800.0
+_COMPOSE_SERVICE_TIMEOUT_S = 3300.0
+
 
 class SymphonyToolkit:
     """Expose the process-local Symphony service as model-callable tools."""
@@ -40,14 +43,31 @@ class SymphonyToolkit:
             "[SymphonyToolkit] calling service: operation=%s",
             operation,
         )
-        timeout_s = self._resolve_timeout_s()
+        default_timeout_s = (
+            _COMPOSE_SERVICE_TIMEOUT_S
+            if operation == "plan"
+            else _DEFAULT_SERVICE_TIMEOUT_S
+        )
+        timeout_s = self._resolve_timeout_s(default_timeout_s)
         try:
             service = self._service or get_swarm_symphony_service()
             handler = getattr(service, operation)
-            payload = await asyncio.wait_for(handler(*args, **kwargs), timeout=timeout_s)
+            payload = await asyncio.wait_for(
+                handler(*args, **kwargs), timeout=timeout_s
+            )
         except asyncio.TimeoutError:
+            if operation not in {"plan", "refresh_graph"}:
+                return {
+                    "success": False,
+                    "detail": f"symphony.{operation}: timeout after {timeout_s}s",
+                }
             return {
                 "success": False,
+                "reason": "graph_build_timeout",
+                "timed_out": True,
+                "retryable": False,
+                "operation": operation,
+                "timeout_s": timeout_s,
                 "detail": f"symphony.{operation}: timeout after {timeout_s}s",
             }
         except Exception as exc:  # noqa: BLE001
@@ -94,6 +114,10 @@ class SymphonyToolkit:
             "direct_display",
             "continue_after_display",
             "followup_action",
+            "timed_out",
+            "retryable",
+            "operation",
+            "timeout_s",
         ):
             if key in payload:
                 compact[key] = payload[key]
@@ -347,6 +371,11 @@ class SymphonyToolkit:
 
     @classmethod
     def _attach_followup_control(cls, payload: dict[str, Any]) -> None:
+        if payload.get("reason") == "graph_build_timeout":
+            payload["continue_after_display"] = False
+            if payload.get("followup_action") == "external_skill_discovery":
+                payload.pop("followup_action")
+            return
         if cls._needs_external_skill_discovery(payload):
             payload["continue_after_display"] = True
             payload["followup_action"] = "external_skill_discovery"
@@ -408,53 +437,55 @@ class SymphonyToolkit:
             description: str,
             input_params: dict[str, Any],
             func: Callable[..., Any],
+            uses_internal_timeout: bool = False,
         ) -> Tool:
             card = ToolCard(
                 id=name,
                 name=name,
                 description=description,
                 input_params=input_params,
+                properties=(
+                    {"resilience": {"timeout_s": None}} if uses_internal_timeout else {}
+                ),
             )
             return LocalFunction(card=card, func=func)
 
         return [
             make_tool(
                 "symphony_read_graph",
-                "Read whether the Symphony graph exists or is stale before composing skill execution.",
+                "Read whether the Skill Graph exists or is stale before composing Skill execution.",
                 {"type": "object", "properties": {}},
                 self.graph_status,
             ),
             make_tool(
                 "symphony_refresh_graph",
-                "Extract installed skill features and refresh the Symphony graph.",
+                (
+                    "Extract installed Skill features and refresh the Skill Graph. "
+                    "If a result reports graph_build_timeout or manual_graph_build, "
+                    "do not call this tool or symphony_compose_graph again in this round."
+                ),
                 {"type": "object", "properties": {}},
                 self.refresh_graph,
+                uses_internal_timeout=True,
             ),
             make_tool(
                 "symphony_compose_graph",
                 (
-                    "MUST call before answering when the user says to use skill(s) "
-                    "or 技能, or when skill capabilities, skill chaining, skill ordering, "
-                    "or a specialized toolchain could help complete the task. When you identify, "
-                    "inspect, or recommend installed Skills that are relevant to the task, you MUST "
-                    "pass their exact identifiers or names as candidate_skill_ids. Do not omit "
-                    "candidate_skill_ids after selecting candidate Skills. "
-                    "This is the Symphony composition entrypoint: it reads the graph, refreshes a stale "
-                    "or missing graph, then composes the skill execution graph from the provided "
-                    "candidates or a default graph subgraph. If no suitable candidates or a missing "
-                    "capability is reported, use search_skill to discover external skills; when "
-                    "installing a discovered skill is appropriate, call install_skill, then call "
-                    "symphony_refresh_graph and retry this tool with the original query. "
-                    "After it returns, present its content result directly to the user; "
-                    "do not call individual skill tools just to manually recreate the plan. "
-                    "Skip only clearly ordinary tasks that do not benefit from skill capabilities."
+                    "Compose an execution plan for a task that requires multiple installed "
+                    "skills or an ordered skill workflow. Discovery, comparison, and "
+                    "recommendation alone do not require this tool. Pass only shortlisted "
+                    "exact skill IDs in candidate_skill_ids; omit that argument when the "
+                    "user requested a plan but no candidate is known. The tool may refresh a "
+                    "missing or stale graph before composing. Use its returned plan and ask "
+                    "for any missing inputs it reports. If it returns graph_build_timeout or "
+                    "manual_graph_build, do not retry graph tools in the same round."
                 ),
                 {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "The original user task to complete with skill capabilities.",
+                            "description": "The user's original task, without retrieval commands or internal notes.",
                         },
                         "mode": {
                             "type": "string",
@@ -472,16 +503,16 @@ class SymphonyToolkit:
                             "type": "array",
                             "items": {"type": "string"},
                             "description": (
-                                "Optional identifiers or exact names of the installed Skills "
-                                "you consider most relevant to the user's task. When relevant "
-                                "Skills have already been identified, provide them here so "
-                                "Symphony uses them and their eligible neighbors as seeds."
+                                "Exact installed skill IDs already shortlisted for the task. "
+                                "Batch all relevant IDs in this one argument; do not include "
+                                "weak matches or every skill from a catalog overview."
                             ),
                         },
                     },
                     "required": ["query"],
                 },
                 self.plan,
+                uses_internal_timeout=True,
             ),
         ]
 
