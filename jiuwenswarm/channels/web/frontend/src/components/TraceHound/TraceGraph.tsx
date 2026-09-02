@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import type { HistoryRecord } from '../../stores/traceHoundStore';
 import { C, cat } from './traceTokens';
-import { buildGraph, layoutGraph, graphNodeTooltip, type GraphNode, type GraphMode } from './traceGraph';
+import { buildGraph, layoutGraph, graphNodeTooltip, type GraphNode, type GraphMode } from './traceGraphLayout';
 import { useElementWidth } from './useElementWidth';
 import { Tooltip } from './Tooltip';
 

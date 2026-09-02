@@ -2266,7 +2266,7 @@ export function TurnDetailView() {
           ) : (
             <TraceGraph
               records={turnRecords}
-              onSelectRecord={index => {
+              onSelectRecord={(index: number) => {
                 setPendingRecordIndex(index);
                 setTab('records');
               }}

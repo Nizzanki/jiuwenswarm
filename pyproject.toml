@@ -185,7 +185,7 @@ default-groups = ['dev']
 [tool.uv.sources]
 workswarm-tui = { path = "./packages/jiuwenswarm-tui" }  # build-config: tui-source
 a2a-embed = { path = "./packages/a2a-embed" }
-openjiuwen = { git = "https://gitcode.com/openJiuwen/agent-core.git", branch = "develop" }
+openjiuwen = { git = "https://gitcode.com/openJiuwen/agent-core.git", rev = "da1a248e48bc6e95a3c57918d0130df6fd26f902" }
 
 [dependency-groups]
 # Testing (keep in sync with optional-dependencies.test)
