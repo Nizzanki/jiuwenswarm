@@ -57,9 +57,21 @@ class JiuwenError(BaseError):
     def __str__(self) -> str:
         # Keep the historical message-only rendering when no StatusCode was
         # attached, so existing `str(e)` call sites keep their output.
-        if self.status is StatusCode.ERROR and self.message:
-            return self.message
+        # Use getattr defensively: __str__ must never raise, even if called
+        # on a not-fully-initialized instance (e.g. during unpickling).
+        status = getattr(self, "status", None)
+        message = getattr(self, "message", None)
+        if status is StatusCode.ERROR and message:
+            return message
         return super().__str__()
+
+    @classmethod
+    def _reconstruct(cls, status, msg, details, cause, params):
+        # Override BaseError._reconstruct to pass `status` as an explicit
+        # keyword rather than relying on the message/StatusCode sniffing in
+        # __init__ matching BaseError.__reduce__'s positional argument order.
+        params = params or {}
+        return cls(status=status, msg=msg, details=details, cause=cause, **params)
 
 
 class JiuwenToolError(JiuwenError):

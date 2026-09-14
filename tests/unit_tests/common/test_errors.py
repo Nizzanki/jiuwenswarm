@@ -13,9 +13,11 @@ reach for interchangeably.
 
 from __future__ import annotations
 
+import pickle
+
 from openjiuwen.core.common.exception.codes import StatusCode
 
-from jiuwenswarm.common.errors import JiuwenError
+from jiuwenswarm.common.errors import JiuwenError, JiuwenToolError
 
 
 def test_str_is_message_only_for_default_error_status() -> None:
@@ -54,3 +56,21 @@ def test_str_never_raises_for_empty_message() -> None:
     """``JiuwenError()`` stringifies to the ERROR template, not an exception."""
     err = JiuwenError()
     assert str(err) == StatusCode.ERROR.errmsg
+
+
+def test_pickle_round_trip_preserves_status_and_message() -> None:
+    """Pickling relies on ``_reconstruct`` passing ``status`` explicitly.
+
+    ``BaseError.__reduce__`` rebuilds instances via a positional call that
+    would otherwise land in ``JiuwenError.__init__``'s message-first ``message``
+    parameter instead of ``status``. Pin the round trip so a future change to
+    either side can't silently reintroduce that mismatch.
+    """
+    status = StatusCode.MODEL_CALL_FAILED
+    err = JiuwenToolError(status, msg="boom", details={"x": 1})
+    restored = pickle.loads(pickle.dumps(err))
+    assert type(restored) is JiuwenToolError
+    assert restored.status is status
+    assert restored.message == "boom"
+    assert restored.details == {"x": 1}
+    assert str(restored) == str(err)
