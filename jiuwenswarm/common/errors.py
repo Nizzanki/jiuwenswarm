@@ -46,13 +46,25 @@ class JiuwenError(BaseError):
             message = msg
         elif not message and msg is not None:
             message = msg
+        # Message-first calls (TeamError("boom"), A2XError("boom"), ...) never
+        # attach a StatusCode, so without this flag _render_message() would
+        # fall back to StatusCode.ERROR's generic "error" template while
+        # str(e)/message show the real text - making args, to_dict()
+        # and str() disagree with each other. See _render_message below.
+        self._status_given = status is not None
+        self._raw_message = "" if message is None else str(message)
         super().__init__(
             status if status is not None else StatusCode.ERROR,
-            msg="" if message is None else str(message),
+            msg=self._raw_message,
             details=details,
             cause=cause,
             **kwargs,
         )
+
+    def _render_message(self) -> str:
+        if not self._status_given and self._raw_message:
+            return self._raw_message
+        return super()._render_message()
 
     def __str__(self) -> str:
         # Keep the historical message-only rendering when no StatusCode was
@@ -65,6 +77,20 @@ class JiuwenError(BaseError):
             return message
         return super().__str__()
 
+    def __reduce__(self):
+        # BaseError.__reduce__ always replays through the StatusCode-first
+        # path (`cls(status, msg=...)`), which would mark a reconstructed
+        # message-first error as "status given" and reintroduce the
+        # args/to_dict contradiction _render_message fixes above. Replay
+        # with None instead when no status was ever attached, so unpickling
+        # reproduces the original message-first instance.
+        status = self.status if self._status_given else None
+        return (
+            self.__class__._reconstruct,
+            (status, self.message, self.details, self.cause, self.params),
+            None,
+        )
+
     @classmethod
     def _reconstruct(cls, status, msg, details, cause, params):
         # Override BaseError._reconstruct to pass `status` as an explicit
@@ -72,6 +98,16 @@ class JiuwenError(BaseError):
         # __init__ matching BaseError.__reduce__'s positional argument order.
         params = params or {}
         return cls(status=status, msg=msg, details=details, cause=cause, **params)
+
+    def to_dict(self) -> dict[str, Any]:
+        data = super().to_dict()
+        # Every message-first raise collapses onto StatusCode.ERROR(-1), so
+        # `code`/`status` alone can't tell a TeamCreateError from an
+        # A2XConnectionError. The class itself is the one identifier that's
+        # already stable and unique per error kind, so surface it until
+        # module-based error codes exist.
+        data["error_type"] = type(self).__qualname__
+        return data
 
 
 class JiuwenToolError(JiuwenError):
@@ -81,15 +117,29 @@ class JiuwenToolError(JiuwenError):
 
 
 class JiuwenStoreError(JiuwenError):
-    """Persistence failure (session store, vector store, config store)."""
-    recoverable = False
+    """Persistence failure (session store, vector store, config store).
+
+    recoverable=True matches openjiuwen SDK's StoreError (an ExecutionError):
+    a store call is usually worth retrying. It was previously False, the
+    opposite of the SDK's verdict, so a boundary handler that trusted
+    `.recoverable` would retry an SDK StoreError but give up on the
+    equivalent jiuwenswarm one.
+    """
+    recoverable = True
     fatal = False
 
 
 class JiuwenConfigError(JiuwenError):
-    """Invalid or missing configuration; retrying will not help."""
+    """Invalid or missing configuration; retrying will not help.
+
+    fatal=True matches openjiuwen SDK's ConfigurationError (a
+    FrameworkError, "must abort current execution"). It was previously
+    False, the opposite of the SDK's verdict, so a boundary handler that
+    trusted `.fatal` would abort on an SDK ConfigurationError but keep going
+    on the equivalent jiuwenswarm one.
+    """
     recoverable = False
-    fatal = False
+    fatal = True
 
 
 def record_boundary_exception(boundary: str, exc: BaseException) -> None:
