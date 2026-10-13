@@ -7,8 +7,8 @@ Our own app's tiny backend (still Path 2). It:
      the swarm's line-delimited JSON protocol to the browser as normalized events —
      the exact events the Phase 1 reducer already renders.
 
-Transport, JSON-protocol framing, whitespace dedup, live-progress forwarding, the resilient-
-retry pattern, and the FastAPI auth/CORS/rate-limit/SSE plumbing all now live in the
+Transport, JSON-protocol framing, delta/chat.final dedup, live-progress forwarding, the
+resilient-retry pattern, and the FastAPI auth/CORS/rate-limit/SSE plumbing all now live in the
 `a2a_embed` package (packages/a2a-embed/) — this file keeps only what's genuinely Inkwell's:
 the guided-protocol prompt wiring (prompt.py), panel/brief validation, moderation, the
 team/single-agent fallback and fill-retry orchestration, and image rendering + the story-
@@ -46,6 +46,7 @@ import imagegen  # noqa: E402
 import gifexport  # noqa: E402
 import pdfexport  # noqa: E402
 import moderate  # noqa: E402
+import narrate  # noqa: E402
 
 log = logging.getLogger("inkwell.bridge")
 
@@ -80,18 +81,26 @@ embed_server.add_cors(app)
 # navigation can't attach an Authorization header. /events isn't in this list either: it
 # validates the same token via ?token= instead (wired below through sse_route's
 # token_env_var), since EventSource can't set headers at all.
-_PROTECTED_ROUTES = {"/export/gif", "/export/pdf", "/restyle", "/panel/regenerate"}
+_PROTECTED_ROUTES = {"/export/gif", "/export/pdf", "/restyle", "/panel/regenerate", "/narrate"}
 embed_server.add_auth(app, env_var=API_TOKEN_ENV_VAR, protect_paths=_PROTECTED_ROUTES)
 
 
 # --------------------------------- swarm run ------------------------------------
 #
-# Why buffer + replay instead of pure passthrough: some A2A streaming paths strip
-# whitespace from per-chunk deltas (see docs/en/A2A.md), so live token deltas can lose the
-# spaces between tokens ("Eliasworkedthrough..."). Only the final consolidated artifact is
-# guaranteed correctly-spaced. So we collect the whole run, pick the best-spaced variant of
-# each event (a2a_embed.dedup), then replay it with gentle pacing — the swarm's work is
-# real; we just render it readably. (Latency tuning is Phase 3.)
+# Why buffer + replay instead of pure passthrough: jiuwenswarm's chat.final event replays
+# the FULL consolidated text of a turn as one more appended A2A artifact part, on top of
+# (not instead of) the chat.delta chunks already streamed for that same content -- other
+# channels (e.g. the CLI renderer) explicitly skip re-printing chat.final's text once any
+# delta has been written; A2AChannel doesn't do that suppression, so every logical
+# panel.caption/panel.note/etc. line genuinely appears twice in the raw A2A stream. (A
+# separate, now-fixed bug used to also corrupt the per-chunk delta copy's spacing --
+# a2a_connect.py's message_to_a2a_parts used to .strip() each chunk, dropping inter-token
+# spaces ("Eliasworkedthrough...") -- see docs/en/A2A.md section 6. That's fixed at the
+# source now, but it only ever explained why the two copies could differ, not why there
+# were two; the dedup below is still required for the latter.) So we collect the whole
+# run, dedup down to one variant per event (a2a_embed.dedup.best_variants), then replay it
+# with gentle pacing -- the swarm's work is real; we just render it readably. (Latency
+# tuning is Phase 3.)
 
 # Per-event replay delay (seconds) — mimics the Phase 1 timeline's cadence.
 _PACE = {
@@ -103,8 +112,8 @@ _PACE = {
 
 # --------------------------- live status while the crew writes -------------------------
 #
-# The whitespace-stripping bug (see the block comment above) only corrupts FREE-TEXT fields.
-# panel.status/progress/focus carry none at all (just panel numbers, an enum status, counts);
+# The delta/chat.final duplication (see the block comment above) only matters for FREE-TEXT
+# fields. panel.status/progress/focus carry none at all (just panel numbers, an enum status, counts);
 # `agent` mixes a safe enum `status`/`state` with a free-form `say` sentence. So instead of
 # leaving the whole UI frozen on "Contacting the crew…" for the entire single A2A call that
 # writes the full story, forward the text-safe SLICE of these live, as run_agent's on_event
@@ -259,7 +268,12 @@ async def _moderate_events(events: list[dict]) -> list[dict]:
             if safe:
                 continue
             ev = events[i]
-            log.warning("panel %s: moderation flagged %s (%s)", ev.get("panel"), ev["t"], reason or "unspecified")
+            flagged = ev.get("text") if ev["t"] == "panel.caption" else ev.get("svg")
+            flagged_preview = " ".join(str(flagged or "").split())[:160]
+            log.warning(
+                "panel %s: moderation flagged %s (%s) — text: %r",
+                ev.get("panel"), ev["t"], reason or "unspecified", flagged_preview,
+            )
             if ev["t"] == "panel.caption":
                 events[i] = {**ev, "text": CAPTION_REDACTED}
             else:
@@ -564,6 +578,23 @@ async def regenerate_panel(request: Request):
     return JSONResponse({"src": src, "error": err})
 
 
+@app.post("/narrate")
+async def narrate_text(request: Request):
+    """Synthesize one line of story text as speech — the server-side replacement for the
+    browser's SpeechSynthesis API (see app.js's narration engine). Body: {text}. Returns raw
+    MP3 bytes on success; on failure, JSON {error} and a 502 — there's deliberately no fallback
+    voice engine, so a narration failure is visible rather than silently swapped for a lesser
+    one (see server/narrate.py)."""
+    data = await request.json()
+    text = str(data.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    audio, err = await narrate.synthesize(text)
+    if not audio:
+        return JSONResponse({"error": err or "narration failed"}, status_code=502)
+    return Response(content=audio, media_type="audio/mpeg")
+
+
 embed_server.sse_route(app, "/events", stream_story, guard=RUN_GUARD, token_env_var=API_TOKEN_ENV_VAR)
 
 
@@ -576,6 +607,7 @@ if __name__ == "__main__":
     print(f"[bridge] A2A_URL={A2A_URL}  static={STATIC_DIR}")
     print(f"[bridge] engine: {'native jiuwen_team (mode=team)' if TEAM else 'single-agent guided'}")
     print(f"[bridge] images: {imagegen.describe()}  (concurrency={IMAGE_CONCURRENCY})")
+    print(f"[bridge] narration: {narrate.describe()}")
     print(f"[bridge] auth: {'token required' if os.getenv(API_TOKEN_ENV_VAR) else 'open (no ' + API_TOKEN_ENV_VAR + ' set)'}"
           f"  concurrency cap: {RUN_GUARD.max_concurrent or 'none'}")
     print(f"[bridge] open http://{BRIDGE_HOST}:{BRIDGE_PORT}/")

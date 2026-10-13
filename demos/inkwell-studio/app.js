@@ -40,40 +40,115 @@ function surpriseIdea() {
 const REDUCED_MOTION = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 /* --------------------------------- read-aloud narration ----------------------------------- */
-// Browser-native SpeechSynthesis — no backend, no cost, no setup. Panels arrive progressively
-// over SSE and each one's caption reveal is already paced, so a small FIFO queue keeps
-// utterances spoken one at a time in panel order instead of overlapping/racing if two panels
-// settle close together.
-const SPEECH_SUPPORTED = 'speechSynthesis' in window;
+// Server-side narration via Edge TTS (server/narrate.py + bridge.py's POST /narrate) —
+// Microsoft's neural voices, same engine behind Edge's own Read Aloud/Narrator feature.
+// Replaces the old browser-native SpeechSynthesis engine: consistent voice quality regardless
+// of browser/OS, at the cost of a real network round-trip per line (bridge → Microsoft) where
+// SpeechSynthesis was instant and local. Panels arrive progressively over SSE and each one's
+// caption reveal is already paced, so a small FIFO queue keeps lines spoken one at a time in
+// panel order instead of overlapping/racing if two panels settle close together.
+//
+// Because each line now costs a round-trip, the NEXT queued line is prefetched while the
+// current one plays — otherwise every panel boundary would have an audible gap. There's
+// deliberately no fallback voice engine: if /narrate fails, narration stops and the failure is
+// surfaced (showLiveNote) rather than silently degrading to a different voice.
 let narrationOn = false;   // live narration off by default (no toggle in the UI); "Read story aloud" bypasses this
 const narrateQueue = [];
 let narrating = false;
-let narrateOnIdle = null;   // fires once when the queue fully drains (see readStoryAloud)
+let narrateOnIdle = null;      // fires once when the queue fully drains (see readStoryAloud)
+let narrateAudio = null;       // the Audio element currently playing, so stop() can kill it
+let narratePaused = false;     // true between narratePause() and narrateResume()/narrateStop()
+const narrateInflight = new Map();   // text -> {promise, controller} — current + one line prefetched ahead
 
-function narratePump() {
+function narrateStart(text) {
+  const existing = narrateInflight.get(text);
+  if (existing) return existing;
+  const controller = new AbortController();
+  const promise = fetch('/narrate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }), signal: controller.signal,
+  }).then(async (res) => {
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || `bridge ${res.status}`);
+    }
+    return URL.createObjectURL(await res.blob());
+  });
+  const entry = { promise, controller };
+  narrateInflight.set(text, entry);
+  return entry;
+}
+
+function narratePrefetchNext() {
+  if (narrateQueue[0]) narrateStart(narrateQueue[0]);
+}
+
+async function narratePump() {
   if (narrating) return;
   if (!narrateQueue.length) {
     if (narrateOnIdle) { const fn = narrateOnIdle; narrateOnIdle = null; fn(); }
     return;
   }
   narrating = true;
-  const utter = new SpeechSynthesisUtterance(narrateQueue.shift());
-  utter.rate = 0.92;   // a touch slower than default — easier to follow as a read-aloud story
-  utter.onend = utter.onerror = () => { narrating = false; narratePump(); };
-  speechSynthesis.speak(utter);
+  const text = narrateQueue.shift();
+  const { promise } = narrateStart(text);
+  narratePrefetchNext();   // kick off the NEXT line's fetch now, while this one loads/plays
+  let url;
+  try {
+    url = await promise;
+  } catch (e) {
+    narrateInflight.delete(text);
+    narrating = false;
+    if (e.name !== 'AbortError') showLiveNote(`Couldn't read the story aloud (${e.message}). Needs the bridge running.`);
+    narrateStop();
+    return;
+  }
+  narrateInflight.delete(text);
+  const audio = new Audio(url);
+  narrateAudio = audio;
+  const done = () => {
+    URL.revokeObjectURL(url);
+    if (narrateAudio === audio) narrateAudio = null;
+    narrating = false;
+    narratePump();
+  };
+  audio.onended = done;
+  audio.onerror = () => { showLiveNote("Couldn't play the story's narration."); done(); };
+  // If paused while this line was still loading, leave it cued but silent — narrateResume()
+  // starts it (onended/onerror above still fire normally once it's eventually played out).
+  if (!narratePaused) audio.play().catch(done);
 }
 
 function narrateEnqueue(text) {
-  if (!narrationOn || !SPEECH_SUPPORTED || !text) return;
+  if (!narrationOn || !text) return;
   narrateQueue.push(text);
+  if (narrateQueue.length === 1) narratePrefetchNext();
   narratePump();
 }
 
 function narrateStop() {
   narrateQueue.length = 0;
   narrating = false;
+  narratePaused = false;
   narrateOnIdle = null;
-  if (SPEECH_SUPPORTED) speechSynthesis.cancel();
+  for (const { controller } of narrateInflight.values()) controller.abort();
+  narrateInflight.clear();
+  if (narrateAudio) { narrateAudio.pause(); narrateAudio = null; }
+}
+
+// Pause/resume only ever touch the CURRENTLY loaded line's <audio> (or, if that line is still
+// being fetched, just the flag narratePump checks before autoplaying it) — the queue itself
+// isn't touched, so resuming picks up mid-line exactly where it left off, not at the next line.
+function narratePause() {
+  if (narratePaused || (!narrating && !narrateQueue.length)) return;
+  narratePaused = true;
+  if (narrateAudio) narrateAudio.pause();
+}
+
+function narrateResume() {
+  if (!narratePaused) return;
+  narratePaused = false;
+  if (narrateAudio) narrateAudio.play().catch(() => {});
 }
 
 /* --------------------------------- the state -------------------------------- */
@@ -507,9 +582,9 @@ function startRun() {
   $('crew-live').textContent = 'live';
 
   setInputsDisabled(true);
-  // stopRun() (above) already called narrateStop() — just reset this button's own label/state.
-  const readBtn = $('read-story');
-  readBtn.disabled = true; readBtn.textContent = '🔊 Read story aloud'; readBtn.classList.remove('reading');
+  // stopRun() (above) already called narrateStop() — just reset these buttons' own label/state.
+  $('read-story').disabled = true;
+  readStoryAloudReset();
   $('download').disabled = true;
   $('download-gif').disabled = true;
   $('download-pdf').disabled = true;
@@ -600,7 +675,7 @@ function finishRun() {
   go.textContent = 'Run again'; go.classList.remove('running'); go.classList.add('again'); go.disabled = false;
   setInputsDisabled(false);
   const hasStory = state.panels.filter((p) => p.caption).length > 0;
-  $('read-story').disabled = !hasStory || !SPEECH_SUPPORTED;
+  $('read-story').disabled = !hasStory;
   $('download').disabled = !hasStory;
   $('download-gif').disabled = !hasStory;
   $('download-pdf').disabled = !hasStory;
@@ -972,25 +1047,51 @@ async function restyleStory() {
 
 /* ------------------------------- read story aloud ------------------------------ */
 // On-demand replay of a FINISHED story through the same narration engine as the live
-// narration (above), but deliberately bypasses the narrationOn gate — clicking this
-// button IS the explicit ask, regardless of whether SpeechSynthesis is otherwise
-// unavailable/unsupported. Click again while reading to stop early.
+// narration (above), but deliberately bypasses the narrationOn gate — clicking this button IS
+// the explicit ask. Click again while reading (or while the first line is still loading) to
+// stop early.
+function readStoryAloudReset() {
+  const btn = $('read-story');
+  const pauseBtn = $('pause-story');
+  btn.textContent = '🔊 Read story aloud';
+  btn.classList.remove('reading');
+  pauseBtn.hidden = true;
+  pauseBtn.disabled = true;
+  pauseBtn.textContent = '⏸ Pause';
+}
+
 function readStoryAloud() {
   const btn = $('read-story');
-  if (!SPEECH_SUPPORTED || btn.disabled) return;
+  if (btn.disabled) return;
   if (narrating || narrateQueue.length) {
     narrateStop();
-    btn.textContent = '🔊 Read story aloud';
-    btn.classList.remove('reading');
+    readStoryAloudReset();
     return;
   }
   const panels = state.panels.filter((p) => p.caption).sort((a, b) => a.n - b.n);
   if (!panels.length) return;
   panels.forEach((p) => narrateQueue.push(p.caption));
+  narratePrefetchNext();
   btn.textContent = '⏹ Stop reading';
   btn.classList.add('reading');
-  narrateOnIdle = () => { btn.textContent = '🔊 Read story aloud'; btn.classList.remove('reading'); };
+  const pauseBtn = $('pause-story');
+  pauseBtn.hidden = false;
+  pauseBtn.disabled = false;
+  pauseBtn.textContent = '⏸ Pause';
+  narrateOnIdle = readStoryAloudReset;
   narratePump();
+}
+
+function togglePauseStory() {
+  const pauseBtn = $('pause-story');
+  if (pauseBtn.disabled) return;
+  if (narratePaused) {
+    narrateResume();
+    pauseBtn.textContent = '⏸ Pause';
+  } else {
+    narratePause();
+    pauseBtn.textContent = '▶ Resume';
+  }
 }
 
 /* --------------------------- regenerate one panel ----------------------------- */
@@ -1047,12 +1148,8 @@ $('gallery').addEventListener('click', (e) => {
   regeneratePanel(parseInt(btn.dataset.panel, 10));
 });
 
-if (!SPEECH_SUPPORTED) {
-  $('read-story').disabled = true;
-  $('read-story').title = 'This browser does not support speech synthesis.';
-} else {
-  $('read-story').addEventListener('click', readStoryAloud);
-}
+$('read-story').addEventListener('click', readStoryAloud);
+$('pause-story').addEventListener('click', togglePauseStory);
 
 const params = new URLSearchParams(location.search);
 // See startRun()'s EMBED_TOKEN comment: only meaningful once the bridge requires one.

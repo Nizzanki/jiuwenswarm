@@ -43,10 +43,10 @@ async def run_agent(
     observability on the gateway side.
 
     `on_event`, if given, is called synchronously with EVERY event as soon as its line
-    completes in the growing buffer -- before the run finishes, before dedup, and before any
-    whitespace-corruption in raw deltas is corrected by the final consolidated artifact. It's
-    the caller's job to decide which event types are safe to act on early (see `live.py`) --
-    this function just reports what it sees, as soon as it sees it.
+    completes in the growing buffer -- before the run finishes and before dedup collapses it
+    against the same event's later replay in jiuwenswarm's chat.final consolidated copy (see
+    `dedup.py`). It's the caller's job to decide which event types are safe to act on early
+    (see `live.py`) -- this function just reports what it sees, as soon as it sees it.
     """
     context_id = f"{context_prefix}_{uuid.uuid4().hex[:12]}"
     hx = httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=connect_timeout))
@@ -73,9 +73,10 @@ async def run_agent(
                             except Exception:  # noqa: BLE001 -- a live-forwarding hiccup must never break the run
                                 log.exception("on_event callback failed")
         # Parse once over the full buffer, line-scoped (robust to team tool-noise). This is
-        # the authoritative pass -- it re-sees everything on_event already reported (plus the
-        # final consolidated/correctly-spaced copy), which is why on_event alone is never the
-        # source of truth downstream.
+        # the authoritative pass -- it re-sees everything on_event already reported (plus
+        # jiuwenswarm's chat.final replay of the same content, appended once more at the
+        # end), which is why on_event alone is never the source of truth downstream -- the
+        # caller must still run dedup.best_variants over the return value.
         return parse_events(buf, known_events)
     finally:
         if client is not None:

@@ -123,6 +123,8 @@ Inbound A2A `message.parts` are mapped into internal `Message.params.query` and 
 
 **Separating reasoning from the answer**: reasoning content never enters the `response` artifact. By default (`A2A_SERVER_EXPOSE_REASONING` enabled) it is emitted as working-state `TaskStatusUpdateEvent`s whose `status.message.parts[].metadata` carries `{"jiuwen_thought": true}` (mirroring Google ADK's `adk_thought` convention), so callers can structurally render or ignore it. Set to `false`/`0`/`no`/`off` to drop it.
 
+**`chat.final` duplicates already-streamed `chat.delta` content**: internally, a completed chat turn emits a `chat.delta` sequence followed by one `chat.final` carrying that same turn's full consolidated text (used by clients that don't accumulate deltas themselves). `A2AChannel` forwards every message it receives as an appended `TaskArtifactUpdateEvent` part, `chat.final` included, without suppressing it when deltas already covered the same content — unlike e.g. the CLI channel's renderer, which explicitly skips re-printing `chat.final`'s text once any delta has been written for that turn. A streaming A2A caller that concatenates every artifact part therefore sees each piece of text twice. If your client needs a single clean copy, either stop accumulating once you see the terminal (`last_chunk=true`) part and use its text as authoritative, or dedup client-side the way `packages/a2a-embed/a2a_embed/dedup.py` does (used by `demos/inkwell-studio/server/bridge.py`).
+
 ### 6.3 Metadata: empty is safe, `mode` routes to team
 
 - Request-level `Message.metadata` is always normalized to `{}` (never `None`) before it

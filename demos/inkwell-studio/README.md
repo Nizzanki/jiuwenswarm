@@ -23,7 +23,7 @@ reducer/renderers turn into panels, crew status, and the revision log.
 
 ## Run it
 
-Needs the repo venv (`uv sync --extra a2a`) and three processes. From the repo root:
+Needs the repo venv (`uv sync --extra a2a --extra tts`) and three processes. From the repo root:
 
 ```bash
 # 1. AgentServer
@@ -109,6 +109,25 @@ IMAGE_BACKEND=a1111 IMAGE_URL=http://127.0.0.1:7860 \
   .venv/Scripts/python.exe demos/inkwell-studio/server/bridge.py
 ```
 
+## Narration
+
+The **🔊 Read story aloud** button narrates the finished story through `server/narrate.py` —
+Microsoft Edge's neural TTS voices (the `edge-tts` package, the same consumer service behind
+Edge's own Read Aloud/Narrator feature), via a new bridge route (`POST /narrate`, one line of
+caption in, MP3 bytes out). Needs the `tts` extra: `uv sync --extra a2a --extra tts`.
+
+| Env | Default | What it does |
+|-----|---------|---------------|
+| `TTS_VOICE` | `en-US-AnaNeural` | The Edge neural voice to speak in (any voice name `edge-tts --list-voices` lists). |
+| `TTS_RATE` | `-8%` | SSML prosody rate — a touch slower than normal speech, easier to follow as a read-aloud story. |
+| `TTS_TIMEOUT` | `20` | Seconds before a single line's synthesis call is given up on. |
+
+**No fallback voice engine, by design:** unlike `imagegen.py`'s stub-image fallback, a
+`/narrate` failure (Microsoft's service unreachable, blocked, or erroring) stops narration and
+shows the error — it does not silently drop back to the browser's own `SpeechSynthesis`. This
+also means narration now depends on the **bridge host** having outbound internet access to
+Microsoft's TTS endpoint, which the old browser-native engine never needed.
+
 ## Child-safety moderation
 
 Every caption and image prompt is required to be child-appropriate (roughly ages 4-8) —
@@ -186,6 +205,11 @@ crew/image backend is simply asked to draw in that style, same as any other pres
 - **Non-determinism:** even guided, a rare run may emit a malformed line or skip the rejection.
   The bridge is tolerant (drops noise, always sends a terminal `run.done`) and the prompt insists
   on one real revision, but the money-moment isn't 100% guaranteed every run.
+- **Narration is a real Microsoft cloud call, not simulated:** the old browser-native
+  `SpeechSynthesis` narration ran fully client-side; `/narrate` (server/narrate.py) now calls
+  Microsoft's Edge TTS service from the bridge host. There's no fallback voice — if that call
+  fails (network, outage, blocked egress), narration stops and shows the error rather than
+  quietly downgrading. See the Narration section above.
 
 ## Accessibility
 Respects `prefers-reduced-motion`: shimmer, pulsing crew dots, the caption typewriter, and card

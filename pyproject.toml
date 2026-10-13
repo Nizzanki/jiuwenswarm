@@ -115,6 +115,7 @@ harmony = [
 ]
 a2a = ["a2a-sdk[http-server]==1.0.0"]
 a2a-embed = ["a2a-embed"]
+tts = ["edge-tts>=7.2"]
 ssh = ["asyncssh>=2.14.0,<2.24"]
 desktop = ["pywebview>=5.4,<7"]
 dev = ["pyinstaller>=6.0.0", "pywebview>=5.4,<7"]

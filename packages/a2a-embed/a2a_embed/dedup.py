@@ -1,7 +1,13 @@
-"""Whitespace-insensitive dedup, keeping the longest (best-spaced) variant of each distinct
-event. Ported from demos/inkwell-studio/server/bridge.py, where it exists because some A2A
-streaming paths strip whitespace from live per-chunk deltas -- only a later, corrected
-variant of the same event carries correct inter-token spacing (see docs/en/A2A.md).
+"""Whitespace-insensitive dedup, keeping the longest variant of each distinct event. Ported
+from demos/inkwell-studio/server/bridge.py, where it exists because jiuwenswarm's chat.final
+event replays a turn's full consolidated text as one more A2A artifact part on top of the
+chat.delta chunks already streamed for that same content (other channels, e.g. the CLI
+renderer, explicitly skip re-printing chat.final once a delta has been written; A2AChannel
+doesn't), so a raw A2A event stream genuinely contains each logical line twice -- see
+docs/en/A2A.md section 6. (A separate, now-fixed bug used to also strip whitespace from the
+delta copy specifically, which is why "longest" was originally framed as "best-spaced" --
+that corruption is fixed at the source now, but the two copies -- and the need to dedup them
+-- predate and outlive it.)
 """
 from __future__ import annotations
 
