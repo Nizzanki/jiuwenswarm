@@ -55,8 +55,18 @@ body {
 .brand h1 { font-family: var(--serif); font-size: clamp(30px,5vw,46px); margin: 0; letter-spacing: .01em; font-weight: 700; color: var(--ink); }
 .brand h1 span { color: var(--teal); font-style: italic; }
 .brand .sub { color: var(--ink-mut); font-family: var(--serif); font-style: italic; font-size: 16px; margin-top: 4px; }
+.powered-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
 .powered { text-align: right; font-size: 10.5px; color: var(--ink-dim); letter-spacing: .04em; line-height: 1.8; text-transform: uppercase; }
 .powered .swarm { color: var(--teal); font-weight: 600; }
+.lang-toggle {
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--ink-dim); background: var(--panel); border: 1px solid var(--border-2); border-radius: var(--r);
+  padding: 4px 10px; cursor: pointer;
+}
+.lang-toggle:hover { border-color: var(--teal); }
+.lang-toggle:hover .lang-opt { color: var(--teal); }
+.lang-toggle .lang-opt { opacity: .55; }
+.lang-toggle .lang-opt.active { opacity: 1; color: var(--teal); font-weight: 700; }
 
 .arch { border: 1px solid var(--border); border-radius: var(--r); background: var(--panel); padding: 16px 18px; margin-bottom: 28px; }
 .arch .cap { font-size: 10px; letter-spacing: .2em; text-transform: uppercase; color: var(--ink-dim); margin-bottom: 14px; }
@@ -294,6 +304,9 @@ body {
 
 /* caption typewriter caret */
 .pcap .t .caret { display: inline-block; width: 2px; height: 1em; margin-left: 1px; background: var(--teal); vertical-align: text-bottom; animation: blink 1s step-end infinite; }
+/* the word currently being read aloud (app.js wordHlTick) — an ochre wash + underline, like a finger following the line */
+.pcap .t .w { border-radius: 2px; transition: background-color .12s ease, box-shadow .12s ease; }
+.pcap .t .w.spoken { background: rgba(169,123,30,.2); box-shadow: inset 0 -2px 0 var(--amber); }
 @keyframes blink { 50% { opacity: 0; } }
 
 .pcard.enter { animation: rise .45s ease both; }
@@ -303,6 +316,7 @@ body {
   .skel { animation: none; }
   .dot.active { animation: none; }
   .pcap .t .caret, .artprompt .rendering::before { animation: none; }
+  .pcap .t .w { transition: none; }
   .pcard.enter { animation: none; }
   .track > i { transition: none; }
   .pimg-img { animation: none; }

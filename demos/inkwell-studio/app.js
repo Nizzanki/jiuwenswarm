@@ -7,33 +7,15 @@
 // front-end; everything below is Inkwell-specific).
 
 import { AgentEmbedSource } from './embed/agent-embed.js';
+import { t, getLang, setLang, applyStaticI18n, surpriseIdeas } from './i18n.js';
 
-const AGENT_LABELS = { imageGen: 'tool' };
-
-// Canned, child-safe one-liners for the "surprise me" idea button — purely client-side,
-// no LLM call needed for something this small.
-const SURPRISE_IDEAS = [
-  'A lonely lighthouse keeper befriends a sea monster.',
-  'A shy dragon just wants someone to read books with.',
-  'A little cloud loses her rain and asks the animals for help.',
-  'A snail dreams of racing the wind and finally gets his chance.',
-  'A grumpy old oak tree learns to share its shade with a new sapling.',
-  'A firefly who can\'t glow yet borrows light from the stars.',
-  'Two rival garden gnomes team up to save the vegetable patch.',
-  'A young otter finds a lost mitten and searches the whole river for its owner.',
-  'A sleepy bear tries to stay awake to see the first snow.',
-  'A paper boat sets sail to find where the stream ends.',
-  'A tiny mole who\'s afraid of the dark discovers she can glow.',
-  'A young owl is scared of heights but must learn to fly before winter.',
-  'A scarecrow secretly longs to dance with the cornstalks at night.',
-  'A hedgehog too prickly for hugs invents a soft blanket instead.',
-  'A whale sings the same song every night, hoping someone finally sings back.',
-];
-
+// Canned, child-safe one-liners for the "surprise me" idea button — purely client-side, no
+// LLM call needed for something this small. The pool itself is language-specific (see
+// i18n.js's surpriseIdeas()) so "surprise me" under the 中文 toggle fills in a Chinese idea.
 function surpriseIdea() {
   if (state.running) return;
   const field = $('idea');
-  const pool = SURPRISE_IDEAS.filter((s) => s !== field.value);
+  const pool = surpriseIdeas().filter((s) => s !== field.value);
   field.value = pool[Math.floor(Math.random() * pool.length)];
 }
 
@@ -66,13 +48,17 @@ function narrateStart(text) {
   const controller = new AbortController();
   const promise = fetch('/narrate', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text }), signal: controller.signal,
+    body: JSON.stringify({ text, lang: getLang() }), signal: controller.signal,
   }).then(async (res) => {
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.error || `bridge ${res.status}`);
     }
-    return URL.createObjectURL(await res.blob());
+    // Per-word timings for the spoken-word highlight (see wordHlStart) — missing or malformed
+    // just means no highlight, never a failed line.
+    let words = [];
+    try { words = JSON.parse(decodeURIComponent(res.headers.get('X-Word-Boundaries') || '[]')); } catch { words = []; }
+    return { url: URL.createObjectURL(await res.blob()), words };
   });
   const entry = { promise, controller };
   narrateInflight.set(text, entry);
@@ -93,27 +79,29 @@ async function narratePump() {
   const text = narrateQueue.shift();
   const { promise } = narrateStart(text);
   narratePrefetchNext();   // kick off the NEXT line's fetch now, while this one loads/plays
-  let url;
+  let url, words;
   try {
-    url = await promise;
+    ({ url, words } = await promise);
   } catch (e) {
     narrateInflight.delete(text);
     narrating = false;
-    if (e.name !== 'AbortError') showLiveNote(`Couldn't read the story aloud (${e.message}). Needs the bridge running.`);
+    if (e.name !== 'AbortError') showLiveNote(t('livenote.narrateFailed', e.message));
     narrateStop();
     return;
   }
   narrateInflight.delete(text);
   const audio = new Audio(url);
   narrateAudio = audio;
+  wordHlStart(text, audio, words);
   const done = () => {
+    wordHlStop();
     URL.revokeObjectURL(url);
     if (narrateAudio === audio) narrateAudio = null;
     narrating = false;
     narratePump();
   };
   audio.onended = done;
-  audio.onerror = () => { showLiveNote("Couldn't play the story's narration."); done(); };
+  audio.onerror = () => { showLiveNote(t('livenote.narratePlayFailed')); done(); };
   // If paused while this line was still loading, leave it cued but silent — narrateResume()
   // starts it (onended/onerror above still fire normally once it's eventually played out).
   if (!narratePaused) audio.play().catch(done);
@@ -134,6 +122,7 @@ function narrateStop() {
   for (const { controller } of narrateInflight.values()) controller.abort();
   narrateInflight.clear();
   if (narrateAudio) { narrateAudio.pause(); narrateAudio = null; }
+  wordHlStop();
 }
 
 // Pause/resume only ever touch the CURRENTLY loaded line's <audio> (or, if that line is still
@@ -151,29 +140,119 @@ function narrateResume() {
   if (narrateAudio) narrateAudio.play().catch(() => {});
 }
 
+/* --------------------------- spoken-word highlight --------------------------- */
+// While a caption is read aloud, the word being spoken gets the .spoken style. /narrate's
+// X-Word-Boundaries header gives each word's start time in the MP3 (zh comes back segmented
+// by word — 水獭, 手套 — not per character). Each boundary word is located in the caption in
+// order; one that can't be found (e.g. a number the voice spelled out) is skipped rather
+// than guessed, so the highlight never lands on the wrong word. Driven off the <audio>
+// element's own clock, so pause/resume needs no extra handling.
+let wordHl = null;   // { text, audio, ranges: [[start, end, startMs], ...], idx, raf }
+
+// Same-length normalization (lowercase, curly → straight apostrophe) so "couldn't" from the
+// voice still matches a caption written "Couldn’t" without shifting any character offsets.
+const wordHlNorm = (s) => s.toLowerCase().replace(/[\u2018\u2019]/g, "'");
+
+function wordRanges(caption, words) {
+  const hay = wordHlNorm(caption);
+  const out = [];
+  let cursor = 0;
+  for (const [ms, , w] of words) {
+    if (!w) continue;
+    const at = hay.indexOf(wordHlNorm(w), cursor);
+    if (at < 0) continue;
+    out.push([at, at + w.length, ms]);
+    cursor = at + w.length;
+  }
+  return out;
+}
+
+function wordHlMarkup(caption, ranges) {
+  let html = '';
+  let pos = 0;
+  ranges.forEach(([start, end], i) => {
+    html += escapeHtml(caption.slice(pos, start))
+      + `<span class="w" data-w="${i}">${escapeHtml(caption.slice(start, end))}</span>`;
+    pos = end;
+  });
+  return html + escapeHtml(caption.slice(pos));
+}
+
+function wordHlEl(text) {
+  const p = state.panels.find((x) => x.caption === text);
+  if (!p || typers[p.n]) return null;   // no such panel, or its typewriter is still revealing it
+  return document.querySelector(`#panel-${p.n} .pcap .t`);
+}
+
+function wordHlTick() {
+  const h = wordHl;
+  if (!h) return;
+  h.raf = requestAnimationFrame(wordHlTick);
+  const el = wordHlEl(h.text);
+  if (!el) return;
+  // (Re)wrap on the first frame, and again whenever renderPanel rebuilt the card mid-line.
+  if (!el.dataset.spoken) {
+    el.innerHTML = wordHlMarkup(h.text, h.ranges);
+    el.dataset.spoken = '1';
+    h.idx = -1;
+  }
+  const ms = h.audio.currentTime * 1000;
+  let i = -1;
+  while (i + 1 < h.ranges.length && h.ranges[i + 1][2] <= ms) i += 1;
+  if (i === h.idx) return;
+  el.querySelector('.w.spoken')?.classList.remove('spoken');
+  if (i >= 0) el.querySelector(`.w[data-w="${i}"]`)?.classList.add('spoken');
+  h.idx = i;
+}
+
+function wordHlStart(text, audio, words) {
+  wordHlStop();
+  const ranges = wordRanges(text, words || []);
+  if (!ranges.length) return;
+  wordHl = { text, audio, ranges, idx: -1, raf: 0 };
+  wordHl.raf = requestAnimationFrame(wordHlTick);
+}
+
+function wordHlStop() {
+  const h = wordHl;
+  if (!h) return;
+  wordHl = null;
+  cancelAnimationFrame(h.raf);
+  const el = wordHlEl(h.text);
+  if (el && el.dataset.spoken) {
+    el.textContent = h.text;
+    delete el.dataset.spoken;
+  }
+}
+
 /* --------------------------------- the state -------------------------------- */
 
 const AGENT_ORDER = ['writer', 'critic', 'artDirector', 'imageGen', 'editor'];
-const AGENT_NAMES = {
-  writer: 'Writer', critic: 'Critic', artDirector: 'Art Director',
-  imageGen: 'Image Gen', editor: 'Editor',
-};
-const STATE_WORD = { active: 'working', done: 'done', idle: 'idle', reject: 'rejected' };
+// Names/say-lines/state-words are looked up live via t() (not cached objects) so a language
+// toggle picks up the current `lang` immediately — see i18n.js.
+const AGENT_NAMES = () => ({
+  writer: t('agent.writer'), critic: t('agent.critic'), artDirector: t('agent.artDirector'),
+  imageGen: t('agent.imageGen'), editor: t('agent.editor'),
+});
+const AGENT_LABELS = () => ({ imageGen: t('agent.label.tool') });
+const STATE_WORD = () => ({
+  active: t('state.active'), done: t('state.done'), idle: t('state.idle'), reject: t('state.reject'),
+});
 // Canned filler for the "say" line when a live-forwarded `agent` event arrives with
 // say:"" (see the reducer's 'agent' case) — keyed by the free-form `state` word the
 // crew emits (drafting/rendering/revising/queued/review/...), falling back to `status`.
-const GENERIC_SAY = {
-  drafting: 'Drafting…', rendering: 'Rendering…', revising: 'Revising…',
-  queued: 'Queued…', review: 'Reviewing…',
-};
+const GENERIC_SAY = () => ({
+  drafting: t('say.drafting'), rendering: t('say.rendering'), revising: t('say.revising'),
+  queued: t('say.queued'), review: t('say.review'),
+});
 
 function freshAgents() {
   return {
-    writer:      { status: 'idle', say: 'Ready when you are.' },
-    critic:      { status: 'idle', say: 'Standing by to review.' },
-    artDirector: { status: 'idle', say: 'Waiting for the first beat.' },
-    imageGen:    { status: 'idle', say: 'No panels rendered yet.' },
-    editor:      { status: 'idle', say: 'Watching the flow.' },
+    writer:      { status: 'idle', say: t('say.writer.idle') },
+    critic:      { status: 'idle', say: t('say.critic.idle') },
+    artDirector: { status: 'idle', say: t('say.artDirector.idle') },
+    imageGen:    { status: 'idle', say: t('say.imageGen.idle') },
+    editor:      { status: 'idle', say: t('say.editor.idle') },
   };
 }
 
@@ -278,7 +357,7 @@ function apply(ev) {
         if (ev.state) a.state = ev.state; else delete a.state;
         if (ev.say) a.say = ev.say;
         else {
-          const canned = GENERIC_SAY[ev.state] || (ev.status === 'active' ? 'Working…' : null);
+          const canned = GENERIC_SAY()[ev.state] || (ev.status === 'active' ? t('say.working') : null);
           if (canned) a.say = canned;
         }
       }
@@ -324,25 +403,26 @@ const $ = (id) => document.getElementById(id);
 function renderBrief() {
   $('brief-q').textContent = `“${state.brief.idea}”`;
   const tags = state.brief.style.split('·').map((s) => s.trim()).filter(Boolean);
-  tags.push(`~${state.brief.total} panels`);
-  $('brief-tags').innerHTML = tags.map((t) => `<span>${escapeHtml(t)}</span>`).join('');
+  tags.push(getLang() === 'zh' ? `约 ${state.brief.total} 格` : `~${state.brief.total} panels`);
+  $('brief-tags').innerHTML = tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join('');
 }
 
 // No entry for "approved" — once a panel lands, its status badge is removed rather than
 // left reading "Approved" over the finished picture.
-const PILL = {
-  drafting:  { cls: 'draft',  text: 'Drafting' },
-  rendering: { cls: 'draft',  text: 'Rendering' },
-  review:    { cls: 'review', text: 'In review' },
-  revising:  { cls: 'review', text: 'In review' },
-};
+function pillFor(status) {
+  const cls = { drafting: 'draft', rendering: 'draft', review: 'review', revising: 'review' }[status];
+  if (!cls) return null;
+  const text = { drafting: t('pill.drafting'), rendering: t('pill.rendering'),
+    review: t('pill.review'), revising: t('pill.review') }[status];
+  return { cls, text };
+}
 
 function panelInnerHtml(p) {
-  const pill = PILL[p.status] || null;
+  const pill = pillFor(p.status);
   const num = String(p.n).padStart(2, '0');
   const revising = p.status === 'revising';
 
-  const revTag = revising ? '<span class="rev-tag">Revising…</span>' : '';
+  const revTag = revising ? `<span class="rev-tag">${t('panel.revising')}</span>` : '';
   let media;
   if (p.image) {
     media = `<img class="pimg-img" src="${p.image}" alt="${escapeHtml(p.caption || 'panel image')}">` + revTag;
@@ -351,21 +431,21 @@ function panelInnerHtml(p) {
     // If the render failed we say so — an endless "rendering…" is a lie.
     let rendering = '';
     if (p.imageError) {
-      rendering = `<div class="failed" title="${escapeHtml(p.imageError)}">no image</div>`;
+      rendering = `<div class="failed" title="${escapeHtml(p.imageError)}">${t('panel.noImage')}</div>`;
     } else if (p.status === 'review' || p.status === 'approved' || p.status === 'revising') {
-      rendering = '<div class="rendering">rendering…</div>';
+      rendering = `<div class="rendering">${t('panel.rendering')}</div>`;
     }
-    media = `<div class="artprompt">${rendering}<div class="k">Art Director · image prompt</div>`
+    media = `<div class="artprompt">${rendering}<div class="k">${t('panel.artDirectorLabel')}</div>`
       + `<div class="p">“${escapeHtml(p.svg)}”</div>`
       + `<div class="tag${p.imageError ? ' bad' : ''}">`
-      + (p.imageError ? `⚠ ${escapeHtml(p.imageError)}` : '🎨 image prompt')
+      + (p.imageError ? `⚠ ${escapeHtml(p.imageError)}` : t('panel.imagePromptTag'))
       + `</div></div>` + revTag;
   } else {
-    const lb = p.status === 'rendering' ? 'Rendering…' : 'Writer at work…';
+    const lb = p.status === 'rendering' ? t('panel.rendering') : t('panel.writerAtWork');
     media = `<div class="skel"><div class="ic"></div><div class="lb">${lb}</div></div>`;
   }
 
-  const capText = p.caption ? escapeHtml(p.caption) : '— caption pending —';
+  const capText = p.caption ? escapeHtml(p.caption) : t('panel.captionPending');
   const capClass = p.caption && !p.dim ? 't' : 't dim';
   const note = p.note
     ? `<div class="note"><b>${escapeHtml(p.note.label)}</b>${escapeHtml(p.note.text)}</div>`
@@ -377,7 +457,7 @@ function panelInnerHtml(p) {
   const canRegen = !!p.svg && !state.running;
   const regenBtn = canRegen
     ? `<button type="button" class="regen-btn" data-panel="${p.n}" ${p.regenerating ? 'disabled' : ''}
-         title="Redo this image — same caption, a fresh picture">${p.regenerating ? '⟳ Redrawing…' : '↻ Redo image'}</button>`
+         title="${t('panel.regen.title')}">${p.regenerating ? t('panel.regenBusy') : t('panel.regen')}</button>`
     : '';
 
   return `
@@ -413,18 +493,45 @@ function renderPanel(n) {
   renderFullText();          // keep the full-text / debug section in step with the panels
 }
 
+// Short state-badge words (no ellipsis) for the crew card's `state` field — the model's own
+// protocol emits these as fixed English tokens (prompt.py's `agent.state`), independent of
+// the story's language, so the raw value needs translating the same as everything else.
+const STATE_SUBWORD_KEYS = {
+  drafting: 'word.drafting', rendering: 'word.rendering', revising: 'word.revising',
+  queued: 'word.queued', review: 'word.review',
+};
+// Returns the translated word for a known state, or null if `raw` isn't one of the enum
+// values prompt.py's protocol asks for. The model doesn't always comply (free-form text can
+// leak into this field despite the closed-enum instruction) — null, not the raw string, so
+// callers never display untrusted model text verbatim in the badge.
+function stateSubword(raw) {
+  const key = STATE_SUBWORD_KEYS[raw];
+  return key ? t(key) : null;
+}
+
+// Panel status (drafting|rendering|review|revising|approved — prompt.py's fixed English
+// enum) shown in the full-text debug section; shares the agent sub-state words above for the
+// four that overlap, plus its own "approved". Unlike the crew card, this IS a debug view, so
+// an unrecognized value falls back to showing the raw text rather than hiding it.
+function panelStatusWord(status) {
+  if (status === 'approved') return t('status.approved');
+  return stateSubword(status) || status;
+}
+
 function renderCrew() {
+  const names = AGENT_NAMES();
+  const labels = AGENT_LABELS();
   const html = AGENT_ORDER.map((id) => {
     const a = state.agents[id];
     const dot = { active: 'active', reject: 'reject', done: 'done', idle: 'idle' }[a.status] || 'idle';
-    const word = a.state || STATE_WORD[a.status] || 'idle';
+    const word = stateSubword(a.state) || STATE_WORD()[a.status] || t('state.idle');
     const stCls = { active: 'st-active', reject: 'st-reject', done: 'st-done', idle: 'st-idle' }[a.status] || 'st-idle';
-    const tool = AGENT_LABELS[id] ? ` <small>${AGENT_LABELS[id]}</small>` : '';
+    const tool = labels[id] ? ` <small>${labels[id]}</small>` : '';
     return `
       <div class="agent${a.status === 'active' || a.status === 'reject' ? ' agent-active' : ''}">
         <span class="dot ${dot}"></span>
         <div style="flex:1">
-          <div class="row1"><span class="who">${AGENT_NAMES[id]}${tool}</span><span class="state ${stCls}">${escapeHtml(word)}</span></div>
+          <div class="row1"><span class="who">${names[id]}${tool}</span><span class="state ${stCls}">${escapeHtml(word)}</span></div>
           <div class="say">${escapeHtml(a.say)}</div>
         </div>
       </div>`;
@@ -437,14 +544,14 @@ function renderProgress() {
   const pct = Math.round((approved / total) * 100);
   $('prog-bar').style.width = `${pct}%`;
   if (state.done) {
-    $('prog-lead').textContent = 'Story complete';
-    $('prog-sub').textContent = `· all ${total} panels approved`;
+    $('prog-lead').textContent = t('prog.done.lead');
+    $('prog-sub').textContent = t('prog.done.sub', total);
   } else if (state.running) {
-    $('prog-lead').textContent = `${approved} approved`;
-    $('prog-sub').textContent = `· ${inReview} in review · ${drafting} drafting · ~${total} total`;
+    $('prog-lead').textContent = t('prog.running.lead', approved);
+    $('prog-sub').textContent = t('prog.running.sub', inReview, drafting, total);
   } else {
-    $('prog-lead').textContent = 'Idle';
-    $('prog-sub').textContent = '· press Go to begin';
+    $('prog-lead').textContent = t('prog.idle.lead');
+    $('prog-sub').textContent = t('prog.idle.sub');
   }
 }
 
@@ -452,11 +559,11 @@ function renderLog() {
   const title = $('loop-title');
   const list = $('log');
   if (state.focus == null || state.log.length === 0) {
-    title.textContent = 'Revision loop';
-    list.innerHTML = '<li class="log-empty"><span class="txt">The Critic↔Writer loop shows up here when a panel gets sent back.</span></li>';
+    title.textContent = t('loop.title');
+    list.innerHTML = `<li class="log-empty"><span class="txt">${t('loop.empty')}</span></li>`;
     return;
   }
-  title.textContent = `Panel ${state.focus}`;
+  title.textContent = t('loop.panel', state.focus);
   list.innerHTML = state.log
     .map((l) => `<li><span class="step">${escapeHtml(String(l.step))}</span><span class="txt">${sanitizeLogHtml(l.html)}</span></li>`)
     .join('');
@@ -491,17 +598,21 @@ function renderFullText() {
   if (!story) return;
   const panels = state.panels.filter((p) => p.caption).sort((a, b) => a.n - b.n);
   if (!panels.length) {
-    story.innerHTML = '<span class="ft-empty">The finished story appears here once a run completes.</span>';
+    story.innerHTML = `<span class="ft-empty">${t('fulltext.empty')}</span>`;
     meta.textContent = '—'; dbg.innerHTML = '';
     return;
   }
-  const words = panels.reduce((n, p) => n + p.caption.split(/\s+/).filter(Boolean).length, 0);
-  meta.textContent = `${panels.length} panel${panels.length > 1 ? 's' : ''} · ${words} words`;
+  // Word count: CJK text has no spaces between words, so count characters instead of
+  // whitespace-split tokens when the story is in Chinese.
+  const words = getLang() === 'zh'
+    ? panels.reduce((n, p) => n + p.caption.replace(/\s+/g, '').length, 0)
+    : panels.reduce((n, p) => n + p.caption.split(/\s+/).filter(Boolean).length, 0);
+  meta.textContent = `${t('ft.panels', panels.length)} · ${t('ft.words', words)}`;
   story.innerHTML = panels.map((p) => `<p>${escapeHtml(p.caption)}</p>`).join('');
   // `svg` holds the Art Director's text image prompt (show the words as the thumbnail's caption).
   const thumb = (svg, image) => {
     if (image) return `<img src="${image}" alt="">`;
-    return '<div class="ft-noimg">no image</div>';
+    return `<div class="ft-noimg">${t('panel.noImage')}</div>`;
   };
   const promptLine = (svg) => (svg ? `<div class="ft-vp">${escapeHtml(svg)}</div>` : '');
   const version = (cls, label, svg, image, caption) => `
@@ -518,17 +629,17 @@ function renderFullText() {
     const rej = (p.artHistory || [])[0];           // the version the Critic sent back
     const compare = rej
       ? `<div class="ft-versions">
-           ${version('rejected', '✕ Rejected', rej.svg, rej.image, p.rejectedCaption)}
-           ${version('approved', '✓ Approved', p.svg, p.image, p.caption)}
+           ${version('rejected', t('ft.rejected'), rej.svg, rej.image, p.rejectedCaption)}
+           ${version('approved', t('ft.approved'), p.svg, p.image, p.caption)}
          </div>`
       : '';
     return `<div class="ft-panel">
-      <div class="ft-h">Panel ${String(p.n).padStart(2, '0')} · ${escapeHtml(p.status || '')}${rej ? ' · revised' : ''}</div>
-      ${note ? `<div class="ft-row ft-note"><b>critic</b>${escapeHtml(note.text)}</div>` : ''}
+      <div class="ft-h">${t('ft.panelHeading', String(p.n).padStart(2, '0'))} · ${escapeHtml(panelStatusWord(p.status || ''))}${rej ? ` · ${t('ft.revised')}` : ''}</div>
+      ${note ? `<div class="ft-row ft-note"><b>${t('ft.critic')}</b>${escapeHtml(note.text)}</div>` : ''}
       ${compare || `
-        <div class="ft-row ft-cap"><b>caption</b>${escapeHtml(p.caption)}</div>
-        ${p.svg ? `<div class="ft-row"><b>image prompt</b>${escapeHtml(p.svg)}</div>` : ''}
-        <div class="ft-row"><b>image</b>${p.image ? `rendered · ~${kb} KB` : '— (placeholder)'}</div>`}
+        <div class="ft-row ft-cap"><b>${t('ft.caption')}</b>${escapeHtml(p.caption)}</div>
+        ${p.svg ? `<div class="ft-row"><b>${t('ft.imagePrompt')}</b>${escapeHtml(p.svg)}</div>` : ''}
+        <div class="ft-row"><b>${t('ft.image')}</b>${p.image ? t('ft.rendered', kb) : t('ft.placeholder')}</div>`}
     </div>`;
   }).join('');
 }
@@ -569,17 +680,16 @@ function startRun() {
   stopRun();
   state = freshState();
 
-  const idea = ($('idea').value || '').trim() || 'A sleepy bear tries to stay awake to see the first snow.';
+  const idea = ($('idea').value || '').trim() || surpriseIdeas()[8];
   const style = $('style').value;
   const total = parseInt($('count').value, 10) || 5;
   state.brief = { idea, style, total };
   state.running = true;
 
   // reset the view
-  $('gallery').innerHTML = '<div class="empty" id="gallery-empty">'
-    + 'Contacting the JiuwenSwarm crew over A2A… first panels take ~20–40s while the story is written.</div>';
+  $('gallery').innerHTML = `<div class="empty" id="gallery-empty">${t('run.contacting')}</div>`;
   renderAll();
-  $('crew-live').textContent = 'live';
+  $('crew-live').textContent = t('crew.live');
 
   setInputsDisabled(true);
   // stopRun() (above) already called narrateStop() — just reset these buttons' own label/state.
@@ -592,15 +702,19 @@ function startRun() {
   $('restyle-style').disabled = true;
   $('restyle-style-preset').disabled = true;
   const go = $('go');
-  go.textContent = 'Running…'; go.classList.add('running'); go.classList.remove('again'); go.disabled = true;
+  go.textContent = t('go.running'); go.classList.add('running'); go.classList.remove('again'); go.disabled = true;
 
   // EMBED_TOKEN: opt-in, read once from ?token= on this page's own URL (see the bottom of
   // this file). Only useful once the bridge is started with INKWELL_API_TOKEN set -- unset
   // by default, so this demo keeps working with zero config. A real embed of a token-gated
   // bridge on someone else's page would have its own way to obtain a scoped token; a query
   // param on Inkwell's own URL is just the simplest thing that lets this be tested end-to-end.
+  //
+  // `lang`: "" (infer from idea) or "zh" (explicit override) — threaded to the bridge's
+  // /events route and on into prompt.py's _lang_line, so the EN/中文 toggle also decides
+  // what language the crew actually writes the story in (see server/prompt.py).
   source = new AgentEmbedSource(
-    { idea, style, panels: String(total) },
+    { idea, style, panels: String(total), lang: getLang() },
     { onFatal: abortRun, token: EMBED_TOKEN },
   );
   source.start(apply);
@@ -612,9 +726,9 @@ function abortRun(msg) {
   stopRun();
   state.running = false; state.done = false;
   renderProgress();
-  $('crew-live').textContent = 'idle';
+  $('crew-live').textContent = t('crew.idle');
   const go = $('go');
-  go.textContent = 'Go'; go.classList.remove('running'); go.classList.remove('again'); go.disabled = false;
+  go.textContent = t('go.idle'); go.classList.remove('running'); go.classList.remove('again'); go.disabled = false;
   setInputsDisabled(false);
   showLiveNote(msg);
 }
@@ -648,7 +762,7 @@ function finishRun() {
   // reconcile it the same way the image-stragglers above are reconciled.
   for (const p of state.panels) {
     if (!p.image && !p.imageError && p.svg) {
-      p.imageError = 'run ended before this panel finished rendering';
+      p.imageError = t('livenote.runEndedMidRender');
     }
     if (p.status !== 'approved') {
       p.status = 'approved';
@@ -670,9 +784,9 @@ function finishRun() {
   }
   renderCrew();
   renderProgress();
-  $('crew-live').textContent = 'done';
+  $('crew-live').textContent = t('crew.done');
   const go = $('go');
-  go.textContent = 'Run again'; go.classList.remove('running'); go.classList.add('again'); go.disabled = false;
+  go.textContent = t('go.again'); go.classList.remove('running'); go.classList.add('again'); go.disabled = false;
   setInputsDisabled(false);
   const hasStory = state.panels.filter((p) => p.caption).length > 0;
   $('read-story').disabled = !hasStory;
@@ -691,7 +805,7 @@ function stopRun() {
 }
 
 function setInputsDisabled(disabled) {
-  ['idea', 'style', 'style-preset', 'count', 'surprise'].forEach((id) => { $(id).disabled = disabled; });
+  ['idea', 'style', 'style-preset', 'count', 'surprise', 'lang-toggle'].forEach((id) => { $(id).disabled = disabled; });
 }
 
 /* ------------------------------- style preset --------------------------------- */
@@ -704,7 +818,12 @@ function wireStylePreset(selectId, inputId) {
   const input = $(inputId);
   select.addEventListener('change', () => {
     if (!select.value) return;
-    input.value = select.value;
+    // Copy the option's DISPLAYED text, not its (always-English) `value` — the <option>s
+    // carry data-i18n and applyStaticI18n() keeps their textContent translated, so this
+    // picks up whichever language is currently active. The style input is free-text and
+    // IS what gets sent to the backend as STYLE, so this also means a run started under
+    // the 中文 toggle gets a Chinese style description, not an English one.
+    input.value = select.options[select.selectedIndex].textContent;
     select.value = '';
   });
 }
@@ -724,33 +843,39 @@ function buildStoryHtml() {
   const b = state.brief;
   const panels = state.panels.filter((p) => p.caption);
 
-  const coverPage = `
+  // Each entry carries its right-page markup plus (for picture pages only) the caption
+  // text, which is rendered on the LEFT page instead -- see data-cap below. Cover/closing
+  // pages have no image, so they keep their text on the right page as a single spread.
+  const coverPage = { cap: '', html: `
     <div class="page-inner cover">
-      <div class="eyebrow">Inkwell Studio</div>
+      <div class="eyebrow">${t('export.eyebrow')}</div>
       <p class="idea">“${escapeHtml(b.idea)}”</p>
-      <p class="hint">turn the page to begin →</p>
-    </div>`;
+      <p class="hint">${t('export.turnPage')}</p>
+    </div>` };
 
   const panelPages = panels.map((p) => {
     const art = p.image ? `<img src="${p.image}" alt="">` : `<div class="ph">“${escapeHtml(p.svg || '')}”</div>`;
-    return `
+    return { cap: escapeHtml(p.caption), html: `
     <div class="page-inner panel">
       <div class="art">${art}</div>
-      <p class="cap">${escapeHtml(p.caption)}</p>
-    </div>`;
+    </div>` };
   });
 
-  const closingPage = `
+  const closingPage = { cap: '', html: `
     <div class="page-inner cover closing">
-      <div class="eyebrow">The End</div>
-      <p class="meta">An illustrated story, made by a crew of agents<br>powered by JiuwenSwarm over A2A</p>
-    </div>`;
+      <div class="eyebrow">${t('export.theEnd')}</div>
+      <p class="meta">${t('export.closing.html')}</p>
+    </div>` };
 
   const pages = [coverPage, ...panelPages, closingPage];
-  const pageHtml = pages.map((inner, i) => `<div class="page" data-i="${i}">${inner}</div>`).join('\n');
-  const dotsHtml = pages.map((_, i) => `<button class="dot" data-i="${i}" aria-label="Go to page ${i + 1}"></button>`).join('');
+  // data-cap carries the (already-escaped) caption text for the LEFT page; the browser
+  // HTML-unescapes it again when JS reads el.dataset.cap, so it comes back as plain text.
+  const pageHtml = pages
+    .map((pg, i) => `<div class="page" data-i="${i}"${pg.cap ? ` data-cap="${pg.cap}"` : ''}>${pg.html}</div>`)
+    .join('\n');
+  const dotsHtml = pages.map((_, i) => `<button class="dot" data-i="${i}" aria-label="${t('export.goToPage', i + 1)}"></button>`).join('');
 
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+  return `<!doctype html><html lang="${getLang() === 'zh' ? 'zh-CN' : 'en'}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(b.idea)} — Inkwell Studio</title>
 <style>
   :root{color-scheme:light}
@@ -765,13 +890,23 @@ function buildStoryHtml() {
   /* Book spread stage */
   .stage{position:relative;width:min(900px,94vw);aspect-ratio:8/5}
   
-  /* Underlying paper base for left side of the open book */
+  /* Underlying paper base for left side of the open book -- holds the caption text for
+     whichever picture page is currently showing on the right. */
   .book-base-left {
     position:absolute; top:0; left:0; width:50%; height:100%;
     background:#efe8da; border:1px solid #c3b490; border-radius:4px 0 0 4px;
     box-shadow:-10px 18px 40px rgba(60,45,20,.15);
   }
-  
+  /* z-index above .clickzone so the mouse wheel / touch scroll actually reaches this box
+     instead of being swallowed by the (otherwise invisible) page-turn click target that
+     sits on top of it -- that overlap, not the text itself, was why long captions couldn't
+     be scrolled. */
+  .leftCap{position:absolute;inset:14px;padding:22px 26px;overflow-y:auto;
+      -webkit-overflow-scrolling:touch;font-size:17px;line-height:1.7;color:#241f18;
+      z-index:9999;scrollbar-width:thin;scrollbar-color:#c3b490 transparent}
+  .leftCap::-webkit-scrollbar{width:8px}
+  .leftCap::-webkit-scrollbar-thumb{background:#c3b490;border-radius:4px}
+
   /* Central book spine visual guide */
   .stage::after {
     content:''; position:absolute; top:0; bottom:0; left:50%; width:2px;
@@ -790,11 +925,12 @@ function buildStoryHtml() {
         box-shadow:0 18px 50px rgba(60,45,20,.25)}
         
   .page-inner{position:absolute;inset:0;display:flex;flex-direction:column}
-  .page .art{flex:0 0 62%;position:relative;overflow:hidden;background:#f0e8d5}
+  /* Picture pages: the image fills the whole right page; its caption lives on the left
+     page (see .leftCap) instead of being squeezed in underneath it. */
+  .page .art{flex:1 1 auto;position:relative;overflow:hidden;background:#f0e8d5}
   .page .art img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
   .page .ph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;
       font-family:Georgia,serif;font-style:italic;color:#6a6051;background:linear-gradient(180deg,#f0e8d5,#e9dfc8)}
-  .page .cap{font-size:16px;line-height:1.55;padding:18px 20px 20px;margin:0;flex:1 1 auto;overflow:auto;color:#241f18}
   .cover{align-items:center;justify-content:center;text-align:center;padding:40px;gap:14px;
          background:linear-gradient(180deg,#f6f0e2,#efe6d0)}
   .cover .eyebrow{font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:#8c2f2a;
@@ -821,10 +957,10 @@ function buildStoryHtml() {
 </style></head><body>
 <h1>Inkwell Studio</h1>
 <div class="stage" id="stage">
-  <div class="book-base-left"></div>
+  <div class="book-base-left"><div class="leftCap" id="leftCap"></div></div>
   <div class="pages" id="pages">${pageHtml}</div>
-  <button class="nav prev" id="prev" aria-label="Previous page">‹</button>
-  <button class="nav next" id="next" aria-label="Next page">›</button>
+  <button class="nav prev" id="prev" aria-label="${t('export.prevPage')}">‹</button>
+  <button class="nav next" id="next" aria-label="${t('export.nextPage')}">›</button>
   <div class="clickzone left" id="zoneLeft"></div>
   <div class="clickzone right" id="zoneRight"></div>
 </div>
@@ -840,9 +976,16 @@ function buildStoryHtml() {
   var prevBtn = document.getElementById('prev');
   var nextBtn = document.getElementById('next');
   var pageno = document.getElementById('pageno');
+  var leftCap = document.getElementById('leftCap');
   var dots = Array.prototype.slice.call(document.querySelectorAll('.dot'));
 
+  function syncLeft() {
+    leftCap.textContent = pages[current].dataset.cap || '';
+    leftCap.scrollTop = 0;
+  }
+
   function layout() {
+    syncLeft();
     pages.forEach(function (el, i) {
       if (i === current) { 
         el.style.transform = 'rotateY(0deg)'; 
@@ -872,6 +1015,9 @@ function buildStoryHtml() {
     void mover.offsetWidth; // force reflow
     mover.style.transform = dir > 0 ? 'rotateY(-180deg)' : 'rotateY(0deg)';
     current = to;
+    // Caption text is intentionally NOT synced here -- it should only appear once the
+    // flip has finished (layout(), below, calls syncLeft() after the animation ends),
+    // so the left page doesn't reveal the new page's text while it's still mid-turn.
     pageno.textContent = (current + 1) + ' / ' + total;
     prevBtn.disabled = current === 0;
     nextBtn.disabled = current === total - 1;
@@ -934,17 +1080,25 @@ function panelArtToPng(p) {
       draw((ctx) => {
         ctx.fillStyle = '#f0e8d5'; ctx.fillRect(0, 0, W, Hh);
         ctx.fillStyle = '#6a6051'; ctx.font = 'italic 20px Georgia, serif';
-        wrapText(ctx, `“${(p.svg || 'image pending')}”`, 40, 60, W - 80, 28);
+        wrapText(ctx, `“${(p.svg || t('panel.imagePending'))}”`, 40, 60, W - 80, 28);
       });
     }
   });
 }
 
+const CJK_RE = /[぀-ヿ㐀-鿿가-힣豈-﫿]/;
+
 function wrapText(ctx, text, x, y, maxW, lh) {
-  const words = String(text).split(' '); let line = '';
-  for (const w of words) {
-    const t = line + w + ' ';
-    if (ctx.measureText(t).width > maxW && line) { ctx.fillText(line, x, y); line = w + ' '; y += lh; }
+  // CJK has no spaces between "words" — splitting on ' ' would return the whole string as
+  // one unbreakable token that just runs off the canvas (same fix as server/gifexport.py's
+  // _wrap, for the same reason).
+  const str = String(text);
+  const units = CJK_RE.test(str) ? [...str] : str.split(' ');
+  const sep = CJK_RE.test(str) ? '' : ' ';
+  let line = '';
+  for (const w of units) {
+    const t = line + w + sep;
+    if (ctx.measureText(t).width > maxW && line) { ctx.fillText(line, x, y); line = w + sep; y += lh; }
     else line = t;
   }
   ctx.fillText(line, x, y);
@@ -954,7 +1108,7 @@ async function downloadGif() {
   const btn = $('download-gif');
   if (btn.disabled) return;
   const label = btn.textContent;
-  btn.classList.add('busy'); btn.textContent = '⟳ Rendering GIF…'; btn.disabled = true;
+  btn.classList.add('busy'); btn.textContent = t('download.gif.busy'); btn.disabled = true;
   try {
     const panels = state.panels.filter((p) => p.caption);
     const out = [];
@@ -968,7 +1122,7 @@ async function downloadGif() {
     if (!res.ok) throw new Error(`bridge ${res.status}`);
     triggerDownload(await res.blob(), `inkwell-${storySlug()}.gif`);
   } catch (e) {
-    showLiveNote(`Couldn't build the GIF (${e.message}). GIF export needs the bridge running.`);
+    showLiveNote(t('livenote.gifFailed', e.message));
   } finally {
     btn.classList.remove('busy'); btn.textContent = label; btn.disabled = false;
   }
@@ -982,7 +1136,7 @@ async function downloadPdf() {
   const btn = $('download-pdf');
   if (btn.disabled) return;
   const label = btn.textContent;
-  btn.classList.add('busy'); btn.textContent = '⟳ Rendering PDF…'; btn.disabled = true;
+  btn.classList.add('busy'); btn.textContent = t('download.pdf.busy'); btn.disabled = true;
   try {
     const panels = state.panels.filter((p) => p.caption);
     const out = [];
@@ -996,7 +1150,7 @@ async function downloadPdf() {
     if (!res.ok) throw new Error(`bridge ${res.status}`);
     triggerDownload(await res.blob(), `inkwell-${storySlug()}.pdf`);
   } catch (e) {
-    showLiveNote(`Couldn't build the PDF (${e.message}). PDF export needs the bridge running.`);
+    showLiveNote(t('livenote.pdfFailed', e.message));
   } finally {
     btn.classList.remove('busy'); btn.textContent = label; btn.disabled = false;
   }
@@ -1016,7 +1170,7 @@ async function restyleStory() {
   if (!newStyle || !panels.length) return;
 
   const label = btn.textContent;
-  btn.classList.add('busy'); btn.textContent = '⟳ Restyling…'; btn.disabled = true;
+  btn.classList.add('busy'); btn.textContent = t('restyle.busy'); btn.disabled = true;
   try {
     const payload = {
       style: newStyle,
@@ -1037,9 +1191,9 @@ async function restyleStory() {
     }
     state.brief.style = newStyle;
     renderBrief();
-    if (failed) showLiveNote(`${failed} panel${failed > 1 ? 's' : ''} couldn't be restyled — kept the previous image.`);
+    if (failed) showLiveNote(t('livenote.restylePartial', failed));
   } catch (e) {
-    showLiveNote(`Couldn't restyle (${e.message}). Restyle needs the bridge running.`);
+    showLiveNote(t('livenote.restyleFailed', e.message));
   } finally {
     btn.classList.remove('busy'); btn.textContent = label; btn.disabled = false;
   }
@@ -1053,11 +1207,11 @@ async function restyleStory() {
 function readStoryAloudReset() {
   const btn = $('read-story');
   const pauseBtn = $('pause-story');
-  btn.textContent = '🔊 Read story aloud';
+  btn.textContent = t('readStory.idle');
   btn.classList.remove('reading');
   pauseBtn.hidden = true;
   pauseBtn.disabled = true;
-  pauseBtn.textContent = '⏸ Pause';
+  pauseBtn.textContent = t('pauseStory.pause');
 }
 
 function readStoryAloud() {
@@ -1072,12 +1226,12 @@ function readStoryAloud() {
   if (!panels.length) return;
   panels.forEach((p) => narrateQueue.push(p.caption));
   narratePrefetchNext();
-  btn.textContent = '⏹ Stop reading';
+  btn.textContent = t('readStory.reading');
   btn.classList.add('reading');
   const pauseBtn = $('pause-story');
   pauseBtn.hidden = false;
   pauseBtn.disabled = false;
-  pauseBtn.textContent = '⏸ Pause';
+  pauseBtn.textContent = t('pauseStory.pause');
   narrateOnIdle = readStoryAloudReset;
   narratePump();
 }
@@ -1087,10 +1241,10 @@ function togglePauseStory() {
   if (pauseBtn.disabled) return;
   if (narratePaused) {
     narrateResume();
-    pauseBtn.textContent = '⏸ Pause';
+    pauseBtn.textContent = t('pauseStory.pause');
   } else {
     narratePause();
-    pauseBtn.textContent = '▶ Resume';
+    pauseBtn.textContent = t('pauseStory.resume');
   }
 }
 
@@ -1115,12 +1269,12 @@ async function regeneratePanel(n) {
     if (src) {
       p.image = src; p.imageError = null;
     } else {
-      if (!p.image) p.imageError = error || 'render failed';   // keep a picture we already have
-      showLiveNote(`Couldn't redo panel ${n}'s image${error ? ` (${error})` : ''}`
-        + `${p.image ? ' — kept the previous picture.' : '.'}`);
+      if (!p.image) p.imageError = error || t('livenote.renderFailed');   // keep a picture we already have
+      showLiveNote(t('livenote.regenFailed', n, error)
+        + (p.image ? t('livenote.keptPrevious') : t('livenote.period')));
     }
   } catch (e) {
-    showLiveNote(`Couldn't redo panel ${n}'s image (${e.message}). Needs the bridge running.`);
+    showLiveNote(t('livenote.regenFailedNetwork', n, e.message));
   } finally {
     p.regenerating = false;
     renderPanel(n);
@@ -1128,6 +1282,50 @@ async function regeneratePanel(n) {
 }
 
 /* ----------------------------------- boot ----------------------------------- */
+
+// Highlights whichever of the toggle's "EN" / "中文" spans matches the current language —
+// the other stays dim, so the button reads as a current-state indicator, not just a label.
+function syncLangToggle() {
+  document.querySelectorAll('#lang-toggle .lang-opt').forEach((el) => {
+    el.classList.toggle('active', el.dataset.lang === getLang());
+  });
+}
+
+applyStaticI18n();   // set the page's own chrome text/placeholders before the first paint
+syncLangToggle();
+
+// The EN/中文 toggle switches the page's own chrome AND (via startRun's `lang` query param)
+// what language the crew writes the next story in. Disabled mid-run (setInputsDisabled) so
+// it can't be flipped while a run the server is already treating as one language is in
+// flight.
+//
+// A FINISHED story's own text (captions, crew chatter, log lines) is real content the model
+// wrote in whatever language that run targeted — it can't be retranslated without another
+// crew run, so rather than leave stale-language story text sitting under newly-English (or
+// newly-Chinese) chrome — which reads as a half-translated page — the toggle clears the
+// story back to idle. The idea/style inputs are left alone (the author's own typed text);
+// only the RUN's output (gallery, crew, progress, log, full-text) resets, same as a fresh
+// page load. Press Go again to get a new story in the new language.
+$('lang-toggle').addEventListener('click', () => {
+  if (state.running) return;
+  setLang(getLang() === 'zh' ? 'en' : 'zh');
+  applyStaticI18n();
+  syncLangToggle();
+  stopRun();   // idempotent if nothing was running; also clears any queued narration/typers
+  state = freshState();
+  // renderAll() rebuilds brief/crew/progress/log/full-text from `state`, but panel cards in
+  // #gallery are only ever APPENDED by renderPanel() — nothing bulk-clears them, so without
+  // this the previous run's (stale-language) panel cards would stay sitting in the DOM next
+  // to the freshly-reset chrome. Mirrors index.html's own idle markup.
+  $('gallery').innerHTML = `<div class="empty" id="gallery-empty" data-i18n-html="gallery.empty.html">${t('gallery.empty.html')}</div>`;
+  renderAll();
+  $('crew-live').textContent = t('crew.idle');
+  const go = $('go');
+  go.textContent = t('go.idle'); go.classList.remove('running', 'again'); go.disabled = false;
+  readStoryAloudReset();
+  ['read-story', 'download', 'download-gif', 'download-pdf', 'restyle', 'restyle-style', 'restyle-style-preset']
+    .forEach((id) => { $(id).disabled = true; });
+});
 
 $('promptbar').addEventListener('submit', (e) => {
   e.preventDefault();
@@ -1161,6 +1359,6 @@ if (params.has('autorun')) startRun();
 
 // small automation/debug hook (export + state), used by verification tooling
 window.__inkwell = {
-  buildStoryHtml, downloadStory, downloadGif, downloadPdf, panelArtToPng,
+  buildStoryHtml, downloadStory, downloadGif, downloadPdf, panelArtToPng, apply,
   getState: () => state,
 };

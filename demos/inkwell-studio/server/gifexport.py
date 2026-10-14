@@ -9,6 +9,7 @@ GIF with per-frame durations (a slideshow with clean cuts).
 from __future__ import annotations
 
 import io
+import re
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -23,14 +24,31 @@ RULE = (211, 201, 172)
 W, H = 820, 620
 MARGIN = 56
 
+# The Georgia/Palatino/Arial/DejaVuSerif chain below has no CJK glyphs — a Chinese caption
+# would silently render as tofu boxes (the fonts still load fine, they just can't draw those
+# codepoints). Detect CJK text and switch to a bundled-with-Windows CJK font chain instead;
+# Pillow's ImageFont.truetype() already does its own Windows-fonts-directory search for a bare
+# filename (that's why "georgia.ttf" with no path works above), so "msyh.ttc" resolves the
+# same way on any Windows box without extra plumbing.
+_CJK_RE = re.compile(r"[぀-ヿ㐀-鿿가-힣豈-﫿]")
 
-def _font(size: int, *, bold: bool = False, italic: bool = False):
+
+def _has_cjk(text) -> bool:
+    return bool(_CJK_RE.search(str(text or "")))
+
+
+def _font(size: int, *, bold: bool = False, italic: bool = False, text: str = ""):
     names = []
-    if bold:
-        names += ["georgiab.ttf", "Georgia Bold.ttf"]
-    if italic:
-        names += ["georgiai.ttf", "Georgia Italic.ttf"]
-    names += ["georgia.ttf", "Georgia.ttf", "Palatino Linotype.ttf", "arial.ttf", "DejaVuSerif.ttf"]
+    if _has_cjk(text):
+        if bold:
+            names += ["msyhbd.ttc"]
+        names += ["msyh.ttc", "simsun.ttc", "simhei.ttf", "NotoSansSC-Regular.otf", "wqy-zenhei.ttc"]
+    else:
+        if bold:
+            names += ["georgiab.ttf", "Georgia Bold.ttf"]
+        if italic:
+            names += ["georgiai.ttf", "Georgia Italic.ttf"]
+        names += ["georgia.ttf", "Georgia.ttf", "Palatino Linotype.ttf", "arial.ttf", "DejaVuSerif.ttf"]
     for n in names:
         try:
             return ImageFont.truetype(n, size)
@@ -47,15 +65,22 @@ def _text_w(draw, text, font):
 
 
 def _wrap(draw, text, font, max_w):
-    words = str(text).split()
+    """Word-wrap for space-delimited text; character-wrap for CJK, which has no spaces
+    between words (a plain .split() would return the whole string as one unbreakable
+    "word" and every line would just overflow the frame)."""
+    text = str(text)
+    if _has_cjk(text):
+        units, sep = list(text), ""
+    else:
+        units, sep = text.split(), " "
     lines, cur = [], ""
-    for w in words:
-        t = (cur + " " + w).strip()
+    for u in units:
+        t = (cur + sep + u) if cur else u
         if _text_w(draw, t, font) <= max_w or not cur:
             cur = t
         else:
             lines.append(cur)
-            cur = w
+            cur = u
     if cur:
         lines.append(cur)
     return lines
@@ -71,14 +96,14 @@ def _fit_caption(draw, text, max_w, max_h, *, start_size=24, min_size=15):
     if even min_size overflows, truncate the last visible line with an ellipsis."""
     size = start_size
     while size >= min_size:
-        font = _font(size)
+        font = _font(size, text=text)
         line_h = size + 10
         lines = _wrap(draw, text, font, max_w)
         if len(lines) * line_h <= max_h:
             return font, lines, line_h
         size -= 1
 
-    font = _font(min_size)
+    font = _font(min_size, text=text)
     line_h = min_size + 10
     lines = _wrap(draw, text, font, max_w)
     max_lines = max(1, int(max_h // line_h))
@@ -98,7 +123,7 @@ def _title_frame(idea: str, style: str) -> Image.Image:
     brand = "I N K W E L L   S T U D I O"
     d.text(((W - _text_w(d, brand, f_brand)) / 2, 150), brand, font=f_brand, fill=INK)
     d.line([((W - 260) / 2, 200), ((W + 260) / 2, 200)], fill=OX, width=2)
-    f_idea = _font(34, italic=True)
+    f_idea = _font(34, italic=True, text=idea)
     lines = _wrap(d, f'“{idea}”', f_idea, W - 2 * MARGIN - 40)
     y = 250
     for ln in lines:

@@ -11,8 +11,8 @@
 <div class="wrap">
 
   <div class="notice">
-    <b>Story Studio · Path 2</b>
-    <span>Your own studio UI with JiuwenSwarm running as a service behind it, over A2A — a leader
+    <b data-i18n="notice.b">Story Studio · Path 2</b>
+    <span data-i18n-html="notice.span">Your own studio UI with JiuwenSwarm running as a service behind it, over A2A — a leader
       agent spawns Writer &amp; Critic teammates who genuinely draft, reject and revise the story
       (~1–3 min). Type an idea, press <strong>Go</strong>.</span>
   </div>
@@ -20,21 +20,24 @@
   <div class="ribbon">
     <div class="brand">
       <h1>Inkwell <span>Studio</span></h1>
-      <div class="sub">An illustrated story, made by a crew of agents</div>
+      <div class="sub" data-i18n="brand.sub">An illustrated story, made by a crew of agents</div>
     </div>
-    <div class="powered">a custom studio front-end<br>crew: <span class="swarm">JiuwenSwarm swarm</span> over A2A</div>
+    <div class="powered-wrap">
+      <div class="powered" data-i18n-html="powered.html">a custom studio front-end<br>crew: <span class="swarm">JiuwenSwarm swarm</span> over A2A</div>
+      <button type="button" class="lang-toggle" id="lang-toggle" data-i18n-title="lang.toggle.title" title="Switch to Chinese UI — also makes the crew write the story in Chinese"><span class="lang-opt" data-lang="en">EN</span> · <span class="lang-opt" data-lang="zh">中文</span></button>
+    </div>
   </div>
 
   <!-- Path 2 -->
   <div class="arch">
-    <div class="cap">How one run travels — Path 2 (JiuwenSwarm as a service)</div>
+    <div class="cap" data-i18n="arch.cap">How one run travels — Path 2 (JiuwenSwarm as a service)</div>
     <div class="flow">
-      <div class="node you"><div class="k">1 · Your app</div><div class="t">Studio UI (this page)</div><div class="d">Author types one story idea + a style.</div></div>
-      <div class="arrow">→<small>JSON-RPC</small></div>
-      <div class="node a2a"><div class="k">2 · Transport</div><div class="t">A2A</div><div class="d">Standard agent endpoint</div></div>
-      <div class="arrow">→<small>the brief</small></div>
-      <div class="node swarm"><div class="k">3 · JiuwenSwarm</div><div class="t">Jiuwen Team</div><div class="d">Writer · Art Director · Image Gen · Editor · Critic build the story panel by panel.</div></div>
-      <div class="arrow">↩<small>panels: image + caption + status (JSON)</small></div>
+      <div class="node you"><div class="k" data-i18n="arch.n1.k">1 · Your app</div><div class="t" data-i18n="arch.n1.t">Studio UI (this page)</div><div class="d" data-i18n="arch.n1.d">Author types one story idea + a style.</div></div>
+      <div class="arrow">→<small data-i18n="arch.a1">JSON-RPC</small></div>
+      <div class="node a2a"><div class="k" data-i18n="arch.n2.k">2 · Transport</div><div class="t">A2A</div><div class="d" data-i18n="arch.n2.d">Standard agent endpoint</div></div>
+      <div class="arrow">→<small data-i18n="arch.a2">the brief</small></div>
+      <div class="node swarm"><div class="k" data-i18n="arch.n3.k">3 · JiuwenSwarm</div><div class="t" data-i18n="arch.n3.t">Jiuwen Team</div><div class="d" data-i18n="arch.n3.d">Writer · Art Director · Image Gen · Editor · Critic build the story panel by panel.</div></div>
+      <div class="arrow">↩<small data-i18n="arch.a3">panels: image + caption + status (JSON)</small></div>
     </div>
   </div>
 
@@ -42,33 +45,33 @@
   <form class="promptbar" id="promptbar" autocomplete="off">
     <div class="pb-row pb-row-idea">
       <div class="pb-field pb-idea">
-        <label for="idea">Story idea</label>
+        <label for="idea" data-i18n="idea.label">Story idea</label>
         <div class="pb-idea-row">
           <input type="text" id="idea" name="idea"
                  value=""
-                 maxlength="140" placeholder="One sentence: who, and what happens?">
-          <button type="button" class="surprise" id="surprise" title="Fill in a random idea">🎲</button>
+                 maxlength="140" data-i18n-placeholder="idea.placeholder" placeholder="One sentence: who, and what happens?">
+          <button type="button" class="surprise" id="surprise" data-i18n-title="surprise.title" title="Fill in a random idea">🎲</button>
         </div>
       </div>
     </div>
     <div class="pb-row pb-row-options">
       <div class="pb-field pb-style">
-        <label for="style">Style</label>
+        <label for="style" data-i18n="style.label">Style</label>
         <div class="style-row">
           <select id="style-preset" aria-label="Style preset">
-            <option value="" selected disabled>Presets…</option>
-            <option value="Warm storybook · Painterly">Warm storybook · Painterly</option>
-            <option value="Inky noir · High contrast">Inky noir · High contrast</option>
-            <option value="Soft watercolor · Dreamy">Soft watercolor · Dreamy</option>
-            <option value="Retro comic · Bold ink">Retro comic · Bold ink</option>
-            <option value="Coloring book · Black &amp; white line art">Coloring book · Black &amp; white line art</option>
+            <option value="" selected disabled data-i18n="style.presetPlaceholder">Presets…</option>
+            <option value="Warm storybook · Painterly" data-i18n="style.preset.storybook">Warm storybook · Painterly</option>
+            <option value="Inky noir · High contrast" data-i18n="style.preset.noir">Inky noir · High contrast</option>
+            <option value="Soft watercolor · Dreamy" data-i18n="style.preset.watercolor">Soft watercolor · Dreamy</option>
+            <option value="Retro comic · Bold ink" data-i18n="style.preset.comic">Retro comic · Bold ink</option>
+            <option value="Coloring book · Black &amp; white line art" data-i18n="style.preset.coloring">Coloring book · Black &amp; white line art</option>
           </select>
           <input type="text" id="style" name="style"
-                 maxlength="60" placeholder="…or type your own">
+                 maxlength="60" data-i18n-placeholder="style.placeholder" placeholder="…or type your own">
         </div>
       </div>
       <div class="pb-field pb-count">
-        <label for="count">Panels</label>
+        <label for="count" data-i18n="count.label">Panels</label>
         <select id="count" name="count">
           <option value="3">~3</option>
           <option value="4">~4</option>
@@ -76,7 +79,7 @@
           <option value="6">~6</option>
         </select>
       </div>
-      <button type="submit" class="go" id="go">Go</button>
+      <button type="submit" class="go" id="go" data-i18n="go.idle">Go</button>
     </div>
   </form>
 
@@ -85,14 +88,14 @@
     <!-- ============ GALLERY (your UI) ============ -->
     <div class="card">
       <div class="brief" id="brief">
-        <div class="l">The author asked for</div>
+        <div class="l" data-i18n="brief.l">The author asked for</div>
         <div class="q" id="brief-q">“”</div>
         <div class="tags" id="brief-tags"><span>Warm storybook</span><span>Painterly</span><span>~5 panels</span></div>
       </div>
 
       <!-- panels injected by app.js -->
       <div class="gallery" id="gallery">
-        <div class="empty" id="gallery-empty">Press <b>Go</b> to send the brief to the crew — panels will appear here as they’re drawn.</div>
+        <div class="empty" id="gallery-empty" data-i18n-html="gallery.empty.html">Press <b>Go</b> to send the brief to the crew — panels will appear here as they’re drawn.</div>
       </div>
     </div>
 
@@ -101,50 +104,50 @@
 
       <!-- restyle: same text, same prompts, new style — no crew re-run -->
       <div class="card">
-        <div class="hd"><span class="name">Restyle</span><span class="meta">same text · same prompts</span></div>
+        <div class="hd"><span class="name" data-i18n="restyle.name">Restyle</span><span class="meta" data-i18n="restyle.meta">same text · same prompts</span></div>
         <div class="body">
           <div class="restyle-row">
             <div class="style-row">
               <select id="restyle-style-preset" disabled aria-label="Restyle preset">
-                <option value="" selected disabled>Presets…</option>
-                <option value="Warm storybook · Painterly">Warm storybook · Painterly</option>
-                <option value="Inky noir · High contrast">Inky noir · High contrast</option>
-                <option value="Soft watercolor · Dreamy">Soft watercolor · Dreamy</option>
-                <option value="Retro comic · Bold ink">Retro comic · Bold ink</option>
-                <option value="Coloring book · Black &amp; white line art">Coloring book · Black &amp; white line art</option>
+                <option value="" selected disabled data-i18n="style.presetPlaceholder">Presets…</option>
+                <option value="Warm storybook · Painterly" data-i18n="style.preset.storybook">Warm storybook · Painterly</option>
+                <option value="Inky noir · High contrast" data-i18n="style.preset.noir">Inky noir · High contrast</option>
+                <option value="Soft watercolor · Dreamy" data-i18n="style.preset.watercolor">Soft watercolor · Dreamy</option>
+                <option value="Retro comic · Bold ink" data-i18n="style.preset.comic">Retro comic · Bold ink</option>
+                <option value="Coloring book · Black &amp; white line art" data-i18n="style.preset.coloring">Coloring book · Black &amp; white line art</option>
               </select>
-              <input type="text" id="restyle-style" disabled placeholder="…or type your own">
+              <input type="text" id="restyle-style" disabled data-i18n-placeholder="style.placeholder" placeholder="…or type your own">
             </div>
-            <button type="button" class="download" id="restyle" disabled title="Same text, same prompts — new style. Live mode only.">🎨 Restyle images</button>
+            <button type="button" class="download" id="restyle" disabled data-i18n="restyle.button" data-i18n-title="restyle.button.title" title="Same text, same prompts — new style. Live mode only.">🎨 Restyle images</button>
           </div>
         </div>
       </div>
 
       <div class="card">
-        <div class="hd"><span class="name">Story so far</span><span class="meta">The Loom</span></div>
+        <div class="hd"><span class="name" data-i18n="storySoFar.name">Story so far</span><span class="meta" data-i18n="storySoFar.meta">The Loom</span></div>
         <div class="body">
-          <div class="prog"><b id="prog-lead">Idle</b><small id="prog-sub">· press Go to begin</small></div>
+          <div class="prog"><b id="prog-lead" data-i18n="prog.idle.lead">Idle</b><small id="prog-sub" data-i18n="prog.idle.sub">· press Go to begin</small></div>
           <div class="track"><i id="prog-bar" style="width:0%"></i></div>
-          <button type="button" class="download" id="read-story" disabled>🔊 Read story aloud</button>
-          <button type="button" class="download" id="pause-story" disabled hidden>⏸ Pause</button>
-          <button type="button" class="download" id="download" disabled>⤓ Download story (HTML)</button>
-          <button type="button" class="download" id="download-gif" disabled>⤓ Download GIF</button>
-          <button type="button" class="download" id="download-pdf" disabled>⤓ Download PDF</button>
+          <button type="button" class="download" id="read-story" disabled data-i18n="readStory.idle">🔊 Read story aloud</button>
+          <button type="button" class="download" id="pause-story" disabled hidden data-i18n="pauseStory.pause">⏸ Pause</button>
+          <button type="button" class="download" id="download" disabled data-i18n="download.html">⤓ Download story (HTML)</button>
+          <button type="button" class="download" id="download-gif" disabled data-i18n="download.gif">⤓ Download GIF</button>
+          <button type="button" class="download" id="download-pdf" disabled data-i18n="download.pdf">⤓ Download PDF</button>
         </div>
       </div>
 
       <!-- the crew (agents injected by app.js) -->
       <div class="card">
-        <div class="hd"><span class="name">Jiuwen Team</span><span class="meta">5 agents · <span id="crew-live">idle</span></span></div>
+        <div class="hd"><span class="name" data-i18n="crew.name">Jiuwen Team</span><span class="meta"><span data-i18n="crew.meta">5 agents ·</span> <span id="crew-live" data-i18n="crew.idle">idle</span></span></div>
         <div class="body" id="crew" style="padding-top:6px;padding-bottom:6px;"></div>
       </div>
 
       <!-- this panel loop (log injected by app.js) -->
       <div class="card">
-        <div class="hd"><span class="name" id="loop-title">Revision loop</span><span class="meta">handoffs</span></div>
+        <div class="hd"><span class="name" id="loop-title" data-i18n="loop.title">Revision loop</span><span class="meta" data-i18n="loop.meta">handoffs</span></div>
         <div class="body">
           <ul class="log" id="log">
-            <li class="log-empty"><span class="txt">The Critic↔Writer loop shows up here when a panel gets sent back.</span></li>
+            <li class="log-empty"><span class="txt" data-i18n="loop.empty">The Critic↔Writer loop shows up here when a panel gets sent back.</span></li>
           </ul>
         </div>
       </div>
@@ -154,23 +157,23 @@
 
   <!-- full text / debug: the whole story as prose + what the crew produced per panel -->
   <div class="card fulltext" id="fulltext">
-    <div class="hd"><span class="name">The story · full text</span><span class="meta" id="ft-meta">—</span></div>
+    <div class="hd"><span class="name" data-i18n="fulltext.name">The story · full text</span><span class="meta" id="ft-meta">—</span></div>
     <div class="body">
-      <div class="story" id="ft-story"><span class="ft-empty">The finished story appears here once a run completes.</span></div>
+      <div class="story" id="ft-story"><span class="ft-empty" data-i18n="fulltext.empty">The finished story appears here once a run completes.</span></div>
       <details id="ft-details">
-        <summary>Debug · what the crew produced per panel</summary>
+        <summary data-i18n="fulltext.debugSummary">Debug · what the crew produced per panel</summary>
         <div id="ft-debug"></div>
       </details>
     </div>
   </div>
 
   <div class="legend">
-    <div class="z"><div class="n">The gallery — your UI</div><p>Panels, images and captions are <em>your</em> app’s components. The swarm returns each panel as data (image + caption + status); your front-end lays out the storybook.</p></div>
-    <div class="z"><div class="n">Jiuwen Team — the swarm made visible</div><p>The differentiator: you <em>watch</em> the Critic reject a panel and the Writer revise it. Agents improving each other’s work is the whole show.</p></div>
-    <div class="z"><div class="n">The revision loop — why a team</div><p>A single AI hands you one draft, take it or leave it. The Critic↔Writer loop is what turns a rough panel into a good one — and it needs separate agents to exist.</p></div>
+    <div class="z"><div class="n" data-i18n="legend.1.n">The gallery — your UI</div><p data-i18n-html="legend.1.p">Panels, images and captions are <em>your</em> app’s components. The swarm returns each panel as data (image + caption + status); your front-end lays out the storybook.</p></div>
+    <div class="z"><div class="n" data-i18n="legend.2.n">Jiuwen Team — the swarm made visible</div><p data-i18n-html="legend.2.p">The differentiator: you <em>watch</em> the Critic reject a panel and the Writer revise it. Agents improving each other’s work is the whole show.</p></div>
+    <div class="z"><div class="n" data-i18n="legend.3.n">The revision loop — why a team</div><p data-i18n-html="legend.3.p">A single AI hands you one draft, take it or leave it. The Critic↔Writer loop is what turns a rough panel into a good one — and it needs separate agents to exist.</p></div>
   </div>
 
-  <div class="foot-note">
+  <div class="foot-note" data-i18n-html="footnote.html">
     <b>Path 2 notes:</b> this studio is a standalone app talking to JiuwenSwarm over A2A, so your front-end renders these panels from the swarm’s JSON (A2UI isn’t used — that’s the trade for the cleaner “embedded engine” story). The UI is driven by a normalized event stream coming straight from the bridge’s SSE endpoint.
   </div>
 

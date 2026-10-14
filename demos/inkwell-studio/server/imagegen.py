@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import random
+import re
 import textwrap
 
 import httpx
@@ -349,9 +350,18 @@ def _muted(rnd: random.Random, light: float) -> tuple[int, int, int]:
     return int(r * 255), int(g * 255), int(b * 255)
 
 
-def _load_font(size: int):
+_CJK_RE = re.compile(r"[぀-ヿ㐀-鿿가-힣豈-﫿]")
+
+
+def _load_font(size: int, text: str = ""):
     from PIL import ImageFont
-    for name in ("georgia.ttf", "Georgia.ttf", "arial.ttf", "DejaVuSans.ttf"):
+    if re.search(_CJK_RE, text or ""):
+        # The Georgia/Arial/DejaVuSans chain below has no CJK glyphs (loads fine, draws tofu
+        # boxes for Chinese text) — switch to a CJK-capable chain, same fix as gifexport.py.
+        names = ("msyh.ttc", "simsun.ttc", "simhei.ttf", "NotoSansSC-Regular.otf", "wqy-zenhei.ttc")
+    else:
+        names = ("georgia.ttf", "Georgia.ttf", "arial.ttf", "DejaVuSans.ttf")
+    for name in names:
         try:
             return ImageFont.truetype(name, size)
         except Exception:
@@ -397,9 +407,16 @@ def _stub_png(prompt: str, style: str, w: int, h: int) -> str:
     img = Image.alpha_composite(img, scrim).convert("RGB")
     draw = ImageDraw.Draw(img)
 
-    body = _load_font(max(14, w // 32))
-    text = " ".join(prompt.split()[:24])
-    wrapped = textwrap.fill(text, width=max(22, w // 15))
+    body = _load_font(max(14, w // 32), text=prompt)
+    if _CJK_RE.search(prompt):
+        # textwrap.fill splits on whitespace; Chinese has none between "words", so it would
+        # return the whole string as one unbreakable line that just runs off the image.
+        text = prompt[:40]
+        chars_per_line = max(10, w // 28)
+        wrapped = "\n".join(text[i:i + chars_per_line] for i in range(0, len(text), chars_per_line))
+    else:
+        text = " ".join(prompt.split()[:24])
+        wrapped = textwrap.fill(text, width=max(22, w // 15))
     draw.multiline_text((int(w * 0.05), int(h * 0.64)), wrapped, fill=(236, 238, 242), font=body, spacing=5)
     draw.text((int(w * 0.05), int(h * 0.05)), "STUB · not model art", fill=(224, 151, 63), font=_load_font(max(10, w // 56)))
 

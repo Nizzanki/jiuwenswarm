@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -72,10 +74,40 @@ API_TOKEN_ENV_VAR = "INKWELL_API_TOKEN"
 RUN_GUARD = ConcurrencyGuard.from_env("INKWELL_MAX_CONCURRENT_RUNS", 4)
 
 CAPTION_REDACTED = "— this part of the story was redacted (didn't meet our content guidelines) —"
+# Kept in English regardless of `lang`: unlike CAPTION_REDACTED (shown as the story's own
+# text), this is a prompt FED TO the image backend, where English tends to render more
+# reliably across backends — not a piece of UI/story copy the EN/中文 toggle is about.
 ART_REDACTED_PROMPT = "a soft, warm, gentle abstract illustration, no specific subject"
+# Our own synthetic text (bridge-authored, not the model's) that needs its own translation —
+# prompt.py's _lang_line only instructs the MODEL's output, never these two spots.
+_OPENER_TEXT = {
+    "": {"drafting": "The crew is drafting your story…", "standby": "Standing by."},
+    "zh": {"drafting": "团队正在为你起草故事…", "standby": "待命中。"},
+}
+_CAPTION_REDACTED_BY_LANG = {
+    "": CAPTION_REDACTED,
+    "zh": "——这部分故事因不符合内容规范而被隐去——",
+}
 
 app = FastAPI(title="Inkwell Studio bridge")
 embed_server.add_cors(app)
+
+
+# Starlette's StaticFiles (what add_static mounts, below) sends Last-Modified/ETag but no
+# Cache-Control header at all -- with nothing explicit, browsers are free to apply HTTP
+# heuristic caching (RFC 7234 §4.2.2) to index.html/app.js/i18n.js/style.css and serve them
+# straight from disk cache, with NO request ever reaching this server, for a while after a
+# normal reload (only a hard refresh reliably bypasses it). That's indistinguishable from "my
+# edit didn't take" and has bitten iterating on this demo more than once -- force revalidation
+# on every load instead (still cheap: a 304 on an unchanged file, not a full re-download).
+@app.middleware("http")
+async def _no_heuristic_cache(request, call_next):
+    response = await call_next(request)
+    if request.method == "GET" and (
+        request.url.path == "/" or request.url.path.rsplit(".", 1)[-1] in {"js", "css", "html"}
+    ):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 # Allowlist, not blanket protection: the static front-end (STATIC_DIR, mounted at the very
 # end of this file) and /health stay open so the page can load at all — a plain browser
 # navigation can't attach an Authorization header. /events isn't in this list either: it
@@ -103,9 +135,15 @@ embed_server.add_auth(app, env_var=API_TOKEN_ENV_VAR, protect_paths=_PROTECTED_R
 # tuning is Phase 3.)
 
 # Per-event replay delay (seconds) — mimics the Phase 1 timeline's cadence.
+# "agent" used to sit in the fast 0.06-0.14s tick bucket with panel.status/progress/focus —
+# fine for THOSE (just counters/badges nobody needs to read), but a run can carry 15-20
+# `agent` events (5 agents x several status transitions each), so at 0.14s apart the whole
+# crew visibly flashes active->done in under 2s: the .agent-active highlight (style.css) is
+# technically shown, just never for long enough to register. Watching the crew work IS the
+# point of this demo (see the legend copy), so it gets a caption-like pace instead.
 _PACE = {
     "panel.caption": 0.35, "panel.note": 0.30, "panel.art": 0.12, "log": 0.20,
-    "agent": 0.14, "panel.status": 0.12, "progress": 0.08, "focus": 0.06,
+    "agent": 0.45, "panel.status": 0.12, "progress": 0.08, "focus": 0.06,
     "brief": 0.15, "run.done": 0.0,
 }
 
@@ -162,10 +200,10 @@ def _live_view(ev: dict, total: int) -> dict | None:
     return None
 
 
-async def _run_story(idea: str, style: str, total: int, *, team: bool, relay: LiveRelay) -> list[dict]:
+async def _run_story(idea: str, style: str, total: int, *, team: bool, relay: LiveRelay, lang: str = "") -> list[dict]:
     """run_agent, forwarding live-safe events onto `relay` as they're seen and always
     closing it when finished (success or error) so the drainer never hangs."""
-    prompt = build_team_brief(idea, style, total) if team else build_brief(idea, style, total)
+    prompt = build_team_brief(idea, style, total, lang=lang) if team else build_brief(idea, style, total, lang=lang)
     meta = {"source": "inkwell-studio"}
     if team:
         meta["mode"] = "team"          # route to the real jiuwen_team
@@ -181,12 +219,12 @@ async def _run_story(idea: str, style: str, total: int, *, team: bool, relay: Li
 
 
 async def _collect_fill(
-    idea: str, style: str, total: int, prior: list[tuple[int, str]], missing: list[int],
+    idea: str, style: str, total: int, prior: list[tuple[int, str]], missing: list[int], lang: str = "",
 ) -> list[dict]:
     """Ask a single agent for ONLY the missing panel(s) (build_fill_brief) — a small, fast
     patch instead of re-running the whole story. Short timeout: this is 1-2 panels of prose,
     not a full crew run."""
-    prompt = build_fill_brief(idea, style, total, prior, missing)
+    prompt = build_fill_brief(idea, style, total, prior, missing, lang=lang)
     return await run_agent(
         A2A_URL, prompt,
         known_events=KNOWN_EVENTS, metadata={"source": "inkwell-studio-fill"},
@@ -234,7 +272,7 @@ def _incomplete_panels(events: list[dict], total: int) -> list[int]:
     return [n for n in range(1, total + 1) if n not in have_caption or n not in have_art]
 
 
-async def _moderate_events(events: list[dict]) -> list[dict]:
+async def _moderate_events(events: list[dict], lang: str = "") -> list[dict]:
     """Check every panel.caption/panel.art string against server/moderate.py's child-safety
     classifier before anything downstream sees it — this runs BEFORE images are rendered, so
     a flagged image prompt never reaches imagegen at all. Flagged panels get their
@@ -275,7 +313,8 @@ async def _moderate_events(events: list[dict]) -> list[dict]:
                 ev.get("panel"), ev["t"], reason or "unspecified", flagged_preview,
             )
             if ev["t"] == "panel.caption":
-                events[i] = {**ev, "text": CAPTION_REDACTED}
+                redacted = _CAPTION_REDACTED_BY_LANG.get((lang or "").strip().lower(), CAPTION_REDACTED)
+                events[i] = {**ev, "text": redacted}
             else:
                 events[i] = {**ev, "svg": ART_REDACTED_PROMPT}
     return events
@@ -312,31 +351,37 @@ async def _render_panel_resilient(
     return src, (None if src else err)
 
 
-async def stream_story(idea: str = "", style: str = "", panels: int = 5):
+async def stream_story(idea: str = "", style: str = "", panels: int = 5, lang: str = ""):
     """Async-generate normalized events: instant opener, paced narrative, and images that
     render concurrently and pop in as they finish (progressive reveal).
 
     Defaults mirror the /events route's previous FastAPI-level defaults — the generic SSE
     route (a2a_embed.server.sse_route) forwards raw query-string values, so this function
-    now owns its own defaults instead of relying on route parameter declarations."""
+    now owns its own defaults instead of relying on route parameter declarations.
+
+    `lang`: "" (default, infer from the idea's own language) or "zh" (explicit Simplified
+    Chinese override — see prompt.py's _lang_line) — set by the front-end's EN/中文 toggle."""
     total = max(3, min(int(panels or 5), 6))
     idea = (idea or "").strip() or "A sleepy bear tries to stay awake to see the first snow."
     style = (style or "").strip() or "Warm storybook · Painterly"
 
-    # Immediate opener so the UI shows the brief + a warming crew during generation.
+    # Immediate opener so the UI shows the brief + a warming crew during generation. These
+    # "say" lines are OUR OWN synthetic text (not the model's), so prompt.py's _lang_line
+    # instruction to the model never touches them — they need their own translation here.
+    opener = _OPENER_TEXT.get((lang or "").strip().lower(), _OPENER_TEXT[""])
     yield {"t": "brief", "idea": idea, "style": style, "total": total}
     yield {"t": "progress", "approved": 0, "inReview": 0, "drafting": total, "total": total}
     yield {"t": "agent", "id": "writer", "status": "active", "state": "drafting",
-           "say": "The crew is drafting your story…"}
+           "say": opener["drafting"]}
     for aid in ("critic", "artDirector", "imageGen", "editor"):
-        yield {"t": "agent", "id": aid, "status": "idle", "say": "Standing by."}
+        yield {"t": "agent", "id": aid, "status": "idle", "say": opener["standby"]}
 
     # relay carries text-safe events out of the crew's single big A2A call AS IT WRITES, so
     # the Crew panel and panel statuses animate in real time instead of the UI sitting frozen
     # on "Contacting the crew…" for the whole call. See _run_story / _live_view above.
     relay = LiveRelay(lambda ev: _live_view(ev, total))
     try:
-        collect_task = asyncio.create_task(_run_story(idea, style, total, team=TEAM, relay=relay))
+        collect_task = asyncio.create_task(_run_story(idea, style, total, team=TEAM, relay=relay, lang=lang))
         async for live_ev in relay.drain():
             yield live_ev
         raw = await collect_task
@@ -350,7 +395,7 @@ async def stream_story(idea: str = "", style: str = "", panels: int = 5):
             log.warning("team run produced ~no usable protocol — falling back to single-agent")
             relay.seen.clear()
             fallback_relay = LiveRelay(lambda ev: None)
-            raw = await _run_story(idea, style, total, team=False, relay=fallback_relay)
+            raw = await _run_story(idea, style, total, team=False, relay=fallback_relay, lang=lang)
             events = best_variants(raw)
         elif TEAM and _incomplete_panels(events, total):
             # The team otherwise wrote a good story but silently skipped panel(s) — team mode
@@ -369,7 +414,7 @@ async def stream_story(idea: str = "", style: str = "", panels: int = 5):
                     (ev["panel"], ev["text"]) for ev in events
                     if ev.get("t") == "panel.caption" and ev.get("panel") not in missing
                 )
-                fill_raw = await _collect_fill(idea, style, total, prior, missing)
+                fill_raw = await _collect_fill(idea, style, total, prior, missing, lang=lang)
                 fill_events = [
                     ev for ev in best_variants(fill_raw)
                     if ev.get("t") in ("panel.art", "panel.caption") and ev.get("panel") in missing
@@ -391,10 +436,10 @@ async def stream_story(idea: str = "", style: str = "", panels: int = 5):
                             missing, FILL_RETRIES)
                 relay.seen.clear()
                 fallback_relay = LiveRelay(lambda ev: None)
-                raw = await _run_story(idea, style, total, team=False, relay=fallback_relay)
+                raw = await _run_story(idea, style, total, team=False, relay=fallback_relay, lang=lang)
                 events = best_variants(raw)
         events = _valid_panel_events(events, total)
-        events = await _moderate_events(events)
+        events = await _moderate_events(events, lang=lang)
         if relay.seen:
             # Don't replay-with-pacing what the viewer already watched happen live.
             events = [
@@ -578,21 +623,40 @@ async def regenerate_panel(request: Request):
     return JSONResponse({"src": src, "error": err})
 
 
+# Voice override by language, for the front-end's EN/中文 toggle — narrate.py's own VOICE
+# env var stays the English default so this demo keeps working with zero config either way.
+# zh-CN-XiaoxiaoNeural (the old default) is tagged "Warm"/News-Novel in edge-tts's own voice
+# list — a mature newsreader-ish register, not a child one, unlike en-US-AnaNeural (the
+# English default, an actual child voice). zh-CN-XiaoyiNeural is the closest zh-CN match:
+# tagged "Lively"/Cartoon-Novel, a young/girlish storytelling voice. (The only other
+# child-coded zh-CN option edge-tts exposes is zh-CN-YunxiaNeural — "Cute"/Cartoon-Novel,
+# a boy's voice — swap to that via TTS_VOICE_ZH if a boy's voice reads better.)
+_VOICE_BY_LANG = {"zh": os.getenv("TTS_VOICE_ZH", "zh-CN-XiaoyiNeural")}
+
+
 @app.post("/narrate")
 async def narrate_text(request: Request):
     """Synthesize one line of story text as speech — the server-side replacement for the
-    browser's SpeechSynthesis API (see app.js's narration engine). Body: {text}. Returns raw
-    MP3 bytes on success; on failure, JSON {error} and a 502 — there's deliberately no fallback
-    voice engine, so a narration failure is visible rather than silently swapped for a lesser
-    one (see server/narrate.py)."""
+    browser's SpeechSynthesis API (see app.js's narration engine). Body: {text, lang}. `lang`
+    ("" or "zh") picks the voice via _VOICE_BY_LANG; omitted/unknown falls back to narrate.py's
+    default English voice. Returns raw MP3 bytes on success; on failure, JSON {error} and a
+    502 — there's deliberately no fallback voice engine, so a narration failure is visible
+    rather than silently swapped for a lesser one (see server/narrate.py).
+
+    The per-word timings ride along in an X-Word-Boundaries header (percent-encoded JSON of
+    `[[start_ms, duration_ms, word], ...]` — percent-encoded because header values must be
+    ASCII and zh words aren't), so the body stays a plain MP3 and app.js's blob handling is
+    unchanged. app.js uses them to highlight each word as it's spoken."""
     data = await request.json()
     text = str(data.get("text") or "").strip()
     if not text:
         return JSONResponse({"error": "text is required"}, status_code=400)
-    audio, err = await narrate.synthesize(text)
+    voice = _VOICE_BY_LANG.get(str(data.get("lang") or "").strip().lower())
+    audio, words, err = await narrate.synthesize_with_words(text, voice=voice)
     if not audio:
         return JSONResponse({"error": err or "narration failed"}, status_code=502)
-    return Response(content=audio, media_type="audio/mpeg")
+    boundaries = quote(json.dumps(words, ensure_ascii=False, separators=(",", ":")), safe="")
+    return Response(content=audio, media_type="audio/mpeg", headers={"X-Word-Boundaries": boundaries})
 
 
 embed_server.sse_route(app, "/events", stream_story, guard=RUN_GUARD, token_env_var=API_TOKEN_ENV_VAR)

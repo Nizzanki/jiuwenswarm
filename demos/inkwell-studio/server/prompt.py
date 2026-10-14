@@ -22,7 +22,7 @@ prose, no explanations, no markdown, no ``` fences. Every line MUST be a single 
 JSON object. Allowed events (field names are exact):
 
 {"t":"brief","idea":"<the author's idea>","style":"<the style>","total":<int panels>}
-{"t":"agent","id":"<writer|critic|artDirector|imageGen|editor>","status":"<active|done|idle|reject>","say":"<one short present-tense line>","state":"<optional short word e.g. drafting|revising|queued>"}
+{"t":"agent","id":"<writer|critic|artDirector|imageGen|editor>","status":"<active|done|idle|reject>","say":"<one short present-tense line>","state":"<optional, ONLY one of: drafting|rendering|revising|queued|review — omit the field entirely if none fit, never invent a different word>"}
 {"t":"panel.status","panel":<int>,"status":"<drafting|rendering|review|revising|approved>"}
 {"t":"panel.art","panel":<int>,"svg":"<a ONE-SENTENCE image prompt describing the picture>"}
 {"t":"panel.caption","panel":<int>,"text":"<the story caption for this panel>","dim":<true|false>}
@@ -40,7 +40,11 @@ Rules:
   that draft for being flat, rushed, or lacking warmth, never for being graphic or scary.
 - Output events in the ORDER they happen, so a viewer watches the story build live.
 - The crew has exactly five members with these ids: writer, critic, artDirector, imageGen, editor.
-- `panel.art.svg` is a short IMAGE PROMPT sentence (no real image is generated in this phase).
+- `panel.art.svg` is a short IMAGE PROMPT sentence that gets rendered into the ACTUAL picture
+  the viewer sees for that panel — it is not decorative or unused. It MUST depict the exact
+  same character(s), species, and setting as that panel's caption (e.g. if the caption is
+  about a dragon, the image prompt must describe a dragon — never substitute a generic child
+  or a different character just because that renders more easily).
 - Emit a `brief` first, then build each panel through its lifecycle:
   drafting -> rendering -> review -> approved, updating the relevant `agent` and `progress`.
 - CAPTIONS ARE THE STORY ITSELF. Read end to end, the captions must form ONE continuous
@@ -66,7 +70,7 @@ Rules:
 """
 
 
-def build_brief(idea: str, style: str, panels: int = 5) -> str:
+def build_brief(idea: str, style: str, panels: int = 5, lang: str = "") -> str:
     idea = (idea or "").strip() or "A sleepy bear tries to stay awake to see the first snow."
     style = (style or "").strip() or "Warm storybook · Painterly"
     panels = max(3, min(int(panels or 5), 6))
@@ -83,11 +87,12 @@ def build_brief(idea: str, style: str, panels: int = 5) -> str:
         "the Image Generator renders, the Critic reviews, and on one panel the Critic "
         "genuinely rejects the work and the Writer revises it warmer. The captions must read "
         "as one continuous short story (past tense narrative), not picture descriptions.\n"
+        f"{_lang_line(lang)}"
         f"{PROTOCOL_SPEC}"
     )
 
 
-def build_team_brief(idea: str, style: str, panels: int = 3) -> str:
+def build_team_brief(idea: str, style: str, panels: int = 3, lang: str = "") -> str:
     """Brief for NATIVE team mode. Deliberately LEAN so the real multi-agent team completes
     in bounded time (heavy briefs make the leader poll/coordinate forever and deadlock):
     small crew, few panels, one revision, and the protocol emitted as the FINAL answer."""
@@ -111,11 +116,14 @@ def build_team_brief(idea: str, style: str, panels: int = 3) -> str:
         "JSON object per line) describing the finished run — the brief, each panel's caption+art+"
         "status, the crew members and their activity, the Critic's rejection note on the revised "
         "panel, the revision-loop log, progress, and a final run.done. No prose, no markdown.\n"
+        f"{_lang_line(lang)}"
         f"{PROTOCOL_SPEC}"
     )
 
 
-def build_fill_brief(idea: str, style: str, total: int, prior: list[tuple[int, str]], missing: list[int]) -> str:
+def build_fill_brief(
+    idea: str, style: str, total: int, prior: list[tuple[int, str]], missing: list[int], lang: str = "",
+) -> str:
     """Patch brief for when the team wrote most of the story but skipped panel(s) `missing`
     (see bridge.py's _incomplete_panels): ask a single agent for ONLY those panels as a
     direct continuation, not the whole story over again. This is deliberately the smallest
@@ -137,6 +145,7 @@ def build_fill_brief(idea: str, style: str, total: int, prior: list[tuple[int, s
         "land a real ending, not a cliffhanger.\n\n"
         "CHILD-SAFE, ALWAYS: warm, gentle, wonder-filled — no violence, weapons, blood/gore, "
         "death, scary or frightening imagery, horror, adult themes, or innuendo.\n\n"
+        f"{_lang_line(lang)}"
         "Emit ONLY these two event types, one compact JSON object per line, nothing else (no "
         "prose, no markdown fences) — one art line and one caption line per missing panel:\n"
         '{"t":"panel.art","panel":<int>,"svg":"<a ONE-SENTENCE image prompt describing the picture>"}\n'
@@ -144,6 +153,28 @@ def build_fill_brief(idea: str, style: str, total: int, prior: list[tuple[int, s
         f"Only emit these for panel numbers in: {panel_list}. No other panels, no other event types, "
         "no commentary."
     )
+
+
+# Explicit language override. Normally the protocol spec's "in the author's language" line
+# is enough — a Chinese idea naturally gets a Chinese story. This exists for the UI's
+# English/中文 toggle: when the author explicitly picked 中文, say so outright rather than
+# inferring it, so e.g. a Chinese STYLE preset (still English words) can't pull the output
+# back toward English.
+_LANG_INSTRUCTION = {
+    "zh": "\nLANGUAGE: write EVERY caption, agent `say` line, log `html` line, and critic "
+          "`panel.note` in Simplified Chinese (简体中文), regardless of what language the "
+          "idea/style above happen to be written in.\n"
+          "EXCEPTION — `panel.art.svg` (the image prompt): write this ONE field in ENGLISH "
+          "even though everything else is in Chinese — the image-generation backend behind "
+          "it renders English prompts far more reliably. It must still describe EXACTLY the "
+          "same character/species/setting as that panel's (Chinese) caption, just translated, "
+          "not reinterpreted — e.g. a caption about a '小龙' (dragon) needs an English image "
+          "prompt that explicitly says \"dragon\", not a generic child or unrelated figure.\n",
+}
+
+
+def _lang_line(lang: str) -> str:
+    return _LANG_INSTRUCTION.get((lang or "").strip().lower(), "")
 
 
 # Event `t` values the bridge will accept; anything else is dropped as noise.

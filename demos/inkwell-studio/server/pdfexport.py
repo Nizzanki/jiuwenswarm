@@ -36,7 +36,7 @@ def _pdf_panel_frame(art: Image.Image | None, caption: str) -> Image.Image:
         d.rectangle([MARGIN, box_top, W - MARGIN, box_top + box_h], outline=RULE, width=1)
         cap_y = box_top + box_h + 30
 
-    f_cap = _font(24)
+    f_cap = _font(24, text=caption)
     for ln in _wrap(d, caption, f_cap, box_w):
         d.text((MARGIN, cap_y), ln, font=f_cap, fill=INK)
         cap_y += 34
