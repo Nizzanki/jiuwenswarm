@@ -168,6 +168,21 @@ body {
 .pcap { padding: 14px 15px 16px; }
 .pcap .t { font-family: var(--serif); font-size: 15.5px; line-height: 1.55; color: var(--ink); }
 .pcap .t.dim { color: var(--ink-dim); font-style: italic; }
+/* per-panel caption edit / rewrite (app.js "edit / rewrite one panel's text") */
+.cap-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px; }
+.cap-btn { cursor: pointer; font-family: var(--mono); font-size: 9px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--ink-mut); background: var(--panel-2); border: 1px solid var(--border-2); border-radius: var(--r);
+  padding: 4px 9px; transition: color .15s, border-color .15s; }
+.cap-btn:hover:not(:disabled) { color: var(--teal); border-color: var(--teal); }
+.cap-btn:disabled { opacity: .6; cursor: default; }
+.cap-save { color: var(--teal); border-color: var(--teal); }
+.cap-hint { font-size: 11px; font-style: italic; color: var(--ink-dim); }
+.cap-input { width: 100%; box-sizing: border-box; resize: vertical; font-family: var(--serif); font-size: 15px;
+  line-height: 1.5; color: var(--ink); background: var(--panel); border: 1px solid var(--border-2);
+  border-radius: var(--r); padding: 8px 10px; }
+.cap-input:focus { outline: none; border-color: var(--teal); box-shadow: inset 0 -2px 0 var(--teal); }
+.cap-input:disabled { opacity: .7; }
+.cap-err { margin-top: 8px; font-size: 12.5px; line-height: 1.4; color: var(--coral); }
 .pcap .note { margin-top: 11px; font-size: 13px; color: var(--coral); border-left: 2px solid var(--coral); padding-left: 10px; line-height: 1.5; font-style: italic; }
 .pcap .note b { font-family: var(--mono); font-size: 9px; letter-spacing: .12em; text-transform: uppercase; font-style: normal; display: block; color: var(--coral); margin-bottom: 3px; }
 
@@ -213,6 +228,14 @@ body {
 .download + .download { margin-top: 8px; }
 .download.busy { opacity: .7; cursor: default; }
 .download.reading { background: var(--amber); color: #2a1f0a; border-color: var(--amber); }
+/* reading-speed picker under the read-aloud buttons (app.js NARRATE_RATES) */
+.speed-row { display: flex; align-items: center; gap: 4px; margin-top: 8px; }
+.speed-row + .download { margin-top: 8px; }
+.speed-label { flex: 1 1 auto; font-family: var(--mono); font-size: 9.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-dim); }
+.speed-opt { cursor: pointer; font-family: var(--mono); font-size: 10px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--ink-mut); background: transparent; border: 1px solid var(--border-2); border-radius: var(--r); padding: 4px 8px; }
+.speed-opt:hover { color: var(--teal); border-color: var(--teal); }
+.speed-opt.active { color: #f6f0e2; background: var(--teal); border-color: var(--teal); }
 
 .restyle-row { display: flex; flex-direction: column; gap: 8px; }
 .restyle-row .style-row input, .restyle-row .style-row select {

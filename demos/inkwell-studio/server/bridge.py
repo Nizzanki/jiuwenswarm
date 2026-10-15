@@ -43,7 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dotenv import load_dotenv  # noqa: E402
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-from prompt import build_brief, build_team_brief, build_fill_brief, KNOWN_EVENTS  # noqa: E402
+from prompt import build_brief, build_team_brief, build_fill_brief, build_caption_brief, KNOWN_EVENTS  # noqa: E402
 import imagegen  # noqa: E402
 import gifexport  # noqa: E402
 import pdfexport  # noqa: E402
@@ -113,7 +113,10 @@ async def _no_heuristic_cache(request, call_next):
 # navigation can't attach an Authorization header. /events isn't in this list either: it
 # validates the same token via ?token= instead (wired below through sse_route's
 # token_env_var), since EventSource can't set headers at all.
-_PROTECTED_ROUTES = {"/export/gif", "/export/pdf", "/restyle", "/panel/regenerate", "/narrate"}
+_PROTECTED_ROUTES = {
+    "/export/gif", "/export/pdf", "/restyle", "/panel/regenerate", "/narrate",
+    "/panel/caption/regenerate", "/panel/caption/check",
+}
 embed_server.add_auth(app, env_var=API_TOKEN_ENV_VAR, protect_paths=_PROTECTED_ROUTES)
 
 
@@ -621,6 +624,87 @@ async def regenerate_panel(request: Request):
     sem = asyncio.Semaphore(IMAGE_CONCURRENCY)
     src, err = await _render_panel_resilient(n, prompt, style, sem)
     return JSONResponse({"src": src, "error": err})
+
+
+# Hand-edited captions are a sentence or two; the cap keeps a pasted wall of text from
+# reaching the moderation model (and, if it passes, the narration/export paths).
+CAPTION_MAX_CHARS = 600
+
+
+def _caption_pairs(raw) -> list[tuple[int, str]]:
+    """[{n, text}, ...] from the front-end → sorted (n, text) pairs, junk entries dropped."""
+    out = []
+    for c in raw or []:
+        if isinstance(c, dict) and isinstance(c.get("n"), int):
+            out.append((c["n"], str(c.get("text") or "").strip()))
+    return sorted(out)
+
+
+@app.post("/panel/caption/regenerate")
+async def regenerate_caption(request: Request):
+    """Rewrite ONE panel's caption — the text sibling of /panel/regenerate. The picture is NOT
+    redrawn, so the brief (prompt.build_caption_brief) gets the panel's existing image prompt
+    to keep the new text consistent with it, plus every other panel's caption so it still
+    reads as one story. A single-agent call, never team mode: one line of prose doesn't need a
+    crew, and team mode's coordination overhead/deadlock risk would dwarf the work.
+
+    The new caption goes through the same child-safety check as the initial run's captions
+    (with the module's normal fail-open policy — it's model output under a CHILD-SAFE brief,
+    same as the story); a flagged rewrite is returned as an error and the panel keeps its
+    current text, rather than being replaced by the redaction filler. Body: {n, idea, style,
+    lang, prompt, captions:[{n, text}]}. Returns {text} or {error}."""
+    data = await request.json()
+    n = data.get("n")
+    captions = _caption_pairs(data.get("captions"))
+    if not isinstance(n, int) or not any(k == n for k, _ in captions):
+        return JSONResponse({"error": "n and captions (including panel n) are required"}, status_code=400)
+    lang = str(data.get("lang") or "")
+    brief = build_caption_brief(
+        str(data.get("idea") or ""), str(data.get("style") or ""), len(captions), captions, n,
+        art_prompt=str(data.get("prompt") or "").strip(), lang=lang,
+    )
+    try:
+        raw = await run_agent(
+            A2A_URL, brief, known_events=KNOWN_EVENTS,
+            metadata={"source": "inkwell-studio-caption"}, context_prefix="inkwell_caption",
+            timeout=180.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": f"bridge/swarm error: {exc}"}, status_code=502)
+    text = next(
+        (str(ev.get("text") or "").strip() for ev in reversed(best_variants(raw))
+         if ev.get("t") == "panel.caption" and ev.get("panel") == n and ev.get("text")),
+        "",
+    )
+    if not text:
+        return JSONResponse({"error": "the writer didn't return a new caption"}, status_code=502)
+    safe, reason = await moderate.check_child_safe(text)
+    if not safe:
+        log.warning("panel %s: rewritten caption flagged by moderation (%s) — text: %r",
+                    n, reason or "unspecified", " ".join(text.split())[:160])
+        return JSONResponse({"error": "the rewrite didn't pass the child-safety check — try again"})
+    return JSONResponse({"text": text})
+
+
+@app.post("/panel/caption/check")
+async def check_caption(request: Request):
+    """Child-safety gate for a caption the user typed by hand. The front-end only applies the
+    edit when this returns {safe: true}. Fails CLOSED (moderate.check_child_safe with
+    fail_open=False), regardless of MODERATION_FAIL_OPEN: unlike the model's own output, a
+    hand edit is arbitrary user input that was never asked to be child-safe, so a moderation
+    timeout/garbled answer rejects it instead of letting it through. Body: {text}. Returns
+    {safe, reason}."""
+    data = await request.json()
+    text = str(data.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    if len(text) > CAPTION_MAX_CHARS:
+        return JSONResponse({"error": f"caption is too long (max {CAPTION_MAX_CHARS} characters)"}, status_code=400)
+    safe, reason = await moderate.check_child_safe(text, fail_open=False)
+    if not safe:
+        log.warning("manual caption edit rejected by moderation (%s) — text: %r",
+                    reason or "unspecified", " ".join(text.split())[:160])
+    return JSONResponse({"safe": safe, "reason": reason})
 
 
 # Voice override by language, for the front-end's EN/中文 toggle — narrate.py's own VOICE

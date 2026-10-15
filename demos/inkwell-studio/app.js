@@ -41,6 +41,39 @@ let narrateOnIdle = null;      // fires once when the queue fully drains (see re
 let narrateAudio = null;       // the Audio element currently playing, so stop() can kill it
 let narratePaused = false;     // true between narratePause() and narrateResume()/narrateStop()
 const narrateInflight = new Map();   // text -> {promise, controller} — current + one line prefetched ahead
+let narrateGapTimer = null;    // the pause between two panels' lines (see PANEL_GAP_MS)
+
+// Reading pace. Speed is applied browser-side as the <audio> element's playbackRate, NOT by
+// re-synthesizing at a different TTS_RATE: it takes effect instantly (even mid-line), costs no
+// extra /narrate round-trip or cache entry, browsers keep the pitch natural (preservesPitch
+// defaults on), and the word highlight stays in sync because it runs off audio.currentTime.
+// TTS_RATE (server/narrate.py) still sets the voice's baseline pace that these multiply.
+const NARRATE_RATES = [0.75, 1, 1.25];
+const NARRATE_RATE_KEY = 'inkwell-read-speed';
+let narrateRate = 1;
+try {
+  const saved = parseFloat(localStorage.getItem(NARRATE_RATE_KEY));
+  if (NARRATE_RATES.includes(saved)) narrateRate = saved;
+} catch { /* localStorage unavailable — default speed */ }
+// A beat of silence between panels so each page lands before the next one starts, instead of
+// the lines running straight into each other.
+const PANEL_GAP_MS = 900;
+
+function setNarrateRate(rate) {
+  if (!NARRATE_RATES.includes(rate)) return;
+  narrateRate = rate;
+  if (narrateAudio) narrateAudio.playbackRate = rate;
+  try { localStorage.setItem(NARRATE_RATE_KEY, String(rate)); } catch { /* best-effort */ }
+  syncSpeedButtons();
+}
+
+function syncSpeedButtons() {
+  document.querySelectorAll('#read-speed .speed-opt').forEach((el) => {
+    const on = parseFloat(el.dataset.rate) === narrateRate;
+    el.classList.toggle('active', on);
+    el.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+}
 
 function narrateStart(text) {
   const existing = narrateInflight.get(text);
@@ -91,16 +124,21 @@ async function narratePump() {
   }
   narrateInflight.delete(text);
   const audio = new Audio(url);
+  audio.playbackRate = narrateRate;
   narrateAudio = audio;
   wordHlStart(text, audio, words);
-  const done = () => {
+  const done = (gap = 0) => {
     wordHlStop();
     URL.revokeObjectURL(url);
     if (narrateAudio === audio) narrateAudio = null;
-    narrating = false;
-    narratePump();
+    // `narrating` stays true through the gap so a line enqueued meanwhile waits its turn
+    // instead of starting early; narrateStop() cancels the timer. No gap after the last
+    // queued line, so "done reading" (narrateOnIdle) isn't delayed.
+    const next = () => { narrateGapTimer = null; narrating = false; narratePump(); };
+    if (gap && narrateQueue.length) narrateGapTimer = setTimeout(next, gap);
+    else next();
   };
-  audio.onended = done;
+  audio.onended = () => done(PANEL_GAP_MS);
   audio.onerror = () => { showLiveNote(t('livenote.narratePlayFailed')); done(); };
   // If paused while this line was still loading, leave it cued but silent — narrateResume()
   // starts it (onended/onerror above still fire normally once it's eventually played out).
@@ -116,6 +154,7 @@ function narrateEnqueue(text) {
 
 function narrateStop() {
   narrateQueue.length = 0;
+  if (narrateGapTimer) { clearTimeout(narrateGapTimer); narrateGapTimer = null; }
   narrating = false;
   narratePaused = false;
   narrateOnIdle = null;
@@ -390,7 +429,11 @@ function ensurePanel(n) {
   let p = state.panels.find((x) => x.n === n);
   if (!p) {
     p = { n, status: 'drafting', caption: '', dim: true, svg: '', image: '', imageError: null,
-          note: null, artHistory: [], rejectedCaption: null, regenerating: false };
+          note: null, artHistory: [], rejectedCaption: null, regenerating: false,
+          // caption editing (see "edit / rewrite one panel's text" below): editing = the
+          // inline editor is open, draft = its unsaved text, captionBusy = null|'rewriting'|
+          // 'checking', captionError = last rejection/failure shown under the caption.
+          editing: false, draft: '', captionBusy: null, captionError: null };
     state.panels.push(p); state.panels.sort((a, b) => a.n - b.n);
   }
   return p;
@@ -466,7 +509,36 @@ function panelInnerHtml(p) {
       ${media}
       ${regenBtn}
     </div>
-    <div class="pcap"><div class="${capClass}">${capText}</div>${note}</div>`;
+    <div class="pcap">${p.editing ? captionEditorHtml(p) : `<div class="${capClass}">${capText}</div>${captionActionsHtml(p)}`}${note}</div>`;
+}
+
+// "✎ Edit text" / "↻ Rewrite text" under a finished panel's caption — same availability rule
+// as the Redo-image button (a finished run, and something there to edit).
+function captionActionsHtml(p) {
+  if (!p.caption || state.running) return '';
+  const busy = p.captionBusy === 'rewriting';
+  const err = p.captionError ? `<div class="cap-err">${escapeHtml(p.captionError)}</div>` : '';
+  return `<div class="cap-actions">
+      <button type="button" class="cap-btn cap-edit" data-panel="${p.n}" ${busy ? 'disabled' : ''}
+        title="${t('panel.editText.title')}">${t('panel.editText')}</button>
+      <button type="button" class="cap-btn cap-rewrite" data-panel="${p.n}" ${busy ? 'disabled' : ''}
+        title="${t('panel.rewriteText.title')}">${busy ? t('panel.rewriteBusy') : t('panel.rewriteText')}</button>
+    </div>${err}`;
+}
+
+function captionEditorHtml(p) {
+  const checking = p.captionBusy === 'checking';
+  const err = p.captionError ? `<div class="cap-err">${escapeHtml(p.captionError)}</div>` : '';
+  return `<textarea class="cap-input" data-panel="${p.n}" maxlength="${CAPTION_MAX_CHARS}" rows="4"
+      aria-label="${t('panel.editText.title')}" ${checking ? 'disabled' : ''}>${escapeHtml(p.draft)}</textarea>
+    ${err}
+    <div class="cap-actions">
+      <button type="button" class="cap-btn cap-save" data-panel="${p.n}" ${checking ? 'disabled' : ''}>
+        ${checking ? t('panel.checkBusy') : t('panel.saveText')}</button>
+      <button type="button" class="cap-btn cap-cancel" data-panel="${p.n}" ${checking ? 'disabled' : ''}>
+        ${t('panel.cancelEdit')}</button>
+      <span class="cap-hint">${t('panel.editHint')}</span>
+    </div>`;
 }
 
 function renderPanel(n) {
@@ -1281,6 +1353,95 @@ async function regeneratePanel(n) {
   }
 }
 
+/* ------------------------ edit / rewrite one panel's text ---------------------- */
+// Two ways to change a finished panel's caption without re-running the crew (the picture is
+// left as it is — "↻ Redo image" is still there for that):
+//   - Rewrite: /panel/caption/regenerate asks a single agent for a fresh caption for this
+//     panel only, given the rest of the story and the panel's image prompt. The bridge
+//     moderates the result before returning it.
+//   - Edit: the author types their own text. It's only applied once /panel/caption/check
+//     says it's child-safe — that check fails CLOSED (a moderation error rejects the edit),
+//     because unlike the crew's output this is arbitrary user input.
+// Either way the new caption flows everywhere p.caption is read (full text, narration,
+// exports), and a failure keeps the current caption.
+
+const CAPTION_MAX_CHARS = 600;   // matches bridge.py's CAPTION_MAX_CHARS
+
+function storyCaptions() {
+  return state.panels.filter((x) => x.caption).map((x) => ({ n: x.n, text: x.caption }));
+}
+
+function openCaptionEditor(n) {
+  const p = state.panels.find((x) => x.n === n);
+  if (!p || !p.caption || state.running || p.captionBusy) return;
+  p.editing = true; p.draft = p.caption; p.captionError = null;
+  renderPanel(n);
+  const ta = document.querySelector(`#panel-${n} .cap-input`);
+  if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+}
+
+function closeCaptionEditor(n) {
+  const p = state.panels.find((x) => x.n === n);
+  if (!p || p.captionBusy) return;
+  p.editing = false; p.draft = ''; p.captionError = null;
+  renderPanel(n);
+}
+
+async function saveCaptionEdit(n) {
+  const p = state.panels.find((x) => x.n === n);
+  if (!p || !p.editing || p.captionBusy) return;
+  const text = p.draft.trim();
+  if (!text) { p.captionError = t('panel.editEmpty'); renderPanel(n); return; }
+  if (text === p.caption) { closeCaptionEditor(n); return; }
+  p.captionBusy = 'checking'; p.captionError = null;
+  renderPanel(n);
+  try {
+    const res = await fetch('/panel/caption/check', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `bridge ${res.status}`);
+    if (body.safe === true) {
+      p.caption = text; p.dim = false; p.editing = false; p.draft = '';
+    } else {
+      p.captionError = t('panel.editRejected', body.reason);
+    }
+  } catch (e) {
+    p.captionError = t('panel.editCheckFailed', e.message);
+  } finally {
+    p.captionBusy = null;
+    renderPanel(n);
+  }
+}
+
+async function rewriteCaption(n) {
+  const p = state.panels.find((x) => x.n === n);
+  if (!p || !p.caption || state.running || p.captionBusy) return;
+  p.captionBusy = 'rewriting'; p.captionError = null;
+  renderPanel(n);
+  try {
+    const res = await fetch('/panel/caption/regenerate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        n, idea: state.brief.idea, style: state.brief.style, lang: getLang() === 'zh' ? 'zh' : '',
+        prompt: p.svg, captions: storyCaptions(),
+      }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (body.text) {
+      p.caption = body.text; p.dim = false;
+    } else {
+      p.captionError = t('panel.rewriteFailed', body.error || `bridge ${res.status}`);
+    }
+  } catch (e) {
+    p.captionError = t('panel.rewriteFailed', e.message);
+  } finally {
+    p.captionBusy = null;
+    renderPanel(n);
+  }
+}
+
 /* ----------------------------------- boot ----------------------------------- */
 
 // Highlights whichever of the toggle's "EN" / "中文" spans matches the current language —
@@ -1341,12 +1502,35 @@ $('download-gif').addEventListener('click', downloadGif);
 $('download-pdf').addEventListener('click', downloadPdf);
 $('restyle').addEventListener('click', restyleStory);
 $('gallery').addEventListener('click', (e) => {
-  const btn = e.target.closest('.regen-btn');
+  const btn = e.target.closest('.regen-btn, .cap-btn');
   if (!btn || btn.disabled) return;
-  regeneratePanel(parseInt(btn.dataset.panel, 10));
+  const n = parseInt(btn.dataset.panel, 10);
+  if (btn.classList.contains('regen-btn')) regeneratePanel(n);
+  else if (btn.classList.contains('cap-edit')) openCaptionEditor(n);
+  else if (btn.classList.contains('cap-rewrite')) rewriteCaption(n);
+  else if (btn.classList.contains('cap-save')) saveCaptionEdit(n);
+  else if (btn.classList.contains('cap-cancel')) closeCaptionEditor(n);
+});
+// The editor's draft lives on the panel (not just in the DOM) so a card repaint mid-edit
+// doesn't lose what the author typed. Ctrl/⌘+Enter saves, Esc cancels.
+$('gallery').addEventListener('input', (e) => {
+  if (!e.target.classList.contains('cap-input')) return;
+  const p = state.panels.find((x) => x.n === parseInt(e.target.dataset.panel, 10));
+  if (p) p.draft = e.target.value;
+});
+$('gallery').addEventListener('keydown', (e) => {
+  if (!e.target.classList.contains('cap-input')) return;
+  const n = parseInt(e.target.dataset.panel, 10);
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); saveCaptionEdit(n); }
+  else if (e.key === 'Escape') { e.preventDefault(); closeCaptionEditor(n); }
 });
 
 $('read-story').addEventListener('click', readStoryAloud);
+$('read-speed').addEventListener('click', (e) => {
+  const btn = e.target.closest('.speed-opt');
+  if (btn) setNarrateRate(parseFloat(btn.dataset.rate));
+});
+syncSpeedButtons();
 $('pause-story').addEventListener('click', togglePauseStory);
 
 const params = new URLSearchParams(location.search);

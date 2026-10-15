@@ -155,6 +155,42 @@ def build_fill_brief(
     )
 
 
+def build_caption_brief(
+    idea: str, style: str, total: int, captions: list[tuple[int, str]], n: int,
+    art_prompt: str = "", lang: str = "",
+) -> str:
+    """Brief for "rewrite this panel's text" (bridge.py's /panel/caption/regenerate): a fresh
+    caption for panel `n` only, given the WHOLE story around it (unlike build_fill_brief, the
+    panel can sit mid-story, so it must flow into the panels after it too) and the panel's
+    existing image prompt — the picture isn't redrawn, so the new text has to still match it."""
+    idea = (idea or "").strip() or "A sleepy bear tries to stay awake to see the first snow."
+    style = (style or "").strip() or "Warm storybook · Painterly"
+    current = next((cap for k, cap in captions if k == n), "")
+    context = "\n".join(
+        f"Panel {k}: {'<<< THIS PANEL — rewrite it >>>' if k == n else cap}" for k, cap in captions
+    )
+    picture = f"THE PICTURE ALREADY DRAWN FOR PANEL {n} (keep the text consistent with it): {art_prompt}\n\n" \
+        if art_prompt else ""
+    return (
+        f"You are rewriting the caption of ONE panel (panel {n}) of an illustrated children's "
+        "story. Every other panel stays exactly as it is.\n\n"
+        f"THE AUTHOR'S IDEA: \"{idea}\"\nSTYLE: {style}\nTOTAL PANELS: {total}\n\n"
+        f"THE STORY (for continuity — do not rewrite the other panels):\n{context}\n\n"
+        f"{picture}"
+        f"THE CURRENT CAPTION FOR PANEL {n} (write a DIFFERENT version, not a light paraphrase): "
+        f"{current}\n\n"
+        "Keep the SAME past-tense prose voice and roughly the same length; it must follow on "
+        f"naturally from panel {n - 1} and lead into panel {n + 1} where those exist"
+        + (" — and since this is the last panel, land a real ending." if n == total else ".")
+        + "\n\nCHILD-SAFE, ALWAYS: warm, gentle, wonder-filled — no violence, weapons, blood/gore, "
+        "death, scary or frightening imagery, horror, adult themes, or innuendo.\n\n"
+        f"{_lang_line(lang)}"
+        "Emit ONLY this one line, a compact JSON object, nothing else (no prose, no markdown "
+        "fences):\n"
+        f'{{"t":"panel.caption","panel":{n},"text":"<the new caption>","dim":false}}'
+    )
+
+
 # Explicit language override. Normally the protocol spec's "in the author's language" line
 # is enough — a Chinese idea naturally gets a Chinese story. This exists for the UI's
 # English/中文 toggle: when the author explicitly picked 中文, say so outright rather than

@@ -130,6 +130,12 @@
           <div class="track"><i id="prog-bar" style="width:0%"></i></div>
           <button type="button" class="download" id="read-story" disabled data-i18n="readStory.idle">🔊 Read story aloud</button>
           <button type="button" class="download" id="pause-story" disabled hidden data-i18n="pauseStory.pause">⏸ Pause</button>
+          <div class="speed-row" id="read-speed" role="group" aria-labelledby="read-speed-label">
+            <span class="speed-label" id="read-speed-label" data-i18n="readSpeed.label">Reading speed</span>
+            <button type="button" class="speed-opt" data-rate="0.75" data-i18n="readSpeed.slow">Slow</button>
+            <button type="button" class="speed-opt" data-rate="1" data-i18n="readSpeed.normal">Normal</button>
+            <button type="button" class="speed-opt" data-rate="1.25" data-i18n="readSpeed.fast">Fast</button>
+          </div>
           <button type="button" class="download" id="download" disabled data-i18n="download.html">⤓ Download story (HTML)</button>
           <button type="button" class="download" id="download-gif" disabled data-i18n="download.gif">⤓ Download GIF</button>
           <button type="button" class="download" id="download-pdf" disabled data-i18n="download.pdf">⤓ Download PDF</button>
